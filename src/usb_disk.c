@@ -1,0 +1,377 @@
+/*
+ * usb_disk.c — minimal Mac OS 9 native BLOCK DRIVER for a USB mass-storage device,
+ * to BYPASS the 1.1-era Apple USB mounter that refuses to proceed for a HIGH-SPEED
+ * device (proven: the same device+driver mount at 1.1; the speed is intrinsic to
+ * EHCI enumeration and can't be faked away — see project memory r16-r21).
+ *
+ * Installed via InstallDriverFromMemory by EHCITrigger AFTER our EHCI UIM publishes
+ * a synchronous block-read service (Gestalt 'Eusb', a TVector into the UIM's proven
+ * BOT engine). This driver owns NO USB knowledge — every read goes through that
+ * service. It:
+ *   kInitialize -> Gestalt('Eusb'); read the MBR (block 0); find the FAT partition;
+ *                  AddDrive it with a valid DrvSts status prefix.
+ *   kRead       -> service->read(partStart + block, count, buffer); IOCommandIsComplete.
+ *   kWrite      -> declined (read-only v1).
+ *   kStatus     -> kDriveStatus fills a DrvSts; everything else declines (statusErr)
+ *                  so the mounter uses safe defaults (DriverGestalt crash fix).
+ *
+ * Adapted DIRECTLY from the user's proven eSATA sil3512 driver (AddDrive + DrvSts
+ * prefix + the IOCommandIsComplete completion contract + DriverGestalt->statusErr).
+ * The volume is FAT/PC-Exchange, which sidesteps the HFS-mounter hang eSATA hit.
+ */
+#include <MacTypes.h>
+#include <MacMemory.h>
+#include <Devices.h>
+#include <Disks.h>
+#include <Files.h>
+#include <Gestalt.h>
+#include <DriverServices.h>
+#include <DriverGestalt.h>   /* r37: answer 'devt'/'intf' so we aren't misclaimed as an Audio CD */
+#include <Errors.h>
+
+#define noErr     0L
+#define paramErr  (-50L)
+
+/* IOCommandKind bits (Devices.h): immediate cmds complete by returning from DoDriverIO;
+ * sync/async cmds (the File-Mgr block reads PBMountVol issues) complete ONLY when we call
+ * IOCommandIsComplete(cmdID, result). */
+#define kImmediateIOCommandKind  0x00000004UL
+
+/* r34: DoDriverIO returns this to signal "accepted, completing ASYNC" — the I/O system then waits for
+ * our IOCommandIsComplete(cmdID,result) instead of treating the return as completion. Classic value 1;
+ * absent from Retro68's headers, so defined here. */
+#define kIOBusyStatus  1L
+
+/* ---- byte-accurate DriverDescription with one service (InstallDriverFromMemory
+ * requires >= 1 service, per DriverFamilyMatching.h). nameInfoStr is NOT matched here
+ * (we install explicitly, not by discovery), so its value is cosmetic. ---- */
+typedef struct { UInt8 len; char s[31]; } DStr31;
+typedef struct { UInt8 a, b, c, d; } DNumVer;
+typedef struct { OSType category, type; DNumVer version; } DServiceInfo;
+typedef struct {
+    OSType     sig;            /* 'mtej' */
+    UInt32     descVersion;
+    DStr31     nameInfoStr;
+    DNumVer    typeVersion;
+    UInt32     driverRuntime;
+    DStr31     driverName;
+    UInt32     reserved[8];
+    UInt32     nServices;
+    DServiceInfo service0;
+} USBDiskDriverDesc;
+
+USBDiskDriverDesc TheDriverDescription = {
+    0x6d74656aUL /* 'mtej' */, 0,
+    { 11, "usb,massdsk" }, { 1, 0, 0x80, 0 },
+    0x00000003UL,                 /* kDriverIsLoadedUponDiscovery|kDriverIsOpenedUponLoad */
+    { 7, "USBDisk" }, { 0,0,0,0,0,0,0,0 }, 1,
+    { 0x6e647276UL /*'ndrv'*/, 0x626c6f6bUL /*'blok'*/, { 1, 0, 0x80, 0 } }
+};
+
+/* ---- debug log to "USB Disk Log" (task-safe: called only from kInitialize, which runs
+ * during InstallDriverFromMemory — NOT re-entrant inside a File Manager mount read). ---- */
+static short gLogRef = 0;
+static void dopen(void)
+{
+    FSSpec sp;
+    if (gLogRef) return;
+    (void)FSMakeFSSpec(0, 0, "\pUSB Disk Log", &sp);
+    (void)FSpDelete(&sp);
+    if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) (void)FSpOpenDF(&sp, fsRdWrPerm, &gLogRef);
+}
+static void dput(const char *s)
+{
+    long n = 0, z = 1;
+    if (!gLogRef) dopen();
+    if (gLogRef) { while (s[n]) n++; (void)FSWrite(gLogRef, &n, (Ptr)s);
+        (void)FSWrite(gLogRef, &z, (Ptr)"\r"); (void)FlushVol(0, 0); }
+}
+static void dputx(const char *label, unsigned long v)
+{
+    char b[80]; int i = 0, j; static const char hx[] = "0123456789abcdef";
+    while (label[i] && i < 60) { b[i] = label[i]; i++; }
+    b[i++] = ' '; b[i++] = '0'; b[i++] = 'x';
+    for (j = 28; j >= 0; j -= 4) b[i++] = hx[(v >> j) & 0xF];
+    b[i] = 0; dput(b);
+}
+
+/* ---- USB block-read service published by the UIM via Gestalt('Eusb') ---- */
+typedef long (*usb_rw_fn)(UInt32 lba, UInt32 count, void *buf);     /* >=0 = blocks done; <0 = error */
+typedef long (*usb_submit_fn)(IOCommandID cmdID, UInt32 lba, UInt32 count, void *buf, int isWrite, long *actCount);
+typedef struct { UInt32 magic; usb_rw_fn readFn; usb_rw_fn writeFn; UInt32 blkSize, blkCnt; usb_submit_fn submitFn; } UsbSvc;
+static UsbSvc *gSvc = 0;
+
+static int fetch_svc(void)
+{
+    long v;
+    if (gSvc) return 1;
+    if (Gestalt('Eusb', &v) != noErr || v == 0) return 0;
+    gSvc = (UsbSvc *)v;
+    if (gSvc->magic != 0x45555342UL) { gSvc = 0; return 0; }   /* 'EUSB' */
+    return 1;
+}
+/* Read `count` 512-byte blocks at absolute LBA `lba` into buf; loops the service's
+ * per-call cap. Returns 1 on success, 0 on failure. */
+static int svc_read(UInt32 lba, UInt32 count, void *buf)
+{
+    UInt8 *p = (UInt8 *)buf;
+    if (!fetch_svc()) return 0;
+    while (count > 0) {
+        UInt32 n = (count > 7) ? 7 : count;
+        long r = gSvc->readFn(lba, n, p);
+        if (r <= 0) return 0;
+        lba += (UInt32)r; p += (UInt32)r * 512UL; count -= (UInt32)r;
+    }
+    return 1;
+}
+/* r34: svc_write removed — kWrite is now ASYNC via the 'Eusb' submitFn (see disk_submit). svc_read
+ * stays: kInitialize's MBR scan reads synchronously at install time (task-level, one-shot, safe). */
+
+/* ---- drive state ---- */
+static short  gRefNum = 0, gDriveNum = 0;
+static UInt32 gPartStart = 0, gPartCount = 0;
+
+/* ---- r24 INSTRUMENTATION: wrap-around ring of every Status/Control call the OS issues to this
+ * drive. Pure memory writes only — safe at File-Mgr / interrupt time (unlike the dput() file I/O,
+ * which is why that stays confined to kInitialize). The point: Foreign File Access / Audio CD
+ * Access probes the drive AFTER PBMountVol returns — exactly the calls the r23 mount-time logs
+ * never captured. Published via Gestalt('Ucsl') so the trigger app can dump it LIVE while the
+ * volume is browsed. Behavior is otherwise byte-for-byte r23 (writes still enabled) so the
+ * 'Audio CD 1' misID still reproduces. ---- */
+#define kCsCap 512                                    /* power of 2: index = count & (kCsCap-1) */
+typedef struct { short kind; short csCode; short ioVRefNum; short pad; long p0, p1; } CsRec; /* 16B */
+/* r26: nReads/nWrites count File-Mgr I/O to this drive so the log proves a Finder copy actually
+ * reaches us (write climbing) vs failing upstream in PC Exchange. Header is now 5 longs (20B). */
+typedef struct { UInt32 magic; UInt32 count; UInt32 cap; UInt32 nReads; UInt32 nWrites; CsRec recs[kCsCap]; } CsLog;
+static CsLog gCsLog;
+static void cslog(short kind, ParmBlkPtr pb)          /* kind: 1 = Status, 2 = Control */
+{
+    CsRec *r = &gCsLog.recs[gCsLog.count & (kCsCap - 1)];
+    r->kind      = kind;
+    r->csCode    = pb->cntrlParam.csCode;
+    r->ioVRefNum = pb->cntrlParam.ioVRefNum;          /* which drive/vol the call targets */
+    r->pad       = 0;
+    /* csParam[0..1] as one big-endian long = DriverGestalt/CD-ROM sub-selector (e.g. 'devt') */
+    r->p0 = ((long)(unsigned short)pb->cntrlParam.csParam[0] << 16) | (unsigned short)pb->cntrlParam.csParam[1];
+    r->p1 = ((long)(unsigned short)pb->cntrlParam.csParam[2] << 16) | (unsigned short)pb->cntrlParam.csParam[3];
+    gCsLog.count++;                                   /* free-running; ring index masks it */
+}
+/* r29: record each File-Mgr READ/WRITE — its IOCommandKind (1=sync/2=async/4=immediate), the
+ * partition-relative start block, and the block count. This reveals whether the Finder copy that
+ * freezes is issuing ASYNC writes (our driver blocks synchronously — illegal at async/interrupt
+ * time -> hard freeze) and whether reads are interleaved with writes (re-entrancy into our engine). */
+static void iolog(short kind, unsigned long iokind, ParmBlkPtr pb)  /* kind: 3=read, 4=write */
+{
+    CsRec *r = &gCsLog.recs[gCsLog.count & (kCsCap - 1)];
+    r->kind      = kind;
+    r->csCode    = (short)((UInt32)pb->ioParam.ioReqCount / 512UL);   /* block count */
+    r->ioVRefNum = pb->ioParam.ioVRefNum;
+    r->pad       = 0;
+    r->p0 = (long)((UInt32)pb->ioParam.ioPosOffset / 512UL);          /* partition-relative start block */
+    r->p1 = (long)iokind;                                             /* IOCommandKind bits */
+    gCsLog.count++;
+    if (kind == 3) gCsLog.nReads++; else gCsLog.nWrites++;
+}
+
+static short pick_drive_num(void)
+{
+    QHdrPtr q = GetDrvQHdr();
+    DrvQElPtr el; short mx = 4;                 /* drive #s <=4 are historically reserved */
+    for (el = (DrvQElPtr)(q ? q->qHead : 0); el; el = (DrvQElPtr)el->qLink)
+        if (el->dQDrive > mx) mx = el->dQDrive;
+    return (short)(mx + 1);
+}
+
+/* kInitialize: scan the Apple Partition Map, find the Apple_HFS partition, AddDrive it. r38: PIVOTED
+ * from MBR/FAT to APM/HFS. HFS uses OS 9's BUILT-IN mounter (NOT Foreign File Access), which sidesteps
+ * the intermittent audio-CD misID entirely — the sibling eSATA project proved native HFS = clean stable
+ * R/W (v50) where FAT/PC-Exchange was a dead end. Tradeoff: the stick is Mac-only (format via Drive
+ * Setup: Mac OS Extended + Apple Partition Map). Reads go through the SAME 'Eusb' BOT service. APM layout:
+ * blk0='ER' Driver Descriptor Record; blk1..N='PM' partition entries (pmMapBlkCnt @+4, pmPyPartStart @+8,
+ * pmPartBlkCnt @+12, type string @+48). All fields big-endian. */
+static OSErr scan_and_add(short refNum)
+{
+    static UInt8 blk[512];
+    UInt32 e, mapCnt, bs = 0, bc = 0;
+    int isAPM;
+
+    gRefNum = refNum;
+    /* r24: arm + publish the Status/Control ring before we AddDrive (probes captured live). */
+    gCsLog.magic = 0x5563736cUL;   /* 'Ucsl' */
+    gCsLog.count = 0;
+    gCsLog.cap   = kCsCap;
+    gCsLog.nReads = 0;
+    gCsLog.nWrites = 0;
+    (void)NewGestaltValue('Ucsl', (long)&gCsLog);
+    dput("=== USB disk driver r40: scanning for a mountable HFS volume (APM or partitionless) via 'Eusb' ===");
+    if (!fetch_svc())         { dput("  service 'Eusb' NOT present"); return ioErr; }
+    if (!svc_read(0, 1, blk)) { dput("  block0 read FAILED"); return ioErr; }
+    dputx("  blk0[0..3]", ((UInt32)blk[0]<<24)|((UInt32)blk[1]<<16)|((UInt32)blk[2]<<8)|blk[3]);   /* r40: see the layout */
+    isAPM = (blk[0] == 0x45 && blk[1] == 0x52);                      /* 'ER' Driver Descriptor Record */
+
+    if (isAPM) {
+        /* --- Apple Partition Map: block1 'PM' pmMapBlkCnt; scan entries for the Apple_HFS partition --- */
+        if (!svc_read(1, 1, blk) || !(blk[0] == 0x50 && blk[1] == 0x4D)) {   /* 'PM' first map entry */
+            dput("  APM: no 'PM' partition map at block 1"); return ioErr;
+        }
+        mapCnt = ((UInt32)blk[4] << 24) | ((UInt32)blk[5] << 16) | ((UInt32)blk[6] << 8) | blk[7];  /* pmMapBlkCnt */
+        if (mapCnt > 63) mapCnt = 63;
+        dputx("  APM map entries", mapCnt);
+        for (e = 1; e <= mapCnt; e++) {
+            if (!svc_read(e, 1, blk) || blk[0] != 0x50 || blk[1] != 0x4D) break;
+            /* partition type string @ +48; match "Apple_HFS" (covers HFS + HFS+) */
+            if (!(blk[48]=='A'&&blk[49]=='p'&&blk[50]=='p'&&blk[51]=='l'&&blk[52]=='e'&&
+                  blk[53]=='_'&&blk[54]=='H'&&blk[55]=='F'&&blk[56]=='S')) continue;
+            bs = ((UInt32)blk[8]  << 24) | ((UInt32)blk[9]  << 16) | ((UInt32)blk[10] << 8) | blk[11];  /* pmPyPartStart */
+            bc = ((UInt32)blk[12] << 24) | ((UInt32)blk[13] << 16) | ((UInt32)blk[14] << 8) | blk[15];  /* pmPartBlkCnt */
+            dputx("  -> Apple_HFS entry", e); dputx("    start", bs); dputx("    count", bc);
+            break;   /* first HFS partition = the volume */
+        }
+        if (bc == 0) { dput("  APM: no Apple_HFS partition found"); return ioErr; }
+    } else {
+        /* --- r40: partitionless (superfloppy) HFS — no partition map; the HFS volume IS the whole device
+         * (block 0 = zeroed boot blocks, which is why the APM 'ER' check missed). Confirm via the volume
+         * header at block 2 ('BD'=0x4244 HFS, 'H+'=0x482B HFS+) and mount the whole device (partStart=0).
+         * This is what a USB stick formatted as a single HFS volume (no APM) looks like — the r39 case. --- */
+        if (!svc_read(2, 1, blk)) { dput("  non-APM + block2 read FAILED"); return ioErr; }
+        dputx("  blk2[0..1] (4244=HFS 482B=HFS+)", ((UInt32)blk[0]<<8)|blk[1]);
+        if ((blk[0]==0x42 && blk[1]==0x44) || (blk[0]==0x48 && blk[1]==0x2B)) {
+            bs = 0; bc = gSvc->blkCnt;                                /* whole device is the volume */
+            dput("  -> partitionless HFS (volume header @ block 2): whole-device volume");
+            dputx("    count(blkCnt)", bc);
+        } else {
+            dput("  no APM 'ER' at blk0 and no HFS header at blk2 - unrecognized (reformat as Mac OS Extended)");
+            return ioErr;
+        }
+    }
+    if (bc == 0) { dput("  volume block count is 0 - cannot AddDrive"); return ioErr; }
+    gPartStart = bs; gPartCount = bc;
+
+    /* AddDrive with the DrvSts STATUS PREFIX valid — the anti-hang fix: the mounter reads
+     * diskInPlace/installed from the 6 bytes BEFORE qLink; zeros there => "offline" => hang. */
+    {
+        Ptr raw = NewPtrSysClear(sizeof(DrvSts) + 8);
+        DrvSts *ds; DrvQElPtr dq; short dnum;
+        if (!raw) { dput("  NewPtrSysClear failed"); return memFullErr; }
+        ds = (DrvSts *)raw;
+        ds->track       = 0;
+        ds->writeProt   = 0;             /* write-enabled */
+        ds->diskInPlace = 8;             /* nonejectable disk present */
+        ds->installed   = 1;             /* drive installed */
+        ds->sides       = 0;
+        dq = (DrvQElPtr)&ds->qLink;
+        dq->qType    = 1;                /* dQDrvSz/dQDrvSz2 valid */
+        dq->dQDrvSz  = (unsigned short)(bc & 0xFFFF);
+        dq->dQDrvSz2 = (unsigned short)(bc >> 16);
+        dnum = pick_drive_num();
+        AddDrive(refNum, dnum, dq);
+        gDriveNum = dnum;
+        dputx("  AddDrive Apple_HFS drive#", (unsigned long)dnum);
+        dputx("    partStart", bs); dputx("    partCount", bc);
+    }
+
+    /* r38 diagnostic (crash-free, pre-mount): dump the HFS Master Directory Block (partition block 2)
+     * to confirm a real HFS/HFS+ volume reads clean through 'Eusb' before the built-in mounter runs.
+     * 'BD'(0x4244)=HFS, 'H+'(0x482B)=HFS+. */
+    if (svc_read(gPartStart + 2, 1, blk))
+        dputx("  MDB sig @part+2 (4244=HFS 482B=HFS+)", ((UInt32)blk[0] << 8) | blk[1]);
+    return noErr;
+}
+
+/* r34: kRead/kWrite are now ASYNC. disk_submit hands the request to the UIM's 'Eusb' submitFn (which
+ * runs the BOT on the heartbeat and completes cmdID via IOCommandIsComplete) and returns immediately —
+ * NO blocking, so the File Manager is never held and the shared engine is never re-entered (that was
+ * the Finder freeze). Partition-relative LBA. Returns: 0=submitted (caller returns kIOBusyStatus),
+ * 1=zero-length (caller completes noErr), -1=no service/queue full (caller completes ioErr). */
+static long disk_submit(IOCommandID cmdID, ParmBlkPtr pb, int isWrite)
+{
+    UInt32 lba, nblk;
+    if (!fetch_svc() || !gSvc->submitFn) return -1;
+    lba  = gPartStart + (UInt32)(pb->ioParam.ioPosOffset / 512);
+    nblk = (UInt32)(pb->ioParam.ioReqCount / 512);
+    pb->ioParam.ioActCount = 0;                    /* UIM sets the real count on completion */
+    return gSvc->submitFn(cmdID, lba, nblk, pb->ioParam.ioBuffer, isWrite, &pb->ioParam.ioActCount);
+}
+
+/* kStatus: answer kDriveStatus(8) with a valid DrvSts and DriverGestalt device-type/interface;
+ * decline everything else with statusErr so the File Manager uses safe defaults. */
+static OSErr disk_status(ParmBlkPtr pb)
+{
+    cslog(1, pb);                        /* r24: record every Status csCode (before we decide) */
+    if (pb->cntrlParam.csCode == 8) {
+        DrvSts *ds = (DrvSts *)&pb->cntrlParam.csParam[0];
+        int k; for (k = 0; k < 11; k++) pb->cntrlParam.csParam[k] = 0;
+        ds->track       = 0;
+        ds->writeProt   = 0;             /* r23: write-enabled */
+        ds->diskInPlace = 8;
+        ds->installed   = 1;
+        ds->sides       = 0;
+        return noErr;
+    }
+    /* r37 AUDIO-CD-MISID FIX: r36 proved a clean HIGH-SPEED mount (self-probe read block-0 0x55AA,
+     * raw WRITE(10) verified) still came up READ-ONLY as "Audio CD 1" — File-Mgr writes to it failed
+     * with wPrErr (-44). Mechanism (CSLOG): the OS probed DriverGestalt('devt') = kdgDeviceType on our
+     * drive and we DECLINED (statusErr), so the CD Foreign File Access plugin claimed our FAT volume.
+     * Answering 'devt'=hard disk (+ 'intf'=USB) asserts a writable fixed disk so PC Exchange claims it.
+     * This is the authoritative device-type gate — earlier + stronger than r30's Control 104/125
+     * rejection (kept below as defence in depth). SAFETY: only answer selectors we can FULLY fill;
+     * decline the rest with statusErr. Returning noErr for a selector whose response is a pointer/
+     * handle (icons, media info) and leaving it unset was the original "DriverGestalt crash". */
+    if (pb->cntrlParam.csCode == kDriverGestaltCode) {          /* 43 */
+        DriverGestaltParam *dg = (DriverGestaltParam *)pb;
+        if (dg->driverGestaltSelector == kdgDeviceType) { dg->driverGestaltResponse = kdgDiskType; return noErr; }
+        if (dg->driverGestaltSelector == kdgInterface)  { dg->driverGestaltResponse = kdgUSBIntf;  return noErr; }
+        return statusErr;                /* every other selector: safe default (never a half-filled response) */
+    }
+    return statusErr;
+}
+
+/* kControl: r23 accepted every control query with noErr. r24 keeps that EXACT behavior (so the
+ * Audio-CD misID still reproduces) but records the csCode first — this is where a Foreign File
+ * System's "is this a CD? / prepare medium" probe would land and be answered too permissively. */
+static OSErr disk_control(ParmBlkPtr pb)
+{
+    cslog(2, pb);
+    /* r30: reject the CD-ROM-specific Control csCodes (104 & 125) that the r29 capture showed appear
+     * ONLY when the volume is misclaimed as "Audio CD 1". Our old blanket noErr falsely told the CD
+     * Foreign-File-Access plugin "yes, that op worked" -> it claimed our FAT volume as a read-only
+     * audio CD (writes then failed with wPrErr -44). controlErr makes it back off so PC Exchange
+     * claims the FAT volume (writable). Other csCodes (e.g. 70/100 used by the normal mount) still
+     * get noErr, so this shouldn't disturb the FAT mount path. */
+    if (pb->cntrlParam.csCode == 104 || pb->cntrlParam.csCode == 125) return controlErr;
+    return noErr;
+}
+
+/* Native-driver entry point (main == DoDriverIO, set by patch-pef-main.py). */
+OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
+                 IOCommandContents contents, IOCommandCode code, IOCommandKind kind)
+{
+    OSErr err;
+    (void)spaceID;
+    switch (code) {
+        case kInitializeCommand: err = scan_and_add(contents.initialInfo->refNum); break;
+        case kOpenCommand:
+        case kCloseCommand:      err = noErr; break;
+        case kReadCommand:
+        case kWriteCommand: {
+            /* r34: ASYNC. Submit to the UIM and return kIOBusyStatus; the UIM completes cmdID from the
+             * heartbeat. No blocking -> the File Manager isn't held and the engine isn't re-entered
+             * (that was the Finder freeze). Async reads from the Finder now just queue. */
+            long sr;
+            iolog((short)(code == kReadCommand ? 3 : 4), (unsigned long)kind, contents.pb);
+            sr = disk_submit(cmdID, contents.pb, (code == kWriteCommand));
+            if (sr == 0) return kIOBusyStatus;     /* accepted -> UIM completes cmdID async; do NOT complete here */
+            err = (sr == 1) ? noErr : ioErr;       /* 1 = zero-length (noErr); -1 = no service/queue full (ioErr) */
+            break;
+        }
+        case kControlCommand:    err = disk_control(contents.pb); break;  /* r24: log then accept */
+        case kStatusCommand:     err = disk_status(contents.pb); break;
+        case kFinalizeCommand:
+        case kSupersededCommand:
+        case kReplaceCommand:
+        case kKillIOCommand:     err = noErr; break;
+        default:                 err = paramErr; break;
+    }
+    if (kind & kImmediateIOCommandKind) return err;                /* immediate: return completes it */
+    return (OSErr)IOCommandIsComplete(cmdID, (short)err);          /* sync/async: signal the File Mgr */
+}
