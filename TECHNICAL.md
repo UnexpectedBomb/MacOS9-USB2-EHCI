@@ -45,10 +45,14 @@ points). The dispatch slots are thin wrappers over the controller/virtual-hub en
   Apple's standard hub driver drives it and enumerates whatever is plugged into a physical
   EHCI port. Port connect/reset/enable are serviced from the real EHCI interrupt plus a
   periodic timer.
-- **Downstream transfer engine** (`ehci_vhub.c`): a single serialized async queue head +
-  qTD + a driver-owned **bounce buffer**. Control transfers (per-phase) and bulk transfers
-  run over it; completions fire the USB Manager's completion UPPs. (DMA is staged through the
-  bounce, never directly to/from a File-Manager buffer — the latter freezes the mount.)
+- **Downstream transfer engine** (`ehci_vhub.c`): **one persistent async queue head per
+  endpoint** (control ep0, bulk-IN, bulk-OUT), each spliced into the reclamation ring for the
+  life of the device, with the controller maintaining each bulk endpoint's **data toggle in
+  hardware** (`DTC=0`). Transfers are queued by a race-free *dummy-qTD append* (a permanently
+  inactive tail qTD is filled in place, its Active bit written last). A driver-owned **bounce
+  buffer** stages all DMA (never directly to/from a File-Manager buffer — the latter freezes
+  the mount). One transfer in flight at a time today. *(This replaced an earlier single shared
+  queue head with a software-managed toggle — see Bug hunt #3 for why that mattered.)*
 - **Self-driven SCSI probe** (`ehci_vhub.c`): once the device's bulk endpoints exist, the UIM
   drives **Bulk-Only Transport** itself — INQUIRY, READ CAPACITY, READ block 0 — proving the
   data path, then publishes a block read/write service via `Gestalt('Eusb')` (a TVector into
@@ -111,6 +115,51 @@ blocks, volume header `'BD'`/`'H+'` at block 2 → mount the whole device).
 Trade-off: the stick is Mac-only. FAT cross-platform support is deferred to a future version
 pending a real solution to the Foreign-File-Access arbitration.
 
+## Bug hunt #3 — the large-copy wedge (a hand-rolled data toggle)
+
+The stubbornest bug: normal file work was flawless, but a **large Finder copy** (hundreds of
+MB, many files) would eventually stall — a file would fail with a "disk error," and pushing on
+could wedge the machine and leave the volume needing repair. A self-contained 64 MB sequential
+write verified byte-perfect every time; only the Finder's *interleaved* read/write/metadata
+workload tripped it. The exact same flash drive was, and is, **completely reliable on the OHCI
+(USB 1.1) stack** — used daily for years. So the hardware was innocent; the bug was ours.
+
+Instrumentation (a tiny always-flushed health log + a controller-state snapshot captured at
+the moment of a stall) walked it down by elimination:
+
+- The async schedule and our queue head were **healthy** at every stall — controller running,
+  schedule running, our QH linked. (An earlier theory that the QH was falling out of the ring
+  was a **misread**: the `ASYNCLISTADDR` register reports the controller's *live position* in
+  the ring, so catching it parked on the anchor looked like an "unlink" but wasn't.)
+- A **destructive recovery we had added** — a USB Bulk-Only Reset fired on a stalled
+  transfer — turned out to be what actually *froze* the machine; with it disabled, a stall
+  degraded to a survivable error instead of a hang.
+- The device was NAKing a **fresh command** (the 31-byte CBW) indefinitely — for the full
+  watchdog, whatever we set it to. That is not flash back-pressure (which resolves); it is a
+  **Bulk-Only-Transport phase desync**: the device still considered the previous command
+  unfinished and refused the next one.
+
+Root cause: the transfer engine used **one shared queue head, reprogrammed per transfer**
+(control ↔ bulk-in ↔ bulk-out), with the USB **data toggle tracked in software**. That toggle
+is correct on a tidy sequential stream but drifts under the Finder's rapid interleaving — and
+once the host and device toggles disagree, the device silently wedges. OHCI (USB 1.1) never
+hits this because its controller keeps a **per-endpoint** data toggle in hardware; our shortcut
+had thrown that away.
+
+The fix is to build the shape EHCI actually intends (and that OHCI's robustness comes from):
+**one persistent queue head per endpoint**, with the controller maintaining the data toggle in
+**hardware** (`DTC=0` on the bulk queues), and transfers appended via the standard **dummy-qTD**
+technique instead of poking the queue-head overlay. Software never touches the toggle again.
+
+Result: the 64 MB verify still passes byte-perfect, the foreground many-files stress test
+completes **all 800 files** with **zero** timeouts (worst transfer pause 50 ms), and a real
+Finder copy of a full **~800 MB / 1000+ file** folder completes with **zero errors**. The
+multi-day wedge saga was one root cause: a hand-rolled toggle on a shared queue.
+
+Lesson: don't reinvent what the host controller will do for you. A per-endpoint queue with a
+hardware-maintained data toggle is not an optimization — it's the correct design, and the
+reason the 1.1 stack was bulletproof all along.
+
 ## Also worth knowing
 
 - **Reset timing:** after a port reset the UIM waits for the port to actually report *Enabled*
@@ -122,14 +171,18 @@ pending a real solution to the Foreign-File-Access arbitration.
 
 ## Roadmap / known limitations
 
-- **Throughput (~0.8 MB/s).** The bottleneck is the engine: one BOT command in flight, 3.5 KB
-  chunks, and a data copy on the interrupt path. Bigger chunks were tried and **backfired** —
-  a 20 KB copy at interrupt level starves the UI (choppy Finder) and the multi-page scatter
-  was unreliable. Real speed needs the data copy moved **off** the interrupt path first, then
-  larger transfers / multiple in-flight commands. That's the main open engineering task.
-- **Large Finder copies can hang.** In-app sequential writes of several MB are fine; the
-  Finder's *interleaved* read/write + re-entrant access into the shared engine trips a hang on
-  big copies. Needs serialization/re-entrancy guarding in the engine.
+- **Throughput (~0.8 MB/s) — the main open task.** The engine still runs one BOT command in
+  flight with a data copy on the interrupt path. Bigger chunks alone were tried and
+  **backfired** — a 20 KB copy at interrupt level starves the UI (choppy Finder) and the
+  multi-page scatter was unreliable. Real speed needs the data copy moved **off** the interrupt
+  path, then multiple in-flight commands — which the **per-endpoint queue heads (Bug hunt #3)
+  now make possible**. That rework is next.
+- **Large Finder copies: fixed.** Previously wedged on the Finder's interleaved access; the
+  cause was a software data toggle on a shared queue head, resolved by per-endpoint hardware
+  toggle (Bug hunt #3). A ~800 MB / 1000+ file copy now completes cleanly.
+- **BOT error recovery is minimal.** With the wedge gone, a *correct* one-shot Bulk-Only Reset
+  (for genuine device errors, not the false-timeout churn that was removed) is a small planned
+  hardening.
 - **No resident auto-load.** Runs as an app today. A resident 68K INIT can load the PPC UIM at
   boot (proven separately), but the mount needs a top-level process context, so the shippable
   vehicle is a faceless background app — not yet built.

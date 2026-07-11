@@ -159,20 +159,43 @@ static void enq_compl(void *upp, void *pipe)
                                * so only buffer[0] is used) — reusable IF a future rework first moves the copies off the
                                * interrupt path (the real prerequisite for big chunks). */
 static volatile UInt8 *gDownPg = 0; static UInt32 gDownPgP = 0;
-static ehci_qh  *gDownQH = 0;  static UInt32 gDownQHP = 0;
-static ehci_qtd *gDownQTD = 0; static UInt32 gDownQTDP = 0;
+/* ---- r63 (A1): PER-ENDPOINT persistent QHs with HARDWARE data toggle ----
+ * Replaces the single shared gDownQH that we reprogrammed per transfer (control<->bulk) + a SOFTWARE
+ * data toggle. That design desynced the BOT toggle under the interleaved Finder workload and wedged the
+ * device (r60-r62; the stick is flawless on OHCI/1.1, so the fault was ours). Now: one resident QH per
+ * endpoint — control ep0 (DTC=1, deterministic control toggle) + bulk-OUT + bulk-IN (DTC=0, so the
+ * controller maintains the data toggle in HARDWARE across every transfer, exactly like OHCI's per-endpoint
+ * EDs). Each QH carries 2 alternating qTDs and is fed by the "dummy-qTD append" (EHCI spec 4.10.2 + Linux
+ * qh_append_tds): a permanently-inactive tail qTD is filled in place with the Active bit written LAST after
+ * a barrier, so the controller only ever sees the old inactive dummy or a fully-formed active qTD — never a
+ * half-built one. All QHs are spliced into the async ring once at init and left resident (no epChar
+ * reprogramming, no overlay-poking in steady state — both were race/toggle hazards). Still one transfer in
+ * flight (gDpBusy); true concurrency/pipelining is a later throughput step. */
+typedef struct {
+    ehci_qh  *qh;   UInt32 qhP;
+    ehci_qtd *td[2]; UInt32 tdP[2];   /* two qTDs alternate as real / tail-dummy */
+    UInt8 dummy;                      /* index (0/1) of the current tail dummy = where the QH advances next */
+    UInt8 dtc;                        /* 1 = toggle from qTD (control ep0); 0 = HW-maintained toggle (bulk) */
+    UInt32 addr, endpt;               /* endpoint this QH is programmed for (0/0 until programmed) */
+} EpQ;
+static EpQ gCtrlQ;        /* device control endpoint 0 */
+static EpQ gBulkQ[2];     /* [0] = bulk-OUT (dirIn 0), [1] = bulk-IN (dirIn 1) */
+static EpQ *gDpQ = 0;             /* the endpoint queue the in-flight transfer was issued on */
+static ehci_qtd *gDpTd = 0;       /* the in-flight (activated) qTD to reap */
 static volatile UInt8 *gDownBuf = 0;                 /* r46: 20KB (5-page) DMA bounce for big data chunks */
 static UInt32 gDownBufPhys[DOWN_DATA_PAGES];         /* physical addr of each bounce page (may be non-contiguous) */
 static int    gDownReady = 0, gDownInitErr = 0, gDownAseOn = 0;
-static UInt32 gDownQHAddr = 0xFFFFUL;
 static volatile int    gDpBusy = 0, gDpIsIn = 0;
 static volatile void  *gDpUPP = 0, *gDpPipe = 0, *gDpDest = 0;
 static volatile UInt32 gDpLen = 0, gDpArmTick = 0;
 static volatile UInt32 gDownDone = 0, gDownErr = 0, gDownTimeouts = 0;
-/* Bulk endpoints (mass storage). We reuse the single serialized gDownQH, reprogramming its epChar
- * per transfer (control ep0 <-> bulk ep), and keep DTC=1 with a SOFTWARE per-endpoint data toggle
- * (bulk needs toggle continuity across transfers; control uses the SETUP=0/else=1 rule). uim6 records
- * the endpoint (addr, endpt, dir 0=OUT/1=IN, maxpkt); uim7 routes by (addr, endpt). */
+static volatile UInt32 gDownRecov = 0;   /* r57: BOT reset-recoveries attempted */
+static volatile UInt32 gDownRelink = 0;      /* r60: async-ring repairs performed (the QH-unlink freeze fix) */
+static volatile UInt32 gLastAnchorLink = 0;  /* r60 diag: anchor->hlink (masked) at the last ring check; compare to gDownQHP */
+/* Bulk endpoints (mass storage). uim6 records each endpoint (addr, endpt, dir 0=OUT/1=IN, maxpkt); uim7
+ * routes a transfer by (addr, endpt). r63: each registered bulk endpoint is bound to its own resident QH
+ * (gBulkQ[dirIn]) with HARDWARE toggle, so the `toggle` field below is now LEGACY/unused (the controller
+ * owns the toggle) — kept only so the currently-disabled recovery code still compiles; removed in A2. */
 #define NBULK 6
 static struct { UInt32 addr, endpt; UInt8 dirIn, toggle; UInt16 maxpkt; UInt8 used; } gBulkEP[NBULK];
 static volatile int gDpBulkEp = -1; static volatile UInt32 gDpNpkt = 1;
@@ -186,15 +209,47 @@ typedef struct { void *upp; void *pipe; void *dest; UInt32 addr, len; UInt8 pid;
 static volatile DownReq gDownQ[DOWNQ_N];
 static volatile UInt32 gDownQHead = 0, gDownQTail = 0, gDownQDrop = 0;
 
-static void down_prog_addr(UInt32 a)
+/* Program an endpoint QH's characteristics. isCtrl => DTC=1 (control toggle carried per-qTD: SETUP=DATA0,
+ * data/status=DATA1); bulk => DTC=0 (the controller maintains this endpoint's data toggle in the QH across
+ * every transfer). No HEAD bit — only the anchor heads the async ring; RL=4 = NAK-reload. Call only while
+ * the QH is idle (enumeration / (re)registration), never mid-transfer. */
+static void epq_program(EpQ *q, UInt32 addr, UInt32 endpt, UInt32 maxpkt, int isCtrl)
 {
-    gDownQH->epChar = ehci_cpu_to_le32(EHCI_QH_DEVADDR(a) | EHCI_QH_ENDPT(0) | EHCI_QH_EPS_HIGH |
-                        EHCI_QH_MAXLEN(64) | EHCI_QH_DTC | EHCI_QH_RL(4));   /* r45: NO EHCI_QH_HEAD — only the anchor heads the ring; this QH is a spliced member */
-    gDownQHAddr = a;
+    UInt32 ch = EHCI_QH_DEVADDR(addr) | EHCI_QH_ENDPT(endpt) | EHCI_QH_EPS_HIGH |
+                EHCI_QH_MAXLEN(maxpkt ? maxpkt : 512) | EHCI_QH_RL(4);
+    if (isCtrl) ch |= EHCI_QH_DTC;
+    q->qh->epChar = ehci_cpu_to_le32(ch);
+    q->dtc = (UInt8)(isCtrl ? 1 : 0);
+    q->addr = addr; q->endpt = endpt;
+}
+/* One-time static init of an endpoint QH: bind its QH + 2 qTDs to the wired page, program it, set MULT=1,
+ * install an inactive tail dummy qTD with the overlay pointed at it (empty overlay => dt=0 = DATA0 initial),
+ * then splice the QH into the async reclamation ring. */
+static void epq_init(EpQ *q, UInt8 *pg, UInt32 pgP, UInt32 qhOff, UInt32 td0Off, UInt32 td1Off,
+                     UInt32 addr, UInt32 endpt, UInt32 maxpkt, int isCtrl)
+{
+    int i;
+    q->qh    = (ehci_qh  *)(pg + qhOff);  q->qhP    = pgP + qhOff;
+    q->td[0] = (ehci_qtd *)(pg + td0Off); q->tdP[0] = pgP + td0Off;
+    q->td[1] = (ehci_qtd *)(pg + td1Off); q->tdP[1] = pgP + td1Off;
+    epq_program(q, addr, endpt, maxpkt, isCtrl);
+    q->qh->epCaps = ehci_cpu_to_le32(EHCI_QH_MULT(1));   /* Mult=1 required — some HCs won't run a Mult=0 async QH */
+    q->qh->curQtd = 0;
+    q->td[0]->next = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
+    q->td[0]->altNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
+    q->td[0]->token = 0;                                 /* inactive tail dummy */
+    for (i = 0; i < 5; i++) q->td[0]->buffer[i] = 0;
+    q->qh->ovlNext = ehci_cpu_to_le32(q->tdP[0]);        /* overlay's Next-qTD -> the dummy */
+    q->qh->ovlAltNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
+    q->qh->ovlToken = 0;                                 /* inactive, dt=0 (DATA0) — EHCI 4.10 "first use" init */
+    for (i = 0; i < 5; i++) q->qh->ovlBuffer[i] = 0;
+    q->dummy = 0;
+    ehci_qh_link_async(&gSoftc, q->qh, q->qhP);          /* splice into the async ring (anchor stays ASYNCLISTADDR) */
 }
 int ehci_vhub_xfer_init(void)
 {
     Ptr raw; LogicalAddress pg; LogicalToPhysicalTable t; unsigned long cnt = 1; UInt32 pgP; int i;
+    UInt8 *p;
     raw = NewPtrSysClear(0x2000);
     if (!raw) { gDownInitErr = 1; return -1; }
     pg = (LogicalAddress)(((UInt32)raw + 0xFFFUL) & ~0xFFFUL);
@@ -203,8 +258,6 @@ int ehci_vhub_xfer_init(void)
     if (GetPhysical(&t, &cnt) != noErr)  { gDownInitErr = 3; return -1; }
     pgP = (UInt32)t.physical[0].address;
     gDownPg = (volatile UInt8 *)pg; gDownPgP = pgP;
-    gDownQH  = (ehci_qh  *)((UInt8 *)pg + DOWN_QH_OFF);  gDownQHP  = pgP + DOWN_QH_OFF;
-    gDownQTD = (ehci_qtd *)((UInt8 *)pg + DOWN_QTD_OFF); gDownQTDP = pgP + DOWN_QTD_OFF;
     /* r46: SEPARATE 20KB (5-page) wired DMA bounce so one BOT command moves up to 40 blocks — one qTD
      * spans 5 buffer pointers = 20KB. Record each page's PHYSICAL address; the pages need not be
      * physically contiguous (the 5 qTD buffer pointers handle the scatter). ~6x fewer BOT commands +
@@ -224,19 +277,18 @@ int ehci_vhub_xfer_init(void)
             gDownBufPhys[i] = (UInt32)t2.physical[0].address;
         }
     }
-    /* r45 ROOT-CAUSE FIX for the intermittent enum wall (the r44 capture: ASYNCLISTADDR pointed at the
-     * anchor, not our QH, on ~2/3 of boots → controller looped the empty anchor → every downstream
-     * transfer timed out = "device unreachable"). Do NOT self-link this QH and do NOT overwrite
-     * ASYNCLISTADDR (unreliable while the schedule runs). Instead SPLICE it into the async anchor ring
-     * and leave ASYNCLISTADDR = the anchor (set once by ehci_hc_start). The controller then always
-     * reaches us: anchor -> gDownQH -> anchor. This is what ehci_qh_link_async was built for. */
-    down_prog_addr(0);
-    gDownQH->epCaps  = ehci_cpu_to_le32(EHCI_QH_MULT(1));
-    gDownQH->curQtd  = 0;
-    gDownQH->ovlNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
-    gDownQH->ovlAltNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
-    gDownQH->ovlToken = ehci_cpu_to_le32(EHCI_QTD_STATUS_HALTED);
-    ehci_qh_link_async(&gSoftc, gDownQH, gDownQHP);   /* sets gDownQH->hlink + publishes into the anchor ring */
+    /* r63: three resident per-endpoint QHs, each with 2 alternating qTDs, all spliced into the async ring.
+     * 32-byte-aligned page layout: QHs at 0x000/0x040/0x080; qTD pairs at 0x0C0.../0x100.../0x140...
+     * (r45 lesson retained: we SPLICE into the anchor ring and never touch ASYNCLISTADDR, which stays = the
+     * anchor set once by ehci_hc_start; overwriting it live was the old intermittent-enum wall.) */
+    p = (UInt8 *)pg;
+    epq_init(&gCtrlQ,    p, pgP, 0x000, 0x0C0, 0x0E0, 0, 0,  64, 1);   /* control ep0 (addr set at SET_ADDRESS), DTC=1 */
+    epq_init(&gBulkQ[0], p, pgP, 0x040, 0x100, 0x120, 0, 0, 512, 0);   /* bulk-OUT, DTC=0 (HW toggle) */
+    epq_init(&gBulkQ[1], p, pgP, 0x080, 0x140, 0x160, 0, 0, 512, 0);   /* bulk-IN,  DTC=0 (HW toggle) */
+    ehci_os_log("=== r63 (A1): per-endpoint QHs spliced (ctrl ep0 + bulk-OUT + bulk-IN); bulk toggle in HARDWARE (DTC=0) ===");
+    ehci_os_logx("  ctrlQH phys",  gCtrlQ.qhP);
+    ehci_os_logx("  bulkOUT phys", gBulkQ[0].qhP);
+    ehci_os_logx("  bulkIN phys",  gBulkQ[1].qhP);
     gDownReady = 1;
     return 0;
 }
@@ -244,48 +296,80 @@ static void down_arm_ase(void)
 {
     if (gDownAseOn) return;
     /* r45: do NOT write ASYNCLISTADDR here — it stays = the anchor (set once by ehci_hc_start), and our
-     * QH is spliced into the anchor ring in xfer_init. Overwriting it while the schedule ran was the
+     * QHs are spliced into the anchor ring in xfer_init. Overwriting it while the schedule ran was the
      * intermittent enum wall. Just ensure the async schedule is enabled (it already is, from init). */
     ehci_write32(gSoftc.opBase, EHCI_USBCMD, ehci_read32(gSoftc.opBase, EHCI_USBCMD) | EHCI_CMD_ASE);
     gDownAseOn = 1;
 }
+/* ==================== async-ring integrity backstop (r60, retained) ====================
+ * The QH-unlink FREEZE theory was DISPROVEN (r60-r62: downRelink stayed 0; the ring is written only by us
+ * via ehci_qh_link_async and the controller never touches a QH hlink, so it never actually breaks). This is
+ * kept purely as a cheap, happy-path-free backstop + the gLastAnchorLink diagnostic. Now a 3-QH ring
+ * (anchor -> our three QHs -> anchor): "intact" = the anchor still heads into one of our QHs. */
+#define QH_LINK_PTR(v) (ehci_le32_to_cpu(v) & ~0x1FUL)   /* strip TYP(2:1)+T(0) -> the 32-byte-aligned phys ptr */
+static int is_our_qh(UInt32 p) { return p == gCtrlQ.qhP || p == gBulkQ[0].qhP || p == gBulkQ[1].qhP; }
+static void down_relink_if_needed(void)
+{
+    UInt32 aLink;
+    if (!gDownReady || gSoftc.asyncAnchor == 0) return;
+    aLink = QH_LINK_PTR(gSoftc.asyncAnchor->hlink);
+    gLastAnchorLink = aLink;                        /* diag */
+    if (is_our_qh(aLink)) return;                   /* anchor heads into our QHs -> intact (happy path, no writes) */
+    ehci_qh_link_async(&gSoftc, gCtrlQ.qh, gCtrlQ.qhP);       /* should never fire — re-splice all three */
+    ehci_qh_link_async(&gSoftc, gBulkQ[0].qh, gBulkQ[0].qhP);
+    ehci_qh_link_async(&gSoftc, gBulkQ[1].qh, gBulkQ[1].qhP);
+    gDownRelink++;
+}
+/* Append one transfer to endpoint queue q via the DUMMY-qTD method (race-free; EHCI 4.10.2 + Linux
+ * qh_append_tds). Fill the current tail dummy in place as the real qTD — body first, a barrier, then the
+ * Active token written LAST as a single store — and hand off a fresh inactive dummy as the new tail. The
+ * controller only ever observes the old inactive dummy (fetch -> Active=0 -> abort advance, retry next
+ * pass) or a fully-formed active qTD, never a half-built one. Bulk QH (dtc=0): the qTD toggle bit is
+ * ignored; the controller carries the endpoint toggle in the QH overlay. Control (dtc=1): `dt` seeds it. */
+static void epq_issue(EpQ *q, UInt32 len, UInt32 pid, int useBounce, UInt32 dt)
+{
+    int d = q->dummy, nd = d ^ 1, i;
+    ehci_qtd *cur = q->td[d];        /* the current tail dummy -> becomes the live qTD */
+    ehci_qtd *nxt = q->td[nd];       /* the new tail dummy */
+    UInt32 tok = EHCI_QTD_STATUS_ACTIVE | EHCI_QTD_CERR(3) | EHCI_QTD_IOC | EHCI_QTD_BYTES(len) |
+                 (pid == 2 ? EHCI_QTD_PID_SETUP : (pid == 1 ? EHCI_QTD_PID_IN : EHCI_QTD_PID_OUT)) |
+                 ((q->dtc && dt) ? EHCI_QTD_TOGGLE : 0u);
+    nxt->next = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);      /* new inactive tail dummy */
+    nxt->altNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
+    nxt->token = 0;
+    cur->next = ehci_cpu_to_le32(q->tdP[nd]);              /* live qTD -> the new dummy */
+    cur->altNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
+    for (i = 0; i < 5; i++) cur->buffer[i] = useBounce ? ehci_cpu_to_le32(gDownBufPhys[i]) : 0;   /* r46: 5 pages -> up to 20KB */
+    __asm__ __volatile__("eieio");                          /* body + new dummy visible BEFORE Active */
+    cur->token = ehci_cpu_to_le32(tok);                     /* ACTIVATE — the single Active-setting store, LAST */
+    __asm__ __volatile__("eieio");
+    q->dummy = (UInt8)nd;
+    gDpQ = q; gDpTd = cur;                                  /* the qTD down_reap polls for completion */
+}
 static void down_issue(volatile DownReq *r)
 {
-    UInt32 tok, i, dt, m; int useBounce = 0;   /* r46: useBounce flag replaces the single bufP address */
+    EpQ *q; UInt32 dt, i; int useBounce = 0;
     down_arm_ase();
     if (r->bulkEp < 0) {                                    /* CONTROL (ep0): SETUP=DATA0, data/status=DATA1 */
-        if (r->addr != gDownQHAddr) down_prog_addr(r->addr);
+        q = &gCtrlQ;
+        if (q->addr != r->addr) epq_program(q, r->addr, 0, 64, 1);   /* (re)point ep0 at this device addr (QH idle) */
         dt = (r->pid == 2) ? 0u : 1u;
         gDpNpkt = 1;
-    } else {                                                /* BULK: reprogram the shared QH for this endpoint */
-        m = gBulkEP[r->bulkEp].maxpkt ? gBulkEP[r->bulkEp].maxpkt : 512;
-        gDownQH->epChar = ehci_cpu_to_le32(EHCI_QH_DEVADDR(r->addr) | EHCI_QH_ENDPT(gBulkEP[r->bulkEp].endpt) |
-                            EHCI_QH_EPS_HIGH | EHCI_QH_MAXLEN(m) | EHCI_QH_DTC | EHCI_QH_RL(4));   /* r45: no HEAD (spliced member, not the ring head) */
-        gDownQHAddr = 0xFFFFUL;                             /* force a control re-program on the next ep0 xfer */
-        dt = gBulkEP[r->bulkEp].toggle;                     /* software per-endpoint data toggle */
+    } else {                                                /* BULK: the endpoint's OWN resident QH (HW toggle) */
+        UInt32 m = gBulkEP[r->bulkEp].maxpkt ? gBulkEP[r->bulkEp].maxpkt : 512;
+        q = &gBulkQ[gBulkEP[r->bulkEp].dirIn ? 1 : 0];
+        dt = 0;                                             /* ignored for bulk (DTC=0 — HW owns the toggle) */
         gDpNpkt = (r->len + m - 1) / m; if (gDpNpkt == 0) gDpNpkt = 1;
     }
     if (r->obig) { UInt32 nn = (r->obiglen > DOWN_BUF_MAX) ? DOWN_BUF_MAX : r->obiglen;   /* large OUT: copy write data to the bounce */
                    for (i = 0; i < nn; i++) gDownBuf[i] = ((volatile UInt8 *)r->obig)[i]; useBounce = 1; }
     else if (r->pid == 2 || (r->pid == 0 && r->olen)) { for (i = 0; i < r->olen; i++) gDownBuf[i] = r->obuf[i]; useBounce = 1; }
     else if (r->pid == 1 && r->len) { useBounce = 1; }        /* IN: HC DMAs into the bounce */
-    tok = EHCI_QTD_STATUS_ACTIVE | EHCI_QTD_CERR(3) | EHCI_QTD_IOC | EHCI_QTD_BYTES(r->len) |
-          (r->pid == 2 ? EHCI_QTD_PID_SETUP : (r->pid == 1 ? EHCI_QTD_PID_IN : EHCI_QTD_PID_OUT)) |
-          (dt ? EHCI_QTD_TOGGLE : 0u);
-    gDownQTD->next    = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
-    gDownQTD->altNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
-    for (i = 0; i < 5; i++) gDownQTD->buffer[i] = useBounce ? ehci_cpu_to_le32(gDownBufPhys[i]) : 0;   /* r46: 5 pages -> up to 20KB per qTD */
-    gDownQTD->token = ehci_cpu_to_le32(tok);
     gDpUPP = r->upp; gDpPipe = r->pipe; gDpDest = r->dest; gDpLen = r->len; gDpIsIn = (r->pid == 1);
     gDpBulkEp = r->bulkEp;
     gDpLastAddr = r->addr; gDpLastPid = r->pid;             /* r36 diag: name the in-flight downstream xfer */
-    gDpArmTick = gVhubTick; gDpBusy = 1;
-    gDownQH->curQtd  = 0;
-    gDownQH->ovlNext = ehci_cpu_to_le32(gDownQTDP);
-    gDownQH->ovlAltNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
-    for (i = 0; i < 5; i++) gDownQH->ovlBuffer[i] = 0;
-    __asm__ __volatile__("eieio");
-    gDownQH->ovlToken = 0;                       /* clear Active/Halted -> HC executes ovlNext */
+    gDpArmTick = *(volatile UInt32 *)0x016AUL; gDpBusy = 1;   /* r54: arm the stall watchdog with the 60Hz Ticks clock */
+    epq_issue(q, r->len, r->pid, useBounce, dt);
 }
 static void down_pump(void)
 {
@@ -322,11 +406,11 @@ static void down_submit(void *pipe, void *upp, volatile UInt8 *buf, UInt32 addr,
 #define BIOQ_N 16
 typedef struct { IOCommandID cmdID; UInt32 lba, count, reqBytes; UInt8 *buf; long *actCount; UInt8 isWrite; } BioReq;
 static BioReq gBioQ[BIOQ_N];
-static UInt32 gBioHead = 0, gBioTail = 0;      /* ring: [tail]=current in-flight request, head=enqueue */
+static volatile UInt32 gBioHead = 0, gBioTail = 0; /* ring: [tail]=in-flight, head=enqueue. r48: volatile — the ring is now the ONE cross-context hand-off: producer = ehci_usb_submit (TASK level), consumer = bio_advance (INTERRUPT level). Must not be register-cached across that boundary. */
 static int    gBioPhase = 0;                   /* 0 idle; 1 CBW issued; 2 data issued; 3 CSW issued */
 static UInt32 gBioChunk = 0;                    /* blocks in the current READ(10)/WRITE(10) */
 static long   gBioResult = 0;
-static void bio_advance(void);                  /* forward: driven from down_reap on each completion */
+static void bio_advance(long status);           /* forward: driven from down_reap on each completion (r57: takes the xfer status) */
 
 /* r39 DIAGNOSTIC: snapshot the EHCI controller + shared-QH state at the instant a downstream transfer
  * TIMES OUT (qTD stayed Active past the watchdog). r38 proved the port is ENABLED yet transfers never
@@ -340,11 +424,11 @@ static void capture_timeout_state(void)
     gToCmd      = ehci_read32(gSoftc.opBase, EHCI_USBCMD);
     gToSts      = ehci_read32(gSoftc.opBase, EHCI_USBSTS);
     gToAsync    = ehci_read32(gSoftc.opBase, EHCI_ASYNCLISTADDR);
-    gToQhP      = gDownQHP;
-    gToQhEpChar = ehci_le32_to_cpu(gDownQH->epChar);
-    gToQhCurQtd = ehci_le32_to_cpu(gDownQH->curQtd);
-    gToQhOvlTok = ehci_le32_to_cpu(gDownQH->ovlToken);
-    gToQtdTok   = ehci_le32_to_cpu(gDownQTD->token);
+    gToQhP      = gDpQ ? gDpQ->qhP : 0;                                  /* r63: the ACTIVE endpoint QH/qTD */
+    gToQhEpChar = gDpQ ? ehci_le32_to_cpu(gDpQ->qh->epChar) : 0;
+    gToQhCurQtd = gDpQ ? ehci_le32_to_cpu(gDpQ->qh->curQtd) : 0;
+    gToQhOvlTok = gDpQ ? ehci_le32_to_cpu(gDpQ->qh->ovlToken) : 0;
+    gToQtdTok   = gDpTd ? ehci_le32_to_cpu(gDpTd->token) : 0;
     __asm__ __volatile__("eieio");                       /* publish payload before the seq bump */
     gToSeq++;
 }
@@ -357,13 +441,31 @@ UInt32 ehci_vhub_timeout_state(UInt32 *cmd, UInt32 *sts, UInt32 *async, UInt32 *
     return gToSeq;
 }
 
+/* r53 RELIABILITY FIX — the root cause of the whole "disk error"/"problem with the disk" saga. After a
+ * WRITE, cheap USB flash (the SanDisk) intermittently NAKs the CSW-status IN for MULTIPLE SECONDS while it
+ * does internal garbage-collection. The r39 XFER TIMEOUT snapshot proved it: qTD ACTIVE, CERR=3 (no errors),
+ * NOT halted, 13 bytes (=the CSW) outstanding, schedule running on our QH — i.e. a BUSY device, not a fault.
+ * The old 200-tick (~1.6s) watchdog fired anyway → we falsely completed the write with -6640/-36 → Finder
+ * "cannot be written, disk error"; and since the write ACTUALLY SUCCEEDED on the device while we told the
+ * File Mgr it failed, the volume's bookkeeping diverged → "problem with the disk" (metadata corruption).
+ * FIX: be patient with a NAKing device (Apple's USB stack uses ~30s command timeouts). Real faults still
+ * fail FAST via the HALTED/XACTERR/BABBLE/DBERR branch below — only pure device-busy waits this long. */
+/* r54: r53's tick-counter watchdog (200->4096) cut timeouts 54->3 — right direction, but gVhubTick's rate
+ * is variable, so switch to the OS 60.15Hz Ticks low-mem global = a RELIABLE wall clock (interrupt-safe to
+ * read), wait 60s, and MEASURE the worst-case stall (gMaxStallTicks) so we stop guessing. A CSW-NAK write
+ * has ALREADY landed on the device, so waiting is always correct; failing = the false-failure + corruption. */
+#define TICKS_NOW (*(volatile UInt32 *)0x016AUL)   /* Ticks: 60.15Hz since boot */
+#define DOWN_WATCHDOG_TICKS (30UL * 60UL)          /* r62 PATIENCE TEST: 30s (was r58's 8s). r61 proved removing the destructive reset = machine ALIVE, but the drive then went persistently wedged because we ABANDON a NAKing transfer at the watchdog (desyncing BOT). Open question the per-endpoint rework hinges on: are the multi-second stalls genuine HS flash BACKPRESSURE that resolves if we WAIT (the stick is flawless on 12Mbps 1.1, consistent with 480Mbps overrunning its flash), or a driver hazard? We've never waited past 8s to find out. 30s + fail-clean (recovery still OFF): if the copy COMPLETES / downTimeouts stays 0 with maxStall well under 30s => backpressure, PATIENCE is the fix (tune to ~2x maxStall) and the per-endpoint rework becomes a throughput task; if downTimeouts still climbs (stalls hit 30s) => not mere backpressure => the structural per-endpoint rework is needed. */
+static volatile UInt32 gMaxStallTicks = 0;         /* longest observed transfer stall, in 60Hz ticks */
 static void down_reap(void)
 {
     UInt32 tok; long status; UInt32 actual = 0;
     if (gDpBusy) {
-        tok = ehci_le32_to_cpu(gDownQTD->token);
+        tok = ehci_le32_to_cpu(gDpTd->token);   /* r63: poll the qTD activated on the endpoint's own QH */
         if (tok & EHCI_QTD_STATUS_ACTIVE) {
-            if ((gVhubTick - gDpArmTick) > 200UL) { gDownTimeouts++; capture_timeout_state(); status = -6640L; }  /* watchdog + r39 snapshot */
+            UInt32 el = TICKS_NOW - gDpArmTick;
+            if (el > gMaxStallTicks) gMaxStallTicks = el;   /* r54: track the device's worst-case GC pause */
+            if (el > DOWN_WATCHDOG_TICKS) { gDownTimeouts++; capture_timeout_state(); status = -6640L; }  /* watchdog + r39 snapshot */
             else return;
         } else if (tok & (EHCI_QTD_STATUS_HALTED | EHCI_QTD_STATUS_XACTERR | EHCI_QTD_STATUS_BABBLE | EHCI_QTD_STATUS_DBERR)) {
             gDownErr++; status = -6640L;
@@ -375,7 +477,8 @@ static void down_reap(void)
                 volatile UInt8 *dd = (volatile UInt8 *)gDpDest; UInt32 i;
                 for (i = 0; i < actual; i++) dd[i] = gDownBuf[i];
             }
-            if (gDpBulkEp >= 0) gBulkEP[gDpBulkEp].toggle ^= (UInt8)(gDpNpkt & 1u);  /* advance bulk data toggle */
+            /* r63: NO software toggle advance — with DTC=0 the controller maintains the bulk data toggle
+             * in the endpoint QH overlay across every transfer (the OHCI-style fix for the BOT desync). */
         }
         if (gDpBulkEp >= 0) {   /* snapshot for the task-context diagnostic log */
             UInt32 i; gBulkLastStat = status;
@@ -390,7 +493,7 @@ static void down_reap(void)
             else                  /* control: completion(pipeRef, status) — 2 args */
                 ((ehci_usl_complete)gDpUPP)((void *)gDpPipe, (unsigned long)status);
         }
-        if (gBioPhase && !gDpUPP) bio_advance();   /* r34: advance the async block-I/O state machine */
+        if (gBioPhase && !gDpUPP) bio_advance(status);   /* r34/r57: advance the async block-I/O state machine (pass the xfer status for recovery) */
     }
     down_pump();
 }
@@ -414,16 +517,19 @@ void ehci_vhub_down_stats(UInt32 *done, UInt32 *err, UInt32 *timeouts, UInt32 *q
 /* ==================== dispatch slots 6/7: bulk (mass storage) ====================
  * Slot 6 CreateBulkEndpoint just REGISTERS the endpoint (addr, endpt, dir, maxpkt) — the USL routes
  * slot-7 transfers purely by (addr, endpt) with no opaque handle, so a stub cannot work (RE-confirmed).
- * Slot 7 BulkTransfer enqueues onto the same serialized FIFO with a valid endpoint index; down_issue
- * reprograms the shared QH + applies the software toggle; down_reap fires the 3-arg completion. */
+ * Slot 7 BulkTransfer enqueues onto the serialized FIFO with a valid endpoint index; down_issue routes to
+ * the endpoint's OWN resident QH (HW toggle, DTC=0); down_reap fires the 3-arg completion. r63: registering
+ * an endpoint also programs its dedicated QH (gBulkQ[dirIn]); the QH's overlay was init'd to DATA0. */
 long ehci_vhub_create_bulk(UInt32 addr, UInt32 endpt, UInt32 dirIn, UInt32 maxpkt)
 {
     int i, freeSlot = -1;
+    UInt32 mp = maxpkt ? maxpkt : 512;
     for (i = 0; i < NBULK; i++) {
         if (gBulkEP[i].used && gBulkEP[i].addr == addr && gBulkEP[i].endpt == endpt) {
             gBulkEP[i].dirIn = (UInt8)(dirIn ? 1 : 0);
-            gBulkEP[i].maxpkt = (UInt16)(maxpkt ? maxpkt : 512);
-            gBulkEP[i].toggle = 0;                       /* fresh endpoint => DATA0 */
+            gBulkEP[i].maxpkt = (UInt16)mp;
+            gBulkEP[i].toggle = 0;                       /* legacy field; HW owns the toggle now */
+            epq_program(&gBulkQ[dirIn ? 1 : 0], addr, endpt, mp, 0);   /* bind this endpoint to its resident bulk QH */
             return 0;
         }
         if (!gBulkEP[i].used && freeSlot < 0) freeSlot = i;
@@ -431,8 +537,9 @@ long ehci_vhub_create_bulk(UInt32 addr, UInt32 endpt, UInt32 dirIn, UInt32 maxpk
     if (freeSlot < 0) return -1;
     gBulkEP[freeSlot].addr = addr; gBulkEP[freeSlot].endpt = endpt;
     gBulkEP[freeSlot].dirIn = (UInt8)(dirIn ? 1 : 0);
-    gBulkEP[freeSlot].maxpkt = (UInt16)(maxpkt ? maxpkt : 512);
+    gBulkEP[freeSlot].maxpkt = (UInt16)mp;
     gBulkEP[freeSlot].toggle = 0; gBulkEP[freeSlot].used = 1;
+    epq_program(&gBulkQ[dirIn ? 1 : 0], addr, endpt, mp, 0);   /* program the endpoint's resident bulk QH (DTC=0) */
     return 0;
 }
 /* r32 ROOT-CAUSE FIX: set to 1 once our self-probe takes over the endpoints. While set,
@@ -571,6 +678,7 @@ static long ehci_usb_write(UInt32 lba, UInt32 count, void *buf)
 static volatile UInt32 gFailSeq = 0, gFailLba = 0, gFailCswSig = 0, gFailCswResid = 0;
 static volatile UInt16 gFailChunk = 0; static volatile UInt8 gFailIsWrite = 0, gFailCswStat = 0;
 static volatile UInt32 gBioWrOk = 0, gBioRdOk = 0, gBioReject = 0;
+static volatile UInt32 gBioHiWater = 0;   /* r49: peak ring occupancy seen at submit — decides ring-full(a) vs slow-engine-timeout(b) for the Finder large-copy "disk error" */
 static void biofail(UInt8 isWrite, UInt32 lba, UInt16 chunk)
 {
     gFailIsWrite = isWrite; gFailLba = lba; gFailChunk = chunk;
@@ -588,6 +696,67 @@ UInt32 ehci_vhub_biofail(UInt8 *isWrite, UInt32 *lba, UInt16 *chunk, UInt8 *cswS
     if (wrOk) *wrOk = gBioWrOk; if (rdOk) *rdOk = gBioRdOk; if (reject) *reject = gBioReject;
     return gFailSeq;
 }
+/* r49: block-I/O engine health for the app's idle-loop THREAD-B diagnostic (exposed via 'Eusb' healthFn).
+ * reject>0                 => the 16-deep async ring overflowed (Finder out-ran us) = mechanism (a); cheap
+ *                             fix = deeper ring + soft back-pressure instead of hard ioErr.
+ * downTimeouts>0(reject==0) => the slow single-in-flight engine watchdog-timed-out = mechanism (b); R4.
+ * hiwater                  => peak ring occupancy; near BIOQ_N(16) = ring pressure even if a later deeper
+ *                             ring hides the actual reject. downDone confirms the copy volume went through. */
+void ehci_vhub_health(UInt32 *reject, UInt32 *hiwater, UInt32 *downTimeouts, UInt32 *downErr, UInt32 *downDone,
+                      UInt32 *failSeq, UInt32 *failStat, UInt32 *failSig, UInt32 *failLba, UInt32 *isrHits, UInt32 *maxStall,
+                      UInt32 *downRecov, UInt32 *downRelink, UInt32 *lastAnchorLink)
+{
+    if (maxStall)     *maxStall     = gMaxStallTicks;  /* r54: worst-case transfer stall in 60Hz ticks (device GC pause) */
+    if (isrHits)      *isrHits      = gIsrHits;   /* R4-P1: real EHCI IRQs. vs downDone: ~= => interrupt-driven; << => 8ms-heartbeat-polled (the stall) */
+    if (reject)       *reject       = gBioReject;
+    if (hiwater)      *hiwater      = gBioHiWater;
+    if (downTimeouts) *downTimeouts = gDownTimeouts;
+    if (downErr)      *downErr      = gDownErr;
+    if (downDone)     *downDone     = gDownDone;
+    /* r50: the CSW-level failure that becomes the Finder's "cannot be written, disk error" (gPB[12]!=0
+     * -> gBioResult=-36 in bio_advance case 3). NOT counted by downErr (that's transport-level only).
+     * failSeq>0 => a CSW failure DID hit our engine; failSig=='USBS'(55534253) + failStat==1 => the DEVICE
+     * rejected the write (real CHECK CONDITION — we issue NO REQUEST SENSE); failSig!='USBS' => our CSW read
+     * is garbage (transport/framing bug); failSeq==0 (with the dialog seen) => the error is ABOVE us (File
+     * Mgr/HFS), our engine never saw it. failLba = the block. */
+    if (failSeq)      *failSeq      = gFailSeq;
+    if (failStat)     *failStat     = (UInt32)gFailCswStat;
+    if (failSig)      *failSig      = gFailCswSig;
+    if (failLba)      *failLba      = gFailLba;
+    if (downRecov)    *downRecov    = gDownRecov;   /* r57: BOT reset-recoveries attempted (a stall we RECOVERED, not false-failed) */
+    /* r60: the QH-unlink freeze fix. downRelink>0 => our downstream QH fell out of the async ring under
+     * heavy wedging and we RE-SPLICED it (freeze converted to slow-but-alive). lastAnchorLink = the phys
+     * the async anchor currently points at; == gDownQHP means the ring is intact right now. */
+    if (downRelink)     *downRelink     = gDownRelink;
+    if (lastAnchorLink) *lastAnchorLink = gLastAnchorLink;
+}
+
+/* r57 BOT ERROR RECOVERY — the robustness layer Apple's 1.1 mass-storage driver has and we lacked. On a
+ * bulk transfer timeout/error (device wedged/NAKing the CBW), instead of false-failing the write (which
+ * corrupted the volume), issue the standard USB Bulk-Only recovery: Mass-Storage Reset + CLEAR_FEATURE
+ * (ENDPOINT_HALT) on both bulk endpoints + reset the data toggles to DATA0, then RETRY the command. All via
+ * ep0 control transfers (down_submit(...,-1)). Bounded by BIO_MAX_RETRY. Recovery phases live above the
+ * normal BOT phases (1/2/3) in gBioPhase so the happy path is untouched. */
+#define REC_BASE          20
+#define REC_RESET_SETUP   20
+#define REC_RESET_STATUS  21
+#define REC_CLROUT_SETUP  22
+#define REC_CLROUT_STATUS 23
+#define REC_CLRIN_SETUP   24
+#define REC_CLRIN_STATUS  25
+#define BIO_MAX_RETRY     3
+/* r61 BISECTION (B, before the per-endpoint-QH rework A): the SanDisk works flawlessly on 1.1/OHCI, so the
+ * freeze is OURS. r60 proved the async ring stays intact — the freeze is NOT the schedule. Leading theory:
+ * our destructive Bulk-Only Reset recovery (fired on a merely-NAKing device) desyncs BOT and the reset churn
+ * freezes the machine. This switch DISABLES the destructive recovery: on a bulk timeout we FAIL THE REQUEST
+ * CLEANLY (no Mass-Storage Reset, no CLEAR_FEATURE churn, no retry) and move on. Changing ONLY this vs r60
+ * (same 8s watchdog) isolates the recovery as the freeze cause: r61 STAYS ALIVE (slow, disk errors, no hard
+ * freeze) => the reset churn WAS the freeze => the (A) rework drops it for OHCI-style patience; r61 STILL
+ * FREEZES => the freeze is deeper (single-QH-blocks-everything / OS-HFS), (A) fixes it via concurrency. Set
+ * back to 1 to restore r57-r60 behavior. */
+#define BIO_DESTRUCTIVE_RECOVERY 0
+static UInt32 gBioRetry = 0;              /* recovery+retry attempts for the current chunk */
+static UInt8  gRecovSetup[8];             /* scratch SETUP packet for the recovery control requests */
 
 /* ---- r34 async block-I/O state machine (see the block comment at gBioQ). Uses the same pb_* BOT
  * primitives as the self-probe but advances on completions instead of spinning in pb_wait. ---- */
@@ -606,13 +775,68 @@ static void bio_start_chunk(void)                 /* issue the CBW for the curre
 static void bio_kick(void)                        /* if idle and the queue is non-empty, start the next request */
 {
     if (gBioPhase != 0 || gBioHead == gBioTail) return;
-    gBioResult = 0;
+    gBioResult = 0; gBioRetry = 0;                 /* r57: fresh request -> full retry budget */
     bio_start_chunk();
 }
-static void bio_advance(void)                     /* called from down_reap after each self-driven completion */
+/* r57: build a zero-data SETUP packet for a recovery control request (wLength=0). */
+static void recov_setup(UInt8 bmRT, UInt8 bReq, UInt16 wValue, UInt16 wIndex)
+{
+    gRecovSetup[0] = bmRT; gRecovSetup[1] = bReq;
+    gRecovSetup[2] = (UInt8)wValue; gRecovSetup[3] = (UInt8)(wValue >> 8);
+    gRecovSetup[4] = (UInt8)wIndex; gRecovSetup[5] = (UInt8)(wIndex >> 8);
+    gRecovSetup[6] = 0; gRecovSetup[7] = 0;
+}
+/* r57: complete the current block request back to the File Manager (res 0=ok, else the failure code). */
+static void bio_finish(BioReq *r, long res)
+{
+    IOCommandID done = r->cmdID;
+    if (r->actCount) *r->actCount = (res == 0) ? (long)r->reqBytes : (long)(r->reqBytes - r->count * 512);
+    gBioTail++; gBioPhase = 0; gBioRetry = 0;      /* dequeue BEFORE completing (completion may enqueue more) */
+    (void)IOCommandIsComplete(done, (OSErr)res);   /* interrupt-safe: hand the block I/O back to the File Mgr */
+    bio_kick();                                    /* start the next queued request */
+}
+/* r57: begin BOT reset recovery for the current (timed-out) chunk — issue the Bulk-Only Mass Storage Reset. */
+static void bio_recover_start(void)
+{
+    UInt32 addr;
+    if (gPOut < 0 || gPIn < 0) return;
+    addr = gBulkEP[gPOut].addr;
+    gDownRecov++;
+    recov_setup(0x21, 0xFF, 0x0000, 0x0000);       /* class, iface recipient; bRequest 0xFF = Bulk-Only Reset; iface 0 */
+    down_submit(0, 0, gRecovSetup, addr, 8, 2, -1);   /* SETUP on ep0 */
+    gBioPhase = REC_RESET_SETUP;
+}
+/* r57: drive the recovery sequence on each control completion, then retry the command. */
+static void bio_recover_advance(long status)
+{
+    BioReq *r = &gBioQ[gBioTail % BIOQ_N];
+    UInt32 addr = (gPOut >= 0) ? gBulkEP[gPOut].addr : 0;
+    if (status != 0) { bio_finish(r, status); return; }   /* ep0 itself unresponsive -> give up on this request */
+    switch (gBioPhase) {
+    case REC_RESET_SETUP:   down_submit(0, 0, gPB, addr, 0, 1, -1); gBioPhase = REC_RESET_STATUS; break;  /* reset STATUS-IN (0 len) */
+    case REC_RESET_STATUS:  recov_setup(0x02, 0x01, 0x0000, gBulkEP[gPOut].endpt);            /* CLEAR_FEATURE(HALT) bulk-OUT */
+                            down_submit(0, 0, gRecovSetup, addr, 8, 2, -1); gBioPhase = REC_CLROUT_SETUP; break;
+    case REC_CLROUT_SETUP:  down_submit(0, 0, gPB, addr, 0, 1, -1); gBioPhase = REC_CLROUT_STATUS; break;
+    case REC_CLROUT_STATUS: recov_setup(0x02, 0x01, 0x0000, (UInt16)(gBulkEP[gPIn].endpt | 0x80u));   /* CLEAR_FEATURE(HALT) bulk-IN */
+                            down_submit(0, 0, gRecovSetup, addr, 8, 2, -1); gBioPhase = REC_CLRIN_SETUP; break;
+    case REC_CLRIN_SETUP:   down_submit(0, 0, gPB, addr, 0, 1, -1); gBioPhase = REC_CLRIN_STATUS; break;
+    case REC_CLRIN_STATUS:  gBulkEP[gPOut].toggle = 0; gBulkEP[gPIn].toggle = 0;   /* Bulk-Only Reset resets device toggles to DATA0 */
+                            down_relink_if_needed();   /* r60: the reset churn is the suspected ring-disruptor — verify our QH is still spliced before re-launching */
+                            bio_start_chunk();     /* RETRY the timed-out chunk from the CBW (gBioPhase -> 1) */
+                            break;
+    }
+}
+static void bio_advance(long status)              /* r57: status = down-engine result (0=ok, else timeout/error) */
 {
     BioReq *r = &gBioQ[gBioTail % BIOQ_N];
     UInt32 nbytes = gBioChunk * 512, i;
+    if (gBioPhase >= REC_BASE) { bio_recover_advance(status); return; }   /* r57: in the recovery sequence */
+    if (status != 0) {   /* r57: a BOT phase (CBW/data/CSW) TIMED OUT or errored. Do NOT read stale gPB (the old
+                          * fake-CSW artifact) — reset-recover + retry, or fail cleanly with the real code if exhausted. */
+        if (BIO_DESTRUCTIVE_RECOVERY && gBioRetry < BIO_MAX_RETRY && gPOut >= 0 && gPIn >= 0) { gBioRetry++; bio_recover_start(); }
+        else bio_finish(r, status);   /* r61: recovery disabled -> fail this request CLEAN (no reset churn) and move on */
+        return;
+    }
     switch (gBioPhase) {
     case 1:                                       /* CBW done -> data phase */
         if (r->isWrite) { for (i = 0; i < nbytes; i++) gPB[i] = r->buf[i]; pb_out(nbytes); }  /* stage+send write data */
@@ -622,17 +846,11 @@ static void bio_advance(void)                     /* called from down_reap after
         if (!r->isWrite) { for (i = 0; i < nbytes; i++) r->buf[i] = gPB[i]; }
         pb_in(13); gBioPhase = 3; break;
     case 3:                                       /* CSW done -> check, advance chunk, or complete */
-        if (gPB[12] != 0) { gBioResult = -36L; biofail(r->isWrite, r->lba, (UInt16)gBioChunk); }  /* r41: name the failing CSW (r43 interrupt-level DebugStr reverted — hung MacsBug) */
-        else { if (r->isWrite) gBioWrOk++; else gBioRdOk++; }                                     /* r41: context counts */
+        if (gPB[12] != 0) { gBioResult = -36L; biofail(r->isWrite, r->lba, (UInt16)gBioChunk); }  /* real CSW status (the IN xfer succeeded) */
+        else { if (r->isWrite) gBioWrOk++; else gBioRdOk++; gBioRetry = 0; }                       /* r57: chunk OK -> refresh retry budget */
         r->lba += gBioChunk; r->buf += gBioChunk * 512; r->count -= gBioChunk;
-        if (gBioResult == 0 && r->count > 0) { bio_start_chunk(); }        /* more chunks in this request */
-        else {
-            IOCommandID done = r->cmdID; long res = gBioResult;
-            if (r->actCount) *r->actCount = (res == 0) ? (long)r->reqBytes : (long)(r->reqBytes - r->count * 512);
-            gBioTail++; gBioPhase = 0;             /* dequeue BEFORE completing (completion may enqueue more) */
-            (void)IOCommandIsComplete(done, (OSErr)res);   /* interrupt-safe: hand the block I/O back to the File Mgr */
-            bio_kick();                            /* start the next queued request */
-        }
+        if (gBioResult == 0 && r->count > 0) bio_start_chunk();        /* more chunks in this request */
+        else bio_finish(r, gBioResult);                               /* done (or CSW-failed) -> complete */
         break;
     }
 }
@@ -641,19 +859,32 @@ static void bio_advance(void)                     /* called from down_reap after
 static long ehci_usb_submit(IOCommandID cmdID, UInt32 lba, UInt32 count, void *buf, int isWrite, long *actCount)
 {
     UInt32 depth = gBioHead - gBioTail; BioReq *r;
+    if (depth > gBioHiWater) gBioHiWater = depth;       /* r49: track peak ring occupancy for the thread-B diagnostic */
     if (count == 0) return 1;
     if (depth >= BIOQ_N) { gBioReject++; return -1; }   /* r41: count queue-full submit rejections */
     r = &gBioQ[gBioHead % BIOQ_N];
     r->cmdID = cmdID; r->lba = lba; r->count = count; r->reqBytes = count * 512;
     r->buf = (UInt8 *)buf; r->actCount = actCount; r->isWrite = (UInt8)(isWrite ? 1 : 0);
+    __asm__ __volatile__("eieio");           /* publish the BioReq fields before advancing head */
     gBioHead++;
-    bio_kick();
+    /* r48 RE-ENTRANCY FIX (thread B — Finder large-copy hard-crash): do NOT bio_kick() here.
+     * This runs at TASK level (File Mgr kRead/kWrite). bio_kick -> bio_start_chunk mutates the shared
+     * bio+down engine (gPB, gDownQH, gBioPhase) — the SAME state the INTERRUPT-level completion path
+     * (down_reap -> bio_advance, and the request the File Mgr re-issues from inside IOCommandIsComplete)
+     * drives. A Finder copy interleaves rapid reads+writes; starting a transfer from task level while
+     * the controller is DMA-executing the async QH corrupts it -> hard crash. So the task side now only
+     * APPENDS (single producer: only this fn writes gBioHead). The engine is kicked SOLELY from interrupt
+     * level — bio_advance on each completion, and ehci_vhub_service() to start an idle engine. */
     return 0;
 }
 
 typedef long (*ehci_usb_rw_fn)(UInt32 lba, UInt32 count, void *buf);
 typedef long (*ehci_usb_submit_fn)(IOCommandID cmdID, UInt32 lba, UInt32 count, void *buf, int isWrite, long *actCount);
-static struct { UInt32 magic; ehci_usb_rw_fn readFn; ehci_usb_rw_fn writeFn; UInt32 blkSize, blkCnt; ehci_usb_submit_fn submitFn; } gSvc;
+typedef void (*ehci_usb_health_fn)(UInt32 *reject, UInt32 *hiwater, UInt32 *downTimeouts, UInt32 *downErr, UInt32 *downDone,
+                                   UInt32 *failSeq, UInt32 *failStat, UInt32 *failSig, UInt32 *failLba, UInt32 *isrHits, UInt32 *maxStall,
+                                   UInt32 *downRecov, UInt32 *downRelink, UInt32 *lastAnchorLink);
+typedef UInt32 (*ehci_usb_tostate_fn)(UInt32 *cmd, UInt32 *sts, UInt32 *async, UInt32 *qhP, UInt32 *epChar, UInt32 *curQtd, UInt32 *ovlTok, UInt32 *qtdTok);   /* r56: controller state captured at the last watchdog timeout */
+static struct { UInt32 magic; ehci_usb_rw_fn readFn; ehci_usb_rw_fn writeFn; UInt32 blkSize, blkCnt; ehci_usb_submit_fn submitFn; ehci_usb_health_fn healthFn; ehci_usb_tostate_fn toStateFn; } gSvc;
 static void ehci_vhub_publish_service(void)
 {
     gSvc.magic = 0x45555342UL;  /* 'EUSB' */
@@ -661,6 +892,8 @@ static void ehci_vhub_publish_service(void)
     gSvc.writeFn = ehci_usb_write;
     gSvc.blkSize = 512; gSvc.blkCnt = gPBlkCnt;
     gSvc.submitFn = ehci_usb_submit;               /* r34: async path for kRead/kWrite */
+    gSvc.healthFn = ehci_vhub_health;              /* r49: engine health for the app idle-loop diagnostic */
+    gSvc.toStateFn = ehci_vhub_timeout_state;      /* r56: controller state at the last 60s stall */
     (void)NewGestaltValue('Eusb', (long)&gSvc);
     ehci_os_log("=== r34: USB block service published via Gestalt 'Eusb' (sync rw + async submit) ===");
 }
@@ -874,8 +1107,15 @@ void ehci_vhub_service(void)
 {
     gVhubTick++;
     (void)hub_int_ack();
+    down_relink_if_needed();   /* r60: heal the async ring BEFORE reaping — restores reachability so a
+                                * stuck-but-now-linked transfer can complete instead of freezing the machine */
     service_ports();
     deliver_completions();
+    bio_kick();          /* r48: SOLE task-independent driver of the async block-I/O engine. Runs at
+                          * interrupt level (real EHCI ISR + the 8ms heartbeat SIH), so starting/advancing
+                          * a bio request never races a task-level submit. deliver_completions() already
+                          * drove bio_advance for in-flight requests; this starts a freshly-appended one
+                          * when the engine is idle (worst-case latency = one heartbeat, ~8ms). */
 }
 
 /* ==================== real EHCI interrupt + periodic timer ====================

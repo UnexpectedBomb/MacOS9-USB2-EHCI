@@ -23,16 +23,23 @@
  * surviving line pinpoints the phase that crashed (r4/r5 = error type 12 inside init). The file
  * lands next to the app; open EHCIUIM_init.log in SimpleText after a reboot. */
 static short gDbgRef = 0;
+static short gDbgVol = 0;   /* r49: the log's OWN volume (boot), captured at create */
 void ehci_os_log(const char *s)
 {
     FSSpec sp; long n = 0, z = 1; static int tried = 0;
     if (!tried) { tried = 1;
         (void)FSMakeFSSpec(0, 0, "\pEHCIUIM_init.log", &sp);
         (void)FSpDelete(&sp);
-        if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) (void)FSpOpenDF(&sp, fsRdWrPerm, &gDbgRef);
+        if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) { (void)FSpOpenDF(&sp, fsRdWrPerm, &gDbgRef); gDbgVol = sp.vRefNum; }
     }
-    if (gDbgRef) { while (s[n]) n++; (void)FSWrite(gDbgRef, &n, (Ptr)s);
-        (void)FSWrite(gDbgRef, &z, (Ptr)"\r"); (void)FlushVol(0, 0); }
+    if (gDbgRef) { ParamBlockRec pbf; while (s[n]) n++; (void)FSWrite(gDbgRef, &n, (Ptr)s);
+        (void)FSWrite(gDbgRef, &z, (Ptr)"\r");
+        /* r49 COPY-SAFETY: flush the LOG's OWN volume, not FlushVol(0,0)=default — the default volume
+         * SWITCHES to the USB stick once it mounts, so post-mount writes never committed the boot-volume
+         * log's catalog EOF and every network/FAT copy read a stale, truncated snapshot. Flush the file
+         * first (buffer -> disk) then its volume (commit the catalog EOF) so the open log copies at full size. */
+        pbf.ioParam.ioCompletion = 0; pbf.ioParam.ioRefNum = gDbgRef; (void)PBFlushFileSync(&pbf);
+        (void)FlushVol(0, gDbgVol); }
 }
 /* Log "label 0xVALUE" without stdio (a driver has no sprintf). */
 void ehci_os_logx(const char *label, unsigned long v)

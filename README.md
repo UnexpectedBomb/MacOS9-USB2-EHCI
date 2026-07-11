@@ -6,10 +6,13 @@ refuses to touch. It brings up the EHCI host controller, enumerates a high-speed
 userland + a native driver, because classic Mac OS never shipped an EHCI (USB 2.0) driver.
 
 > **Status: working, seeking testers.** On my hardware it reliably mounts an HFS-formatted
-> USB 2.0 stick on every boot and reads/writes files through the Finder. It has real
-> limitations (throughput, big copies — see below), and it's only been exercised on one
-> card + a couple of drives, so broad testing is how we build confidence. The design and the
-> hard-won bug hunts are written up in [TECHNICAL.md](TECHNICAL.md).
+> USB 2.0 stick on every boot and reads/writes through the Finder — including **large
+> copies** (a full ~800 MB, 1000+ file folder copied cleanly in one go; the long-standing
+> large-copy hang was traced to a data-toggle bug and fixed — see
+> [TECHNICAL.md](TECHNICAL.md) → *Bug hunt #3*). The main remaining limitation is
+> **throughput** (still USB-1.1-era — the speed rework is next), and it's only been exercised
+> on one card + a couple of drives, so broad testing is how we build confidence. The design
+> and the hard-won bug hunts are written up in [TECHNICAL.md](TECHNICAL.md).
 
 ---
 
@@ -46,24 +49,27 @@ Other OS 9 PowerMacs and other EHCI PCI cards *may* work but are untested — re
 4. **Plug the USB drive into a card port** a few seconds after it prints `pumping…`. It
    enumerates at high speed and the volume mounts on the desktop, read/write.
 
-The app writes a verbose log next to itself — it's a research/diagnostic build, not a
-polished product, so expect chatter.
+The app writes a verbose log next to itself, and after mounting it runs a **self-test** before
+handing the drive to the Finder — a 64 MB write/read-back verify plus an 800-file create test
+(so it writes to, and creates files on, the drive), then summarizes the result in a small
+`USB Health.log`. It's a research/diagnostic build, not a polished product — expect chatter and
+a couple of minutes of self-test on launch. Use a drive you've formatted for testing.
 
 ## What works / what doesn't
 
 **Works**
 - Reliable high-speed (480 Mbps link) **enumeration + mount, every boot**.
 - **Read and write** to an HFS volume through the Finder (copy files, rename, trash).
+- **Large copies** — a full ~800 MB, 1000+ file folder copies through the Finder with zero
+  errors (this used to hang; fixed by moving the data toggle into hardware — see
+  TECHNICAL.md → *Bug hunt #3*).
 - Native HFS mount via OS 9's built-in mounter — no "Audio CD" mis-identification.
 
 **Known limitations (v1)**
-- **Throughput ~0.8 MB/s** — functional but USB-1.1-era. The transfer engine is deliberately
-  simple (one Bulk-Only-Transport command in flight, 3.5 KB chunks, a bounce-buffer copy on
-  the interrupt path). Real 2.0 speed needs an engine rework (see TECHNICAL.md → *Roadmap*).
-- **Large Finder copies (hundreds of MB) can hang.** Small/normal file work is fine;
-  hammering it with a multi-hundred-MB folder trips a re-entrancy bug in the copy path
-  (in-app sequential writes of the same size are fine — it's the Finder's interleaved access).
-  Under investigation.
+- **Throughput ~0.8 MB/s** — functional but USB-1.1-era. The transfer engine still runs one
+  Bulk-Only-Transport command in flight with a bounce-buffer copy on the interrupt path. Real
+  2.0 speed needs the throughput rework (see TECHNICAL.md → *Roadmap*) — now unblocked, since
+  the per-endpoint queues it requires are in place.
 - **No auto-load yet** — it's an app you run, not a resident extension. A faceless
   Startup-Items version is planned.
 - Exercised on **one card + a couple of drives**; some devices behave differently during

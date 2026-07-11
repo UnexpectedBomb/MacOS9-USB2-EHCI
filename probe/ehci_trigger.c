@@ -74,6 +74,7 @@ static volatile unsigned long *gStatusBuf = 0;
  * after every line, so if the app dies (r4 = error type 12) the last surviving line pinpoints the
  * step that crashed. The file lands next to the app; open it in SimpleText after a reboot. */
 static short gLogRef = 0;
+static short gLogVol = 0;   /* r49: the log's OWN volume (boot), captured at create — see LOG() copy-safety */
 static int gQuiet = 0;   /* r26: once the console is hidden, log to FILE only — a printf could re-show it */
 static void log_open(const char *fname)
 {
@@ -81,7 +82,7 @@ static void log_open(const char *fname)
     while (fname[i] && i < 62) { pn[i + 1] = fname[i]; i++; } pn[0] = (unsigned char)i;
     (void)FSMakeFSSpec(0, 0, pn, &sp);      /* default vol/dir = the app's folder */
     (void)FSpDelete(&sp);
-    if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) (void)FSpOpenDF(&sp, fsRdWrPerm, &gLogRef);
+    if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) { (void)FSpOpenDF(&sp, fsRdWrPerm, &gLogRef); gLogVol = sp.vRefNum; }
 }
 static void LOG(const char *fmt, ...)
 {
@@ -89,9 +90,38 @@ static void LOG(const char *fmt, ...)
     va_start(ap, fmt); vsprintf(buf, fmt, ap); va_end(ap);
     if (!gQuiet) printf("%s", buf);
     if (gLogRef) {
+        ParamBlockRec pbf;
         for (i = 0; buf[i]; i++) if (buf[i] == '\n') buf[i] = '\r';   /* Mac line endings for SimpleText */
-        n = i; (void)FSWrite(gLogRef, &n, buf); (void)FlushVol(0, 0);  /* force to disk each line */
+        n = i; (void)FSWrite(gLogRef, &n, buf);
+        /* r49 COPY-SAFETY: flush the log's OWN volume (not FlushVol(0,0)=default, which moves to the USB
+         * stick after mount) so the open log's catalog EOF is committed and it copies at full size. */
+        pbf.ioParam.ioCompletion = 0; pbf.ioParam.ioRefNum = gLogRef; (void)PBFlushFileSync(&pbf);
+        (void)FlushVol(0, gLogVol);
     }
+}
+
+/* r55: a SEPARATE, TINY health/summary log ("USB Health.log") — ONLY the [verify] result + [health] counter
+ * lines, NO per-I/O CSLOG spam. Small enough to OPEN in SimpleText (<32KB) and to copy cleanly, so we can
+ * finally read the POST-Finder-copy engine state (the big log is unopenable, and the backgrounded app can't
+ * capture the copy well). Copy-safe (flush its OWN volume, like LOG). */
+static short gHRef = 0, gHVol = 0;
+static void hlog_open(const char *fname)
+{
+    FSSpec sp; Str63 pn; int i = 0;
+    while (fname[i] && i < 62) { pn[i + 1] = fname[i]; i++; } pn[0] = (unsigned char)i;
+    (void)FSMakeFSSpec(0, 0, pn, &sp);
+    (void)FSpDelete(&sp);
+    if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) { (void)FSpOpenDF(&sp, fsRdWrPerm, &gHRef); gHVol = sp.vRefNum; }
+}
+static void HLOG(const char *fmt, ...)
+{
+    char buf[512]; long i, n; va_list ap; ParamBlockRec pbf;
+    va_start(ap, fmt); vsprintf(buf, fmt, ap); va_end(ap);
+    if (!gHRef) return;
+    for (i = 0; buf[i]; i++) if (buf[i] == '\n') buf[i] = '\r';
+    n = i; (void)FSWrite(gHRef, &n, buf);
+    pbf.ioParam.ioCompletion = 0; pbf.ioParam.ioRefNum = gHRef; (void)PBFlushFileSync(&pbf);
+    (void)FlushVol(0, gHVol);
 }
 
 /* Low-mem queues: mounted volumes (VCB @0x0356) + recognized disks (drive @0x0308). */
@@ -168,6 +198,70 @@ static void dump_cslog(const char *tag)
     gCsDumped = total; gLastReads = cl->nReads; gLastWrites = cl->nWrites;
 }
 
+/* ---- 'Eusb' block-read service published by the UIM (r49: extended to reach healthFn). The layout is a
+ * prefix of the UIM's real gSvc (magic, readFn, writeFn, blkSize, blkCnt, submitFn, healthFn) so appended
+ * fields are ABI-safe; existing readFn/writeFn users are unaffected. ---- */
+typedef long (*UsbRwFn)(unsigned long lba, unsigned long count, void *buf);
+typedef long (*UsbSubmitFn)(long cmdID, unsigned long lba, unsigned long count, void *buf, int isWrite, long *actCount);
+typedef void (*UsbHealthFn)(unsigned long *reject, unsigned long *hiwater, unsigned long *downTimeouts, unsigned long *downErr, unsigned long *downDone,
+                            unsigned long *failSeq, unsigned long *failStat, unsigned long *failSig, unsigned long *failLba, unsigned long *isrHits, unsigned long *maxStall,
+                            unsigned long *downRecov, unsigned long *downRelink, unsigned long *lastAnchorLink);   /* r60: QH re-splices + current anchor target */
+typedef unsigned long (*UsbToStateFn)(unsigned long *cmd, unsigned long *sts, unsigned long *async, unsigned long *qhP, unsigned long *epChar, unsigned long *curQtd, unsigned long *ovlTok, unsigned long *qtdTok);
+typedef struct { unsigned long magic; UsbRwFn readFn; UsbRwFn writeFn; unsigned long blkSize, blkCnt; UsbSubmitFn submitFn; UsbHealthFn healthFn; UsbToStateFn toStateFn; } UsbSvc;
+
+/* r49 THREAD-B DECIDER: read the block engine's health via 'Eusb' healthFn and log it when a decisive
+ * counter moves. Runs from the idle loop (task level, File-Mgr-safe) so it captures the AFTERMATH of a
+ * Finder large copy even though the copy starved the UI — reject/hiwater/timeouts are cumulative, so the
+ * first idle pass after recovery logs the peak values. READ THE LAST [health] LINE:
+ *   reject > 0                    => the 16-deep async ring overflowed (Finder out-ran us) = the "disk
+ *                                    error" is mechanism (a); cheap fix = deeper ring + soft back-pressure.
+ *   downTimeouts > 0 (reject==0)  => slow single-in-flight engine watchdog-timed-out = mechanism (b); R4.
+ *   hiwater near 16               => ring pressure (how close it came to overflow). */
+static void dump_health(void)
+{
+    long gv; UsbSvc *sv;
+    unsigned long rej = 0, hw = 0, tmo = 0, derr = 0, ddone = 0;
+    unsigned long fseq = 0, fstat = 0, fsig = 0, flba = 0;   /* r50: CSW-failure detail */
+    unsigned long isrh = 0;                                  /* R4-P1: real EHCI IRQ count */
+    unsigned long mstall = 0;                                /* r54: worst device stall (60Hz ticks) */
+    unsigned long drecov = 0;                                /* r57: BOT reset-recoveries */
+    unsigned long drelink = 0, lanchor = 0;                  /* r60: async-ring re-splices + current anchor target */
+    static unsigned long lRej = 0xFFFFFFFFUL, lHw = 0xFFFFFFFFUL, lTmo = 0xFFFFFFFFUL, lErr = 0xFFFFFFFFUL, lFseq = 0xFFFFFFFFUL, lRelink = 0xFFFFFFFFUL;
+    if (Gestalt('Eusb', &gv) != noErr || gv == 0) return;
+    sv = (UsbSvc *)gv;
+    if (sv->magic != 0x45555342UL || !sv->healthFn) return;
+    sv->healthFn(&rej, &hw, &tmo, &derr, &ddone, &fseq, &fstat, &fsig, &flba, &isrh, &mstall, &drecov, &drelink, &lanchor);
+    /* r50: also log whenever failSeq moves — each CSW-level write failure (the Finder "disk error").
+     * r60: also whenever downRelink moves — a QH re-splice (the freeze fix firing). */
+    if (rej == lRej && hw == lHw && tmo == lTmo && derr == lErr && fseq == lFseq && drelink == lRelink) return;
+    lRej = rej; lHw = hw; lTmo = tmo; lErr = derr; lFseq = fseq; lRelink = drelink;
+    LOG("\n[health] reject=%lu hiwater=%lu (ring=16) downTimeouts=%lu downErr=%lu downDone=%lu isrHits=%lu\n",
+        rej, hw, tmo, derr, ddone, isrh);
+    LOG("[health]   r54 maxStall=%lu ticks (~%lu.%01lu s @60Hz) = the device's worst-case flash-GC pause; watchdog now 60s\n",
+        mstall, mstall / 60, ((mstall % 60) * 10) / 60);
+    /* r55: the DECISIVE line in the small openable log. downTimeouts/downErr/failSeq all 0 after a Finder
+     * copy => the "disk error" is ABOVE our block I/O (Status/File-Mgr/HFS); any nonzero => it's our block path. */
+    HLOG("[health] downTimeouts=%lu downRecov=%lu downErr=%lu failSeq=%lu reject=%lu maxStall=%lu(~%lu.%01lus) downDone=%lu\n",
+        tmo, drecov, derr, fseq, rej, mstall, mstall / 60, ((mstall % 60) * 10) / 60, ddone);
+    /* r60 QH-UNLINK FREEZE FIX — the decisive line. downRelink>0 => our downstream QH fell out of the
+     * async ring under heavy wedging and the driver RE-SPLICED it (a would-be FREEZE turned into slow-but-
+     * alive). lastAnchorLink = phys the async anchor points at right now; == the ourQH in [timeout-state]
+     * means the ring is intact. WIN = the copy survives with downRelink climbing instead of a hard freeze. */
+    HLOG("[ring] downRelink=%lu lastAnchorLink=%08lx (relink>0 = QH re-spliced = freeze fix fired)\n",
+        drelink, lanchor);
+    /* r56: when a watchdog timeout has occurred, dump the controller state captured AT it — the decisive clue
+     * for WHY a Finder-copy transfer hangs 60s: schedule stopped (ASS=0)? our QH UNLINKED from the async ring?
+     * qTD Halted (b6)? or just Active+NAKing (device)? UNLINKED => a shared-engine race clobbered the ring. */
+    if (tmo > 0 && sv->toStateFn) {
+        unsigned long cmd = 0, sts = 0, async = 0, qhP = 0, epc = 0, cq = 0, ovl = 0, qtd = 0;
+        (void)sv->toStateFn(&cmd, &sts, &async, &qhP, &epc, &cq, &ovl, &qtd);
+        HLOG("[timeout-state] USBSTS=%08lx(b12halt b15schedRun b4hse) USBCMD=%08lx async=%08lx ourQH=%08lx=%s ovlTok=%08lx(b7active b6halt)\n",
+            sts, cmd, async, qhP, (async == qhP ? "LINKED" : "UNLINKED"), ovl);
+    }
+    LOG("[health] CSW-FAIL failSeq=%lu failStat=%lu failSig=%08lx (55534253='USBS'=real device reject; else our CSW read=garbage) failLba=%lu\n",
+        fseq, fstat, fsig, flba);
+}
+
 /* Create a property, or replace it if it already exists (a prior run this boot). */
 static OSStatus set_prop(RegEntryID *n, const char *name, const void *val, RegPropertyValueSize sz)
 {
@@ -225,8 +319,7 @@ static void probe_candidates(RegEntryID *n, const char *tag)
  *      Net-zero to the disk; proves the engine end to end. WRITE(10) shares READ(10)'s CDB LBA fields,
  *      and READ addressed correctly at r22 self-probe, so a mis-addressed write is very unlikely.
  *   L2 create a real file on the mounted FAT volume + read it back = the full Finder-copy path. */
-typedef long (*UsbRwFn)(unsigned long lba, unsigned long count, void *buf);
-typedef struct { unsigned long magic; UsbRwFn readFn; UsbRwFn writeFn; unsigned long blkSize, blkCnt; } UsbSvc;
+/* (UsbSvc / UsbRwFn / UsbSubmitFn / UsbHealthFn typedefs moved up to precede dump_health — r49) */
 
 static void write_test_L1(void)
 {
@@ -381,6 +474,122 @@ static void write_test_speed(short vref)
     (void)FSpDelete(&sp);   /* remove the 4MB test file */
 }
 
+/* r51: LARGE characterizing write-verify. r48-r50 proved the USB engine returns noErr for EVERY I/O
+ * (failSeq=0, downErr=0) yet the Finder fails a big copy with "cannot be written, disk error" — so either
+ * the DATA lands wrong despite a clean CSW (corruption our engine can't see) or the error is HFS/FM-level.
+ * This writes a big file (proven-safe sequential pattern; FSClose+reopen defeats FM caching so the read-back
+ * really hits the DEVICE) with a 4-byte big-endian GLOBAL-BLOCK-INDEX marker at each 512-block head, then
+ * verifies. On the FIRST mismatch it decodes the index that actually landed:
+ *   landed index == expected, bytes wrong  => bit/DMA corruption
+ *   landed index != expected               => WRONG-BLOCK data (LBA/addressing/ordering bug)
+ *   marker all-zero                        => dropped/incomplete transfer
+ * ALL OK at 64MB => our sequential data path is solid; the Finder error is above it (interleaved pattern/HFS). */
+static void write_test_verify_big(short vref)
+{
+    FSSpec sp; short rf = 0; long n; OSErr e; static unsigned char buf[32768];
+    const long kChunks = 2048;            /* 2048 * 32KB = 64 MB (the Finder fails well under this) */
+    long c, i, blk; int failed = 0;
+    if (vref == 0) { LOG("[verify] no vRefNum — skipping\n"); return; }
+    LOG("\n[verify] LARGE %ld-MB write+readback verify (per-512-block index marker). Our engine reports every\n", (kChunks * 32) / 1024);
+    LOG("[verify] I/O OK — this asks whether the DATA is actually correct. ~a few min; fails fast if corrupt.\n");
+    (void)FSMakeFSSpec(vref, 2, "\pUSBVERIFY.DAT", &sp);
+    (void)FSpDelete(&sp);
+    e = FSpCreate(&sp, 'ttxt', 'BINA', 0); if (e != noErr) { LOG("[verify] create -> %d\n", (int)e); return; }
+    e = FSpOpenDF(&sp, fsRdWrPerm, &rf);   if (e != noErr) { LOG("[verify] open -> %d\n", (int)e); return; }
+    for (c = 0; c < kChunks; c++) {
+        for (i = 0; i < 32768; i++) buf[i] = (unsigned char)((c * 251 + i) & 0xFF);
+        for (blk = 0; blk < 64; blk++) {                       /* 4-byte BE global block index at each 512-blk head */
+            long g = c * 64 + blk; unsigned char *p = &buf[blk * 512];
+            p[0] = (unsigned char)(g >> 24); p[1] = (unsigned char)(g >> 16); p[2] = (unsigned char)(g >> 8); p[3] = (unsigned char)g;
+        }
+        n = 32768; e = FSWrite(rf, &n, (Ptr)buf);
+        if (e != noErr || n != 32768) { LOG("[verify] WRITE FAIL chunk %ld (@%ld MB) -> %d n=%ld\n", c, (c * 32) / 1024, (int)e, n); failed = 1; break; }
+        if ((c & 127) == 0) LOG("[verify] ... wrote %ld MB\n", (c * 32) / 1024);   /* progress every 4MB */
+    }
+    (void)FSClose(rf);
+    (void)FlushVol(0, vref);
+    if (failed) { (void)FSpDelete(&sp); return; }
+    LOG("[verify] wrote %ld MB + flushed + closed; reopening read-only to verify from the DEVICE...\n", (kChunks * 32) / 1024);
+    rf = 0; e = FSpOpenDF(&sp, fsRdPerm, &rf); if (e != noErr) { LOG("[verify] reopen -> %d\n", (int)e); return; }
+    for (c = 0; c < kChunks && !failed; c++) {
+        for (i = 0; i < 32768; i++) buf[i] = 0;
+        n = 32768; e = FSRead(rf, &n, (Ptr)buf);
+        if (e != noErr || n != 32768) { LOG("[verify] READ FAIL chunk %ld (@%ld MB) -> %d n=%ld\n", c, (c * 32) / 1024, (int)e, n); failed = 1; break; }
+        for (i = 0; i < 32768; i++) {
+            unsigned char exp; long bb = i & ~511L, off = i & 511L, g = c * 64 + (i >> 9);
+            if (off == 0) exp = (unsigned char)(g >> 24); else if (off == 1) exp = (unsigned char)(g >> 16);
+            else if (off == 2) exp = (unsigned char)(g >> 8); else if (off == 3) exp = (unsigned char)g;
+            else exp = (unsigned char)((c * 251 + i) & 0xFF);
+            if (buf[i] != exp) {
+                unsigned long landed = ((unsigned long)buf[bb] << 24) | ((unsigned long)buf[bb + 1] << 16) | ((unsigned long)buf[bb + 2] << 8) | buf[bb + 3];
+                LOG("[verify] *** MISMATCH @%ld MB: chunk %ld byte %ld (blk-off %ld): expected %02x got %02x ***\n", (c * 32) / 1024, c, i, off, exp, buf[i]);
+                LOG("[verify]   landed block index=%lu expected=%ld -> %s\n", landed, g,
+                    (landed == (unsigned long)g) ? "SAME block => bit/DMA corruption" :
+                    (buf[bb] == 0 && buf[bb + 1] == 0 && buf[bb + 2] == 0 && buf[bb + 3] == 0) ? "ZERO marker => dropped/incomplete transfer" :
+                    "DIFFERENT block => wrong-block/LBA-addressing bug");
+                failed = 1; break;
+            }
+        }
+    }
+    (void)FSClose(rf);
+    (void)FSpDelete(&sp);
+    if (!failed) { LOG("[verify] *** %ld MB write+readback ALL VERIFIED CLEAN — data path solid at this size; the Finder error is above it (interleave/HFS) ***\n", (kChunks * 32) / 1024);
+                   HLOG("[verify] %ld MB ALL VERIFIED CLEAN\n", (kChunks * 32) / 1024); }
+    else { LOG("[verify] *** CORRUPTION REPRODUCED IN-APP (see MISMATCH) — it's our DATA PATH, not HFS/Finder-specific ***\n");
+           HLOG("[verify] FAILED in-app (see big log)\n"); }
+}
+
+/* r59 FOREGROUND REPRODUCTION of the Finder's per-file "cannot be written". The Finder copies MANY files
+ * (UT is hundreds); our single-file verify passes, so the trigger is likely the many-files catalog churn,
+ * NOT the data path. This creates many files ITSELF (same File Mgr calls the Finder uses) in the FOREGROUND
+ * (app not starved, so nothing is hidden), and on the FIRST failure logs the EXACT File Mgr error code — the
+ * one datum we've never captured (we only ever saw the Finder's paraphrase). ALL OK => the trigger is buried
+ * in the Finder's own copy engine (effectively unfixable from our side). */
+static void write_test_manyfiles(short vref)
+{
+    FSSpec sp; short rf = 0; long n; OSErr e; static unsigned char buf[32768];
+    const int kFiles = 800; int f, c, chunks, bad = 0; long fsize; Str63 nm;
+    if (vref == 0) { LOG("[manyfiles] no vRefNum — skipping\n"); return; }
+    LOG("\n[manyfiles] FOREGROUND repro: create up to %d files (create+write+close each, varying sizes) to churn\n", kFiles);
+    LOG("[manyfiles] the catalog like a UT-folder copy. The FIRST failure's ERROR CODE is what we're after.\n");
+    HLOG("[r63] A1 REWORK: per-endpoint QHs + HARDWARE data toggle (DTC=0 bulk), dummy-qTD append. Recovery OFF, 30s watchdog. Q: does the wedge DISAPPEAR (manyfiles completes / no 30s stalls) now that the software toggle is gone?\n");
+    HLOG("[manyfiles] running (foreground repro of the per-file 'cannot be written')...\n");
+    for (n = 0; n < 32768; n++) buf[n] = (unsigned char)n;
+    for (f = 0; f < kFiles; f++) {
+        int L = 0;
+        nm[++L] = 'M'; nm[++L] = 'F';
+        nm[++L] = (unsigned char)('0' + (f / 100) % 10); nm[++L] = (unsigned char)('0' + (f / 10) % 10); nm[++L] = (unsigned char)('0' + f % 10);
+        nm[++L] = '.'; nm[++L] = 'D'; nm[++L] = 'A'; nm[++L] = 'T'; nm[0] = (unsigned char)L;
+        (void)FSMakeFSSpec(vref, 2, nm, &sp);
+        (void)FSpDelete(&sp);
+        e = FSpCreate(&sp, 'ttxt', 'BINA', 0);
+        if (e != noErr) { LOG("[manyfiles] *** FILE %d: FSpCreate -> %d ***\n", f, (int)e); HLOG("[manyfiles] FAIL @file %d FSpCreate err=%d\n", f, (int)e); bad = 1; break; }
+        e = FSpOpenDF(&sp, fsRdWrPerm, &rf);
+        if (e != noErr) { LOG("[manyfiles] *** FILE %d: FSpOpenDF -> %d ***\n", f, (int)e); HLOG("[manyfiles] FAIL @file %d open err=%d\n", f, (int)e); bad = 1; break; }
+        fsize = (long)(((f % 8) + 1) * 32768);            /* 32KB..256KB, varying like a real folder */
+        chunks = (int)(fsize / 32768);
+        for (c = 0; c < chunks; c++) {
+            n = 32768; e = FSWrite(rf, &n, (Ptr)buf);
+            if (e != noErr || n != 32768) { LOG("[manyfiles] *** FILE %d chunk %d: FSWrite -> %d (n=%ld) ***\n", f, c, (int)e, n); HLOG("[manyfiles] FAIL @file %d write err=%d n=%ld\n", f, (int)e, n); bad = 1; break; }
+        }
+        if (bad) { (void)FSClose(rf); break; }
+        e = FSClose(rf);
+        if (e != noErr) { LOG("[manyfiles] *** FILE %d: FSClose -> %d ***\n", f, (int)e); HLOG("[manyfiles] FAIL @file %d close err=%d\n", f, (int)e); bad = 1; break; }
+        if ((f % 50) == 0) { LOG("[manyfiles] ... %d files ok\n", f); (void)FlushVol(0, vref); }
+    }
+    if (!bad) { LOG("[manyfiles] *** ALL %d FILES OK — many-files pattern did NOT reproduce it (trigger is Finder-copy-specific) ***\n", kFiles);
+                HLOG("[manyfiles] ALL %d OK — NOT reproduced (trigger is Finder-copy-specific)\n", kFiles); }
+    else LOG("[manyfiles] *** REPRODUCED at file %d — the err code above IS the File Mgr error the Finder shows as 'cannot be written' ***\n", f);
+    for (f = 0; f < kFiles; f++) {   /* cleanup (best-effort) */
+        int L = 0;
+        nm[++L] = 'M'; nm[++L] = 'F';
+        nm[++L] = (unsigned char)('0' + (f / 100) % 10); nm[++L] = (unsigned char)('0' + (f / 10) % 10); nm[++L] = (unsigned char)('0' + f % 10);
+        nm[++L] = '.'; nm[++L] = 'D'; nm[++L] = 'A'; nm[++L] = 'T'; nm[0] = (unsigned char)L;
+        (void)FSMakeFSSpec(vref, 2, nm, &sp); (void)FSpDelete(&sp);
+    }
+    (void)FlushVol(0, vref);
+}
+
 int main(void)
 {
     RegEntryIter iter; RegEntryID node; Boolean done = false; OSStatus err;
@@ -389,13 +598,59 @@ int main(void)
     unsigned long ticks; int t; int diskDone = 0; short mountedVRef = 0;   /* r25: volume for the write test */
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    log_open("EHCITrigger_r47.log");
-    LOG("==== EHCITrigger r47 — REVERT r46's big-chunk speed attempt (it BACKFIRED: 0.14 MB/s, failed mid-\n");
-    LOG("     write, choppy Finder). Root cause: a 20KB data copy AT INTERRUPT LEVEL starves the UI, and the\n");
-    LOG("     5-page scatter path was unreliable. Back to the PROVEN r45 engine: 7-block (3584B) chunks,\n");
-    LOG("     single-page transfers, small interrupt-level copies = reliable ~0.76 MB/s (identical to r45).\n");
-    LOG("     Real speedup needs a deeper rework that first moves the copy OFF the interrupt path. SUCCESS =\n");
-    LOG("     mounts every boot, [speed] ~0.76 MB/s + 'read-back verify: OK', Finder stays responsive.\n\n");
+    log_open("USB Trigger.log");   /* version-neutral name (was the stale "EHCITrigger_r59.log"); pairs with "USB Health.log" */
+    hlog_open("USB Health.log");   /* read THIS in SimpleText — NO Finder copy needed this run */
+    HLOG("==== USB Health (r59 = FOREGROUND repro of the per-file 'cannot be written'). The [manyfiles] test\n");
+    HLOG("     creates ~800 files itself (foreground, fully observable) to churn the catalog like a UT copy.\n");
+    HLOG("     READ the [manyfiles] line: 'FAIL @file N ... err=CODE' = REPRODUCED (that CODE is the answer!);\n");
+    HLOG("     'ALL 800 OK' = NOT reproduced (trigger is buried in the Finder's copy engine). NO Finder copy needed.\n");
+    LOG("==== EHCITrigger r59 — FOREGROUND REPRODUCTION. We keep failing to SEE the per-file 'cannot be written'\n");
+    LOG("     because it's above our engine + the app is starved during a bg Finder copy. NEW APPROACH: reproduce\n");
+    LOG("     it in the FOREGROUND. Our single-file verify passes, but the Finder copies MANY files, so the trigger\n");
+    LOG("     is likely many-files catalog churn. [manyfiles] creates ~800 files itself (same FM calls) and on the\n");
+    LOG("     FIRST failure logs the EXACT File Mgr error code (never captured before). NO Finder copy needed — just\n");
+    LOG("     run r59 and read the [manyfiles] result in 'USB Health.log'. (64MB verify skipped this run to save time.)\n");
+    LOG("==== (r63) A1: PER-ENDPOINT QHs + HARDWARE toggle (DTC=0 bulk) via dummy-qTD append — replaces the single reprogrammed QH + software toggle that desynced BOT. Recovery OFF, 30s watchdog. WIN = 64MB verify clean + manyfiles no longer wedges (downTimeouts=0).\n");
+    LOG("     and got to 52MB: the fix DIRECTION is right, the device just GC-stalls >33s sometimes. r54:\n");
+    LOG("     (1) watchdog now on the RELIABLE 60Hz Ticks clock @ 60s (was a variable service-counter);\n");
+    LOG("     (2) [health] now reports maxStall = the device's worst-case stall in seconds. EXPECT: 64MB\n");
+    LOG("     [verify] PASSES + downTimeouts=0; maxStall tells us the real worst pause (tune watchdog to it).\n");
+    LOG("     If downTimeouts>0 even at 60s => the device truly hangs (needs BOT reset, not just patience).\n");
+    LOG("     ⚠ Use the freshly-reformatted stick. NO Finder needed for the verify.\n");
+    LOG("==== (r53) watchdog root-cause fix: flash-GC CSW-NAK false-failure.\n");
+    LOG("     CSW status for SECONDS (flash garbage-collection); our 1.6s watchdog fired -> falsely failed the\n");
+    LOG("     write (-36) -> Finder 'disk error' + volume corruption ('problem with the disk'). FIX: watchdog\n");
+    LOG("     200->4096 ticks (~1.6s -> ~33s); real faults still fail fast (HALTED/XACTERR). ⚠ REFORMAT the\n");
+    LOG("     stick CLEAN first (prior runs damaged it) so this is a fair test. EXPECT: the 64MB [verify]\n");
+    LOG("     reliably PASSES + [health] downTimeouts=0 downErr=0; then a Finder copy should complete.\n");
+    LOG("==== (r52) R4 THROUGHPUT PHASE 1: isrHits vs downDone (interrupt-driven confirmed).\n");
+    LOG("     byte-perfect (64MB verified) but throughput is ~0.76 MB/s = SLOWER than USB 1.1, not USB 2.0.\n");
+    LOG("     Latency-bound: ~5ms per 3.5KB BOT while the HS transfer needs ~60us => the bus idles ~98%%. This\n");
+    LOG("     build adds isrHits to [health]. After the 64MB verify (122k transfers), READ isrHits vs downDone:\n");
+    LOG("        isrHits ~= downDone (or x2-3)  => completions ARE interrupt-driven; the stall is chunk-size/\n");
+    LOG("           serialization => P2 = bigger chunks off the interrupt path + pipelining.\n");
+    LOG("        isrHits << downDone            => completions fall back to the 8ms heartbeat => fix the IRQ\n");
+    LOG("           delivery FIRST (huge win, no rework). Just run r52 + copy the log; NO Finder needed.\n");
+    LOG("==== (r51) DATA-CORRUPTION DECIDER. r50 proved the engine returns noErr for EVERY I/O\n");
+    LOG("     (failSeq=0 downErr=0) yet the Finder fails a large copy 'cannot be written, disk error'; a single\n");
+    LOG("     173MB file fails too (~random 30s-2min) => it's the DATA PATH, not metadata-churn. r51 adds a\n");
+    LOG("     self-contained [verify] test: write 64MB with per-512-block index markers, close+reopen (defeats\n");
+    LOG("     FM cache), read back + verify from the DEVICE. NO Finder needed. READ THE [verify] RESULT:\n");
+    LOG("        MISMATCH (landed index=expected)   => bit/DMA corruption in our data path.\n");
+    LOG("        MISMATCH (landed index != expected) => wrong-block/LBA-addressing bug.\n");
+    LOG("        ALL VERIFIED CLEAN                  => our path is solid; the error is HFS/interleave-level.\n");
+    LOG("     Also still logs [health]/CSW-FAIL (engine stays clean). r50 recap follows:\n");
+    LOG("==== (r50) CSW-FAILURE DECIDER. r49 ruled out ring(a)+timeout(b): reject=0 hiwater=0\n");
+    LOG("     downTimeouts=0 downErr=0, yet the Finder shows 'item X cannot be written, because a disk error'\n");
+    LOG("     per-file. Mechanism (code): a nonzero CSW status byte -> gBioResult=-36 -> ioErr to the File Mgr,\n");
+    LOG("     which downErr does NOT count and uim23 doesn't log during a copy. r50 surfaces it: [health] now\n");
+    LOG("     also prints CSW-FAIL failSeq/failStat/failSig/failLba and logs on EACH new failure. READ:\n");
+    LOG("        failSeq>0 + failSig=55534253('USBS') + failStat=1 => the DEVICE rejected the write (real\n");
+    LOG("           CHECK CONDITION; we issue no REQUEST SENSE) -> fix = REQUEST SENSE + retry.\n");
+    LOG("        failSeq>0 + failSig != 'USBS'                     => our CSW READ is garbage (transport bug).\n");
+    LOG("        failSeq==0 (with the dialog seen)                 => the error is ABOVE us (File Mgr/HFS).\n");
+    LOG("     TEST: reboot -> run r50 -> mount -> Finder-copy the folder until the disk-error dialog -> hit\n");
+    LOG("     Continue/Stop, let it settle -> copy EHCITrigger_r50.log off; READ THE LAST [health] CSW-FAIL LINE.\n\n");
 
     /* [1] locate the EHCI controller's Name Registry node */
     LOG("CKPT: searching for EHCI node...\n");
@@ -523,6 +778,8 @@ park:
     write_test_L2(mountedVRef);                        /* FS: tiny file */
     write_test_big(mountedVRef);                       /* FS: 64KB multi-block file */
     write_test_speed(mountedVRef);                     /* r44: TIMED 4MB write+read = KB/s + sustained-write crash probe */
+    write_test_verify_big(mountedVRef);                /* r63: RE-ENABLED — byte-perfect proof the NEW dummy-qTD/HW-toggle engine moves 64MB correctly (the rework's data-integrity safety net) */
+    write_test_manyfiles(mountedVRef);                 /* r59: FOREGROUND repro of the Finder's per-file "cannot be written" */
     dump_cslog("post-write");
 
     /* Make the desktop usable: get the fullscreen console out of the way and run a REAL event loop.
@@ -545,6 +802,7 @@ park:
              * when idle and flushes the Finder's read/write records to disk right up to a freeze. (No
              * ExpertIdleTask/USLPolledProcessDoneQueue — proven unnecessary post-mount, r22/r28.) */
             dump_cslog("live");
+            dump_health();       /* r49: THREAD-B decider — logs reject / hiwater / downTimeouts on change */
         }
     }
     return 0;

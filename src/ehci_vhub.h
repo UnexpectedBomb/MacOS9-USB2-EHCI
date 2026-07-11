@@ -62,6 +62,12 @@ UInt32 ehci_vhub_timeout_state(UInt32 *cmd, UInt32 *sts, UInt32 *async, UInt32 *
 /* r41: last BOT WRITE/READ CSW failure (+ context counts); seq bumps on each new failure. */
 UInt32 ehci_vhub_biofail(UInt8 *isWrite, UInt32 *lba, UInt16 *chunk, UInt8 *cswStat,
                          UInt32 *cswSig, UInt32 *cswResid, UInt32 *wrOk, UInt32 *rdOk, UInt32 *reject);
+/* r49/r50: block-I/O engine health for the app idle-loop diagnostic (read via 'Eusb' healthFn).
+ * r50 adds the CSW-level write-failure detail (failSeq/failStat/failSig/failLba) = the actual source of
+ * the Finder "cannot be written, disk error" (a nonzero CSW status -> -36), which downErr does NOT count. */
+void ehci_vhub_health(UInt32 *reject, UInt32 *hiwater, UInt32 *downTimeouts, UInt32 *downErr, UInt32 *downDone,
+                      UInt32 *failSeq, UInt32 *failStat, UInt32 *failSig, UInt32 *failLba, UInt32 *isrHits, UInt32 *maxStall,
+                      UInt32 *downRecov, UInt32 *downRelink, UInt32 *lastAnchorLink);   /* r60: downRelink = QH re-splices; lastAnchorLink = current anchor target */
 /* r21: task-level self-driven SCSI probe (INQUIRY/READ CAPACITY/READ blk0) over the mounter's idle bulk
  * endpoints, to bypass the parked Apple mounter. Call once per uim23 (task context). */
 void ehci_vhub_selfprobe_tick(void);

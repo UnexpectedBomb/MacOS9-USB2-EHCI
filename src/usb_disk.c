@@ -71,20 +71,25 @@ USBDiskDriverDesc TheDriverDescription = {
 /* ---- debug log to "USB Disk Log" (task-safe: called only from kInitialize, which runs
  * during InstallDriverFromMemory — NOT re-entrant inside a File Manager mount read). ---- */
 static short gLogRef = 0;
+static short gLogVol = 0;   /* r49: the log's OWN volume (boot), captured at create */
 static void dopen(void)
 {
     FSSpec sp;
     if (gLogRef) return;
     (void)FSMakeFSSpec(0, 0, "\pUSB Disk Log", &sp);
     (void)FSpDelete(&sp);
-    if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) (void)FSpOpenDF(&sp, fsRdWrPerm, &gLogRef);
+    if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) { (void)FSpOpenDF(&sp, fsRdWrPerm, &gLogRef); gLogVol = sp.vRefNum; }
 }
 static void dput(const char *s)
 {
     long n = 0, z = 1;
     if (!gLogRef) dopen();
-    if (gLogRef) { while (s[n]) n++; (void)FSWrite(gLogRef, &n, (Ptr)s);
-        (void)FSWrite(gLogRef, &z, (Ptr)"\r"); (void)FlushVol(0, 0); }
+    if (gLogRef) { ParamBlockRec pbf; while (s[n]) n++; (void)FSWrite(gLogRef, &n, (Ptr)s);
+        (void)FSWrite(gLogRef, &z, (Ptr)"\r");
+        /* r49 COPY-SAFETY: flush the log's OWN volume (not the default, which moves to the USB stick after
+         * mount) so the open log's catalog EOF is committed and copies at full size. See ehci_os.c. */
+        pbf.ioParam.ioCompletion = 0; pbf.ioParam.ioRefNum = gLogRef; (void)PBFlushFileSync(&pbf);
+        (void)FlushVol(0, gLogVol); }
 }
 static void dputx(const char *label, unsigned long v)
 {
