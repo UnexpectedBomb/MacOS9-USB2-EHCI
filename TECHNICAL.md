@@ -183,7 +183,15 @@ reason the 1.1 stack was bulletproof all along.
 - **BOT error recovery is minimal.** With the wedge gone, a *correct* one-shot Bulk-Only Reset
   (for genuine device errors, not the false-timeout churn that was removed) is a small planned
   hardening.
-- **No resident auto-load.** Runs as an app today. A resident 68K INIT can load the PPC UIM at
-  boot (proven separately), but the mount needs a top-level process context, so the shippable
-  vehicle is a faceless background app — not yet built.
+- **Manual launch, by design (the big one).** The shippable vehicle is a small prompt-driven
+  app: boot with the drive *unplugged*, run it (it claims the ports for EHCI), and insert when
+  prompted — so the drive enumerates fresh on EHCI. Auto-mount-at-boot and hot re-insertion are
+  **not** supported, and for the same underlying reason: both require handing a mass-storage
+  device between Apple's USB 1.1 *companion* controller and EHCI, and Mac OS 9's USB stack does
+  not do that gracefully. A drive attached at boot is claimed by the 1.1 companion before our
+  driver loads, and taking the port over to EHCI stalls or hangs; a hot re-insert makes the USB
+  Mass Storage class driver monopolize the USB Expert's task-level idle loop (`ExpertIdleTask`)
+  and never yield it back, so the task-level re-mount never runs. Preventing the companion from
+  claiming the port early (from an INIT) fails too — the card's registers aren't CPU-mappable
+  that early in boot. This controller hand-off is the main open problem; see the README.
 - Only validated on one card (NEC µPD720100A) and a couple of drives.

@@ -51,3 +51,13 @@ target_link_libraries(EHCITrigger
     NameRegistryLib PCILib DriverServicesLib DriverLoaderLib InterfaceLib
     ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBServicesLibFull.a
     ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBFamilyExpertFull.a)
+
+# ---- The shippable app: a visible, prompt-driven launcher. Claims the EHCI ports, then prompts
+#      "INSERT USB DRIVE NOW" and mounts the freshly inserted drive at USB 2.0 (with the custom
+#      volume icon). Same load path as EHCITrigger, without the diagnostic harness. ----
+add_application(EHCILauncher probe/ehci_launcher.c CONSOLE)
+target_include_directories(EHCILauncher PRIVATE src)
+target_link_libraries(EHCILauncher
+    NameRegistryLib PCILib DriverServicesLib DriverLoaderLib InterfaceLib
+    ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBServicesLibFull.a
+    ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBFamilyExpertFull.a)

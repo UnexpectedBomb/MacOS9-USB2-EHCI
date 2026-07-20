@@ -52,7 +52,7 @@ void ehci_hc_resume(ehci_softc *sc)
 {
     /* frame list + async ring are still programmed; just re-enable and run */
     ehci_write32(sc->opBase, EHCI_USBCMD,
-        ((UInt32)8 << EHCI_CMD_ITC_SHIFT) |
+        ((UInt32)1 << EHCI_CMD_ITC_SHIFT) |   /* r68: ITC 8->1 microframe (1ms->125us interrupt coalescing) — cut per-command completion latency (r67: ~75% of each command is overhead) */
         EHCI_CMD_ASE | EHCI_CMD_PSE | EHCI_CMD_RUN);
 #if EHCI_ROUTE_PORTS_TO_EHCI
     ehci_write32(sc->opBase, EHCI_CONFIGFLAG, EHCI_CONFIGFLAG_CF);
@@ -179,7 +179,7 @@ int ehci_hc_start(ehci_softc *sc)
 
     /* interrupt threshold 8 microframes; enable async + periodic; Run */
     ehci_write32(op, EHCI_USBCMD,
-        ((UInt32)8 << EHCI_CMD_ITC_SHIFT) |
+        ((UInt32)1 << EHCI_CMD_ITC_SHIFT) |   /* r68: ITC 8->1 microframe (1ms->125us interrupt coalescing) — cut per-command completion latency (r67: ~75% of each command is overhead) */
         EHCI_CMD_ASE | EHCI_CMD_PSE | EHCI_CMD_RUN);
 
 #if EHCI_ROUTE_PORTS_TO_EHCI

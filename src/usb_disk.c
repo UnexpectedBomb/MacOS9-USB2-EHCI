@@ -27,6 +27,7 @@
 #include <Gestalt.h>
 #include <DriverServices.h>
 #include <DriverGestalt.h>   /* r37: answer 'devt'/'intf' so we aren't misclaimed as an Audio CD */
+#include "usb2_icns_blob.h"  /* r98: the USB 2.0 volume icon ('icns'), returned via kdgMediaIconSuite */
 #include <Errors.h>
 
 #define noErr     0L
@@ -135,6 +136,11 @@ static int svc_read(UInt32 lba, UInt32 count, void *buf)
 /* ---- drive state ---- */
 static short  gRefNum = 0, gDriveNum = 0;
 static UInt32 gPartStart = 0, gPartCount = 0;
+/* r80: media-present / ejectability state. 1 = ejectable disk in drive (removable, like USB 1.1); 0 = ejected
+ * (no media). Reported via DrvSts.diskInPlace in AddDrive + kStatus(8). The Eject control (csCode 7) sets it 0
+ * so the eject STICKS (else kStatus still says "disk present" and the Finder immediately remounts). Was a
+ * hardwired 8 (= NONEJECTABLE fixed disk, inherited from the eSATA driver) — wrong for a removable USB stick. */
+static char   gDiskInPlace = 1;
 
 /* ---- r24 INSTRUMENTATION: wrap-around ring of every Status/Control call the OS issues to this
  * drive. Pure memory writes only — safe at File-Mgr / interrupt time (unlike the dput() file I/O,
@@ -261,7 +267,7 @@ static OSErr scan_and_add(short refNum)
         ds = (DrvSts *)raw;
         ds->track       = 0;
         ds->writeProt   = 0;             /* write-enabled */
-        ds->diskInPlace = 8;             /* nonejectable disk present */
+        ds->diskInPlace = gDiskInPlace;  /* r80: 1 = EJECTABLE disk present (was 8 = nonejectable/fixed) */
         ds->installed   = 1;             /* drive installed */
         ds->sides       = 0;
         dq = (DrvQElPtr)&ds->qLink;
@@ -308,7 +314,7 @@ static OSErr disk_status(ParmBlkPtr pb)
         int k; for (k = 0; k < 11; k++) pb->cntrlParam.csParam[k] = 0;
         ds->track       = 0;
         ds->writeProt   = 0;             /* r23: write-enabled */
-        ds->diskInPlace = 8;
+        ds->diskInPlace = gDiskInPlace;  /* r80: reflect ejectable/media-present state (1 present, 0 after Eject) */
         ds->installed   = 1;
         ds->sides       = 0;
         return noErr;
@@ -326,6 +332,16 @@ static OSErr disk_status(ParmBlkPtr pb)
         DriverGestaltParam *dg = (DriverGestaltParam *)pb;
         if (dg->driverGestaltSelector == kdgDeviceType) { dg->driverGestaltResponse = kdgDiskType; return noErr; }
         if (dg->driverGestaltSelector == kdgInterface)  { dg->driverGestaltResponse = kdgUSBIntf;  return noErr; }
+        /* r98: our custom USB 2.0 volume icon. Return a pointer to the embedded 'icns' IconFamily for the
+         * media icon (kdgMediaIconSuite, formerly csCode 22) AND the physical-drive icon (kdgPhysDriveIconSuite,
+         * formerly csCode 21). This response IS fully filled (a valid pointer), so it does NOT hit the r37
+         * "half-filled pointer response = crash" trap. Only OUR (2.0) volumes go through this driver, so USB
+         * 1.1 volumes keep Apple's stock icon — the icon itself signals "mounted at Hi-Speed". */
+        if (dg->driverGestaltSelector == kdgMediaIconSuite ||
+            dg->driverGestaltSelector == kdgPhysDriveIconSuite) {
+            dg->driverGestaltResponse = (UInt32)(unsigned long)gUsb2Icns;
+            return noErr;
+        }
         return statusErr;                /* every other selector: safe default (never a half-filled response) */
     }
     return statusErr;
@@ -343,6 +359,12 @@ static OSErr disk_control(ParmBlkPtr pb)
      * audio CD (writes then failed with wPrErr -44). controlErr makes it back off so PC Exchange
      * claims the FAT volume (writable). Other csCodes (e.g. 70/100 used by the normal mount) still
      * get noErr, so this shouldn't disturb the FAT mount path. */
+    /* r80: EJECT (control csCode 7). Now reachable because we register as ejectable (diskInPlace=1). The File
+     * Manager has ALREADY unmounted + flushed the volume before it sends Eject, so there is no in-flight I/O to
+     * drain here — we just mark the media gone (so kStatus reports diskInPlace=0 and the Finder does NOT
+     * immediately remount) and ack. This gives clean, safe removal of the USB stick, like the USB-1.1 path.
+     * (A USB stick has no physical eject; re-mounting after eject re-runs at boot — hot re-mount is a v2 item.) */
+    if (pb->cntrlParam.csCode == 7) { gDiskInPlace = 0; return noErr; }
     if (pb->cntrlParam.csCode == 104 || pb->cntrlParam.csCode == 125) return controlErr;
     return noErr;
 }

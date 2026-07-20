@@ -14,8 +14,10 @@ the loader app are all PEF/CFM).
 
 - `src/` — the EHCI UIM ndrv (`ehci_uim.c`, `ehci_hw.c`, `ehci_os.c`, `ehci_xfer.c`,
   `ehci_vhub.c` + headers) and the block driver (`usb_disk.c`). `*.exp` are the CFM export
-  lists.
-- `probe/ehci_trigger.c` — the loader/mounter application.
+  lists. `usb2_icns_blob.h` is the "2.0" volume icon (an `'icns'` family) the block driver
+  hands the Finder for a mounted 2.0 volume — committed source, not a generated blob.
+- `probe/ehci_launcher.c` — the shippable launcher/mounter app (prompt-driven).
+- `probe/ehci_trigger.c` — the diagnostic/development harness (verbose logging).
 - `usl_import/` — import-stub libraries for the (never-published) USB Services Library / USB
   Family Expert UIM entry points the app links against.
 - `scripts/pef-to-blob.py` — embeds a built PEF into a C byte array.
@@ -41,22 +43,24 @@ python3 scripts/pef-to-blob.py build/EHCIUIM.pef src/ehci_pef_blob.h gEHCIPef
 cmake --build build --target blockdrv
 python3 scripts/pef-to-blob.py build/USBDisk.pef src/usb_disk_blob.h gUsbDiskPef
 
-# 3. build + package the loader app (MacBinary + disk image)
-cmake --build build --target EHCITrigger
-cmake --build build --target EHCITrigger_APPL
+# 3. build + package the launcher app (MacBinary + disk image)
+cmake --build build --target EHCILauncher
+cmake --build build --target EHCILauncher_APPL
+# (the EHCITrigger / EHCITrigger_APPL targets build the diagnostic harness the same way)
 ```
 
-The result is `build/EHCITrigger.bin` (MacBinary — copy to the OS 9 machine and decode so the
-resource fork survives) plus `.APPL`/`.dsk` variants.
+The result is `build/EHCILauncher.bin` (MacBinary — copy to the OS 9 machine and decode so the
+resource fork survives) plus `.APPL`/`.dsk` variants. A prebuilt copy is in `dist/`.
 
 If you edit a driver source, re-run its build + `pef-to-blob` step and then rebuild the app —
 otherwise the app keeps embedding the old driver.
 
 ## Notes
 
-- The blob headers are `.gitignore`d (generated). A fresh clone must run the steps above in
-  order; building `EHCITrigger` before the blobs exist will fail to compile.
+- The PEF blob headers (`ehci_pef_blob.h`, `usb_disk_blob.h`) are `.gitignore`d (generated). A
+  fresh clone must run the steps above in order; building the app before the blobs exist will
+  fail to compile. (`usb2_icns_blob.h`, the icon, is committed — it is not generated.)
 - Retro68 headers are Latin-1; `grep` them with `LC_ALL=C grep -a`.
-- Only the `ndrv`, `blockdrv`, and `EHCITrigger` targets are included here. The dev tree had
-  additional diagnostic probe apps and a resident-INIT vehicle; those were left out of this
-  repo.
+- Only the `ndrv`, `blockdrv`, `EHCILauncher`, and `EHCITrigger` targets are included here. The
+  dev tree had additional diagnostic probe apps and a resident-INIT vehicle; those were left
+  out of this repo.

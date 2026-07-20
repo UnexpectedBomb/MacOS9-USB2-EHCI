@@ -52,6 +52,12 @@ UInt32 ehci_vhub_bulk_stats(long *lastStat, UInt32 *doneN, UInt32 *errN, UInt8 *
 void   ehci_vhub_irq_stats(unsigned long *isrHits, int *a2live);   /* r35: real-IRQ install/fire state */
 /* r36 reliability diagnostics (all read at TASK level from uim23; interrupt-safe producers). */
 int    ehci_vhub_portevt_pop(UInt32 *ms, UInt8 *port, UInt8 *ev, UInt32 *portsc);   /* 1=popped, 0=empty */
+/* r83 OBSERVE: frame_ms/ring-independent probe. Returns #ports; *svcCalls=gVhubTick (advancing => the
+ * heartbeat/service loop is alive, i.e. service_ports IS scanning); portscArr[i]=live raw PORTSC (TRUE
+ * hardware state); connArr[i]=gPortConn[i] (what our detector tracked). Caller arrays sized >= maxPorts. */
+UInt32 ehci_vhub_obs(UInt32 *svcCalls, UInt32 *portscArr, UInt32 *connArr, UInt32 maxPorts);
+void   ehci_vhub_obs_arm(void);    /* r85: app arms the [obs] probe on entering the post-desktop observe loop */
+int    ehci_vhub_obs_armed(void);  /* uim23 gate — [obs] logging is OFF during boot until armed */
 void   ehci_vhub_down_stats(UInt32 *done, UInt32 *err, UInt32 *timeouts, UInt32 *qdrop,
                             UInt32 *lastAddr, UInt32 *lastPid, long *lastStat);
 UInt32 ehci_vhub_roothub_addr(void);   /* current root-hub USB address (ctrl_trace budgeting) */
@@ -67,12 +73,27 @@ UInt32 ehci_vhub_biofail(UInt8 *isWrite, UInt32 *lba, UInt16 *chunk, UInt8 *cswS
  * the Finder "cannot be written, disk error" (a nonzero CSW status -> -36), which downErr does NOT count. */
 void ehci_vhub_health(UInt32 *reject, UInt32 *hiwater, UInt32 *downTimeouts, UInt32 *downErr, UInt32 *downDone,
                       UInt32 *failSeq, UInt32 *failStat, UInt32 *failSig, UInt32 *failLba, UInt32 *isrHits, UInt32 *maxStall,
-                      UInt32 *downRecov, UInt32 *downRelink, UInt32 *lastAnchorLink);   /* r60: downRelink = QH re-splices; lastAnchorLink = current anchor target */
+                      UInt32 *downRecov, UInt32 *downRelink, UInt32 *lastAnchorLink,
+                      UInt32 *dataBytes, UInt32 *dataFrames);   /* r60: downRelink/lastAnchorLink; r67: dataBytes/dataFrames = pure data-phase rate (MB/s = bytes/(frames*125)) */
 /* r21: task-level self-driven SCSI probe (INQUIRY/READ CAPACITY/READ blk0) over the mounter's idle bulk
  * endpoints, to bypass the parked Apple mounter. Call once per uim23 (task context). */
 void ehci_vhub_selfprobe_tick(void);
+void ehci_vhub_loopcrumb(unsigned long tag);   /* r94: app idle-loop breadcrumb (diagnostic; armed around a reconnect) */
 unsigned long ehci_vhub_ms(void);   /* read-only clock snapshot (safe from any context) */
 void ehci_vhub_service(void);
+
+/* ---- v1 hot re-mount: async-schedule teardown / rebuild (isolation-testable) ----
+ * The reliability-critical core of hot re-mount is stopping and restarting the async schedule at
+ * runtime. teardown() quiesces the schedule (EHCI 4.8: clear ASE, wait ASS=0) and resets the engine
+ * to an idle "disconnected" state; resetToggles!=0 re-arms the bulk QHs to DATA0 for a real re-plug
+ * (the device reset its toggles), while 0 keeps the toggle in sync with a still-live device (the
+ * software-sim path). rebuild(ctrlAddr) re-points the resident QHs and re-enables the schedule
+ * (set ASE, wait ASS=1) — the QHs are never unlinked (the r45/r60 lesson). simulate_replug(n) loops
+ * teardown(0)->rebuild->one BOT READ(blk 0) n times WITHOUT a physical pull, to prove the stop/start
+ * surgery is safe in isolation before it is wired to a real port connect/disconnect. Returns passes. */
+void   ehci_vhub_engine_teardown(int resetToggles);
+void   ehci_vhub_engine_rebuild(UInt32 ctrlAddr);
+UInt32 ehci_vhub_simulate_replug(UInt32 n);
 
 /* Install the real EHCI interrupt handler on the node's driver-ist member + arm a periodic
  * timer, both driving ehci_vhub_service. Call from slot 0 (Initialize) after the controller

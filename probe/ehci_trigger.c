@@ -86,8 +86,8 @@ static void log_open(const char *fname)
 }
 static void LOG(const char *fmt, ...)
 {
-    char buf[512]; long i, n; va_list ap;
-    va_start(ap, fmt); vsprintf(buf, fmt, ap); va_end(ap);
+    char buf[1024]; long i, n; va_list ap;
+    va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);   /* r71: BOUNDED. An over-long banner overflowed the old buf[512] via UNBOUNDED vsprintf and smashed the saved return address -> MacsBug "unmapped memory exception" jumping into string bytes. */
     if (!gQuiet) printf("%s", buf);
     if (gLogRef) {
         ParamBlockRec pbf;
@@ -115,8 +115,8 @@ static void hlog_open(const char *fname)
 }
 static void HLOG(const char *fmt, ...)
 {
-    char buf[512]; long i, n; va_list ap; ParamBlockRec pbf;
-    va_start(ap, fmt); vsprintf(buf, fmt, ap); va_end(ap);
+    char buf[1024]; long i, n; va_list ap; ParamBlockRec pbf;
+    va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);   /* r71: BOUNDED (see LOG — this is what crashed r71) */
     if (!gHRef) return;
     for (i = 0; buf[i]; i++) if (buf[i] == '\n') buf[i] = '\r';
     n = i; (void)FSWrite(gHRef, &n, buf);
@@ -205,9 +205,13 @@ typedef long (*UsbRwFn)(unsigned long lba, unsigned long count, void *buf);
 typedef long (*UsbSubmitFn)(long cmdID, unsigned long lba, unsigned long count, void *buf, int isWrite, long *actCount);
 typedef void (*UsbHealthFn)(unsigned long *reject, unsigned long *hiwater, unsigned long *downTimeouts, unsigned long *downErr, unsigned long *downDone,
                             unsigned long *failSeq, unsigned long *failStat, unsigned long *failSig, unsigned long *failLba, unsigned long *isrHits, unsigned long *maxStall,
-                            unsigned long *downRecov, unsigned long *downRelink, unsigned long *lastAnchorLink);   /* r60: QH re-splices + current anchor target */
+                            unsigned long *downRecov, unsigned long *downRelink, unsigned long *lastAnchorLink,
+                            unsigned long *dataBytes, unsigned long *dataFrames);   /* r60: QH re-splices; r67: pure data-phase rate */
 typedef unsigned long (*UsbToStateFn)(unsigned long *cmd, unsigned long *sts, unsigned long *async, unsigned long *qhP, unsigned long *epChar, unsigned long *curQtd, unsigned long *ovlTok, unsigned long *qtdTok);
-typedef struct { unsigned long magic; UsbRwFn readFn; UsbRwFn writeFn; unsigned long blkSize, blkCnt; UsbSubmitFn submitFn; UsbHealthFn healthFn; UsbToStateFn toStateFn; } UsbSvc;
+typedef unsigned long (*UsbSimFn)(unsigned long n);   /* r81: hot-replug async-schedule isolation test */
+typedef void          (*UsbArmFn)(void);              /* r85: arm the [obs] probe */
+typedef void          (*UsbCrumbFn)(unsigned long tag); /* r94: app idle-loop breadcrumb (diagnostic) */
+typedef struct { unsigned long magic; UsbRwFn readFn; UsbRwFn writeFn; unsigned long blkSize, blkCnt; UsbSubmitFn submitFn; UsbHealthFn healthFn; UsbToStateFn toStateFn; UsbSimFn simReplugFn; UsbArmFn obsArmFn; UsbArmFn tickFn; UsbCrumbFn loopFn; } UsbSvc;
 
 /* r49 THREAD-B DECIDER: read the block engine's health via 'Eusb' healthFn and log it when a decisive
  * counter moves. Runs from the idle loop (task level, File-Mgr-safe) so it captures the AFTERMATH of a
@@ -226,11 +230,21 @@ static void dump_health(void)
     unsigned long mstall = 0;                                /* r54: worst device stall (60Hz ticks) */
     unsigned long drecov = 0;                                /* r57: BOT reset-recoveries */
     unsigned long drelink = 0, lanchor = 0;                  /* r60: async-ring re-splices + current anchor target */
+    unsigned long dbytes = 0, dframes = 0;                   /* r67: pure data-phase rate (MB/s = bytes/(frames*125)) */
     static unsigned long lRej = 0xFFFFFFFFUL, lHw = 0xFFFFFFFFUL, lTmo = 0xFFFFFFFFUL, lErr = 0xFFFFFFFFUL, lFseq = 0xFFFFFFFFUL, lRelink = 0xFFFFFFFFUL;
     if (Gestalt('Eusb', &gv) != noErr || gv == 0) return;
     sv = (UsbSvc *)gv;
     if (sv->magic != 0x45555342UL || !sv->healthFn) return;
-    sv->healthFn(&rej, &hw, &tmo, &derr, &ddone, &fseq, &fstat, &fsig, &flba, &isrh, &mstall, &drecov, &drelink, &lanchor);
+    sv->healthFn(&rej, &hw, &tmo, &derr, &ddone, &fseq, &fstat, &fsig, &flba, &isrh, &mstall, &drecov, &drelink, &lanchor, &dbytes, &dframes);
+    /* r67: the DECISIVE throughput datum — the PURE data-phase rate (isolated from per-command overhead).
+     * MB/s*100 = dbytes*8 / (dframes*125) *100 ... = dbytes*800/(dframes*125). >~10 MB/s => per-command overhead
+     * is the wall (do Phase 2 phase-prequeue + ITC); ~2-3 MB/s => the data phase itself is slow (park mode / RL). */
+    if (dframes) {
+        /* rate = dbytes / (dframes * 125us). MB/s*100 = dbytes*0.8/dframes = (dbytes*4)/(dframes*5). */
+        unsigned long mbx100 = (dbytes * 4UL) / (dframes * 5UL);
+        HLOG("[rcmd] %lu KB in %lu uframes (125us) = %lu.%02lu MB/s on-the-wire per-READ-command (issue->reap: device latency + xfer + 1 IRQ). Compare to [speed]: rcmd >> speed => File-Mgr/above-us overhead is the wall (read-ahead lever); rcmd ~= speed => on-the-wire bound.\n",
+             dbytes >> 10, dframes, mbx100 / 100, mbx100 % 100);
+    }
     /* r50: also log whenever failSeq moves — each CSW-level write failure (the Finder "disk error").
      * r60: also whenever downRelink moves — a QH re-splice (the freeze fix firing). */
     if (rej == lRej && hw == lHw && tmo == lTmo && derr == lErr && fseq == lFseq && drelink == lRelink) return;
@@ -437,41 +451,103 @@ static void write_test_big(short vref)
  * freeze pins the failure point. KB/s = KB*60/ticks; MB/s = KB/s / 1024. */
 static void write_test_speed(short vref)
 {
-    FSSpec sp; short rf = 0; long n; OSErr e; static unsigned char buf[32768];
-    const int kChunks = 128;                 /* 128 * 32KB = 4 MB */
-    UInt32 t0, ticks, kb, kbps; int c, i, done, vbad = 0;
+    FSSpec sp; short rf = 0; long n; OSErr e;
+    const int kChunks = 128;                 /* 128 * 32KB = 4 MB (write still uses 32KB chunks) */
+    Handle bufH = 0; Ptr buf; long bufSz = 4L * 1024 * 1024;   /* r76: up to a 4MB read buffer */
+    OSErr terr = -1;
+    UInt32 ticks, kb, kbps; int vbad = 0;
     if (vref == 0) { LOG("[speed] no mounted-volume vRefNum — skipping\n"); return; }
-    LOG("\n[speed] TIMED %d-MB write to the mounted volume (throughput + sustained-write probe)...\n", (kChunks * 32) / 1024);
+    /* r76: the app's memory partition is only 1MB (Retro68 default SIZE), so NewPtr(1MB) failed in r75. Draw the
+     * big read buffer from TEMPORARY MEMORY (free system RAM, OUTSIDE the app partition) instead — the classic
+     * idiom for large transient buffers. Fall back by halving if the biggest size isn't available. */
+    for (;;) {
+        bufH = TempNewHandle(bufSz, &terr);
+        if (bufH && terr == noErr) break;
+        if (bufH) DisposeHandle(bufH);
+        bufSz /= 2;
+        if (bufSz < 131072L) { LOG("[speed] TempNewHandle failed even at 128KB (%d) — skipping\n", (int)terr); return; }
+    }
+    HLock(bufH); buf = *bufH;
+    LOG("\n[speed] TIMED %d-MB write (contiguous alloc); read buffer = %ld KB (temp mem) ...\n", (kChunks * 32) / 1024, bufSz / 1024);
     (void)FSMakeFSSpec(vref, 2, "\pUSBSPEED.DAT", &sp);
     (void)FSpDelete(&sp);
-    e = FSpCreate(&sp, 'ttxt', 'BINA', 0);   if (e != noErr) { LOG("[speed] FSpCreate -> %d\n", (int)e); return; }
-    e = FSpOpenDF(&sp, fsRdWrPerm, &rf);     if (e != noErr) { LOG("[speed] open -> %d\n", (int)e); return; }
-    for (i = 0; i < 32768; i++) buf[i] = (unsigned char)(i & 0xFF);
-    t0 = TickCount();
-    for (c = 0; c < kChunks; c++) {
-        if ((c & 15) == 0) LOG("[speed] writing... %ld KB\n", (long)c * 32);   /* flushed each 512KB -> pins a freeze */
-        n = 32768; e = FSWrite(rf, &n, (Ptr)buf);
-        if (e != noErr) { LOG("[speed] *** WRITE FAILED at %ld KB (chunk %d) -> %d ***\n", (long)c * 32, c, (int)e); break; }
+    e = FSpCreate(&sp, 'ttxt', 'BINA', 0);   if (e != noErr) { LOG("[speed] FSpCreate -> %d\n", (int)e); HUnlock(bufH); DisposeHandle(bufH); return; }
+    e = FSpOpenDF(&sp, fsRdWrPerm, &rf);     if (e != noErr) { LOG("[speed] open -> %d\n", (int)e); HUnlock(bufH); DisposeHandle(bufH); return; }
+    /* r75: pre-allocate the whole 4MB CONTIGUOUSLY. Per the FM-internals research there is NO ~64KB File-Mgr
+     * per-request cap — the driver gets min(app buffer, contiguous-extent run) in one _Read — so the r73/r74
+     * ~64KB plateau was file FRAGMENTATION (or the small app buffer). A contiguous file + big FSReads should let
+     * bio chunk each read into back-to-back 128KB commands with NO File-Mgr gap, amortizing the ~6.3ms/FSRead
+     * overhead → throughput should climb toward the ~20 MB/s wire rate as the read size grows. */
+    {
+        ParamBlockRec pb; pb.ioParam.ioCompletion = 0; pb.ioParam.ioRefNum = rf;
+        pb.ioParam.ioReqCount = (long)kChunks * 32768L; pb.ioParam.ioPosMode = fsFromStart; pb.ioParam.ioPosOffset = 0;
+        e = PBAllocContigSync(&pb);
+        LOG("[speed] PBAllocContig(4MB) -> %d, got %ld KB %s\n", (int)e, pb.ioParam.ioActCount / 1024,
+            (e == noErr) ? "CONTIGUOUS" : "(not contiguous — volume may be fragmented)");
     }
-    done = c;
+    { long j; for (j = 0; j < bufSz; j++) ((unsigned char *)buf)[j] = (unsigned char)(j & 0xFF); }   /* r79: fill the WHOLE buffer with the position pattern (so the untimed read-back verify holds for any write size) */
+    /* r79: SWEEP the WRITE chunk size (32KB → 4MB), same as the read sweep, to expose the WRITE ceiling — a big
+     * FSWrite lets bio chain it into back-to-back 128KB write commands (no File-Mgr gap), amortizing the
+     * ~6.3ms/FSWrite the same way big reads hit 20 MB/s. FlushVol is inside the timing = real sustained write to
+     * the device (not just into the FM cache). 4MB overwritten from pos 0 each pass onto the contiguous file. */
+    {
+        static const long wsizes[5] = { 32768L, 131072L, 524288L, 1048576L, 4194304L };
+        const long total = (long)kChunks * 32768L;   /* 4 MB per pass */
+        int s; long prev = 0;
+        for (s = 0; s < 5; s++) {
+            long wsz = wsizes[s], wrote = 0; UInt32 wt0;
+            if (wsz > bufSz) wsz = bufSz;
+            if (wsz == prev) continue;                /* skip a duplicate if capping collapsed two sizes */
+            prev = wsz;
+            e = SetFPos(rf, fsFromStart, 0);
+            if (e != noErr) { LOG("[speed] SetFPos(w) -> %d\n", (int)e); break; }
+            wt0 = TickCount();
+            while (wrote < total) {
+                long want = total - wrote; if (want > wsz) want = wsz;
+                n = want; e = FSWrite(rf, &n, buf);
+                if (e != noErr) { LOG("[speed] *** WRITE FAILED at %ld KB (%ldKB chunks) -> %d ***\n", wrote / 1024, wsz / 1024, (int)e); break; }
+                wrote += n;
+            }
+            (void)FlushVol(0, vref);                  /* commit to the device — inside the timing */
+            ticks = TickCount() - wt0; kb = (UInt32)(wrote / 1024); kbps = ticks ? (kb * 60UL) / ticks : 0;
+            LOG("[speed] WROTE (%ldKB) %lu KB in %lu ticks (~%lu.%01lu s) = %lu KB/s = %lu.%02lu MB/s\n",
+                wsz / 1024, kb, ticks, ticks / 60, ((ticks % 60) * 10) / 60, kbps, kbps / 1024, ((kbps % 1024) * 100) / 1024);
+            if (e != noErr) break;
+        }
+    }
     (void)FSClose(rf);
-    (void)FlushVol(0, vref);
-    ticks = TickCount() - t0; kb = (UInt32)((long)done * 32);
-    kbps = ticks ? (kb * 60UL) / ticks : 0;
-    LOG("[speed] WROTE %lu KB in %lu ticks (~%lu.%01lu s) = %lu KB/s = %lu.%02lu MB/s\n",
-        kb, ticks, ticks / 60, ((ticks % 60) * 10) / 60, kbps, kbps / 1024, ((kbps % 1024) * 100) / 1024);
-    if (done < kChunks) { LOG("[speed] (write stopped early = SUSTAINED-WRITE failure at ~%lu KB, in-app)\n", kb); return; }
-    rf = 0; e = FSpOpenDF(&sp, fsRdPerm, &rf); if (e != noErr) { LOG("[speed] reopen(ro) -> %d\n", (int)e); return; }
-    t0 = TickCount();
-    for (c = 0; c < kChunks; c++) { n = 32768; e = FSRead(rf, &n, (Ptr)buf);
-        if (e != noErr || n != 32768) { LOG("[speed] read failed chunk %d -> %d (n=%ld)\n", c, (int)e, n); break; }
-        for (i = 0; i < 32768; i++) if (buf[i] != (unsigned char)(i & 0xFF)) { vbad++; break; } }   /* r46: verify the 40-block-chunk DMA */
-    ticks = TickCount() - t0; (void)FSClose(rf);
-    kb = (UInt32)((long)c * 32); kbps = ticks ? (kb * 60UL) / ticks : 0;
-    LOG("[speed] READ  %lu KB in %lu ticks (~%lu.%01lu s) = %lu KB/s = %lu.%02lu MB/s\n",
-        kb, ticks, ticks / 60, ((ticks % 60) * 10) / 60, kbps, kbps / 1024, ((kbps % 1024) * 100) / 1024);
-    LOG("[speed] read-back verify: %s\n", vbad ? "*** DATA MISMATCH — r46 big-chunk DMA bug ***" : "OK");
+    /* r75: SWEEP big READ sizes (64KB → 1MB). NO inline verify here (it would pollute the timing); integrity is
+     * checked untimed below + by the separate 64MB [verify]. Rising MB/s with size = the 6.3ms/FSRead amortizing. */
+    {
+        static const long rsizes[4] = { 131072L, 524288L, 1048576L, 4194304L };   /* r76: 128KB → 4MB (one whole-file read) */
+        int s; long prev = 0;
+        for (s = 0; s < 4; s++) {
+            long rsz = rsizes[s], total = 0; UInt32 rt0;
+            if (rsz > bufSz) rsz = bufSz;               /* cap to the temp buffer we actually got */
+            if (rsz == prev) continue;                  /* skip a duplicate if capping collapsed two sizes */
+            prev = rsz;
+            rf = 0; e = FSpOpenDF(&sp, fsRdPerm, &rf);
+            if (e != noErr) { LOG("[speed] reopen(ro) -> %d\n", (int)e); break; }
+            rt0 = TickCount();
+            for (;;) { n = rsz; e = FSRead(rf, &n, buf); if (n > 0) total += n; if (e != noErr || n < rsz) break; }
+            ticks = TickCount() - rt0; (void)FSClose(rf);
+            kb = (UInt32)(total / 1024); kbps = ticks ? (kb * 60UL) / ticks : 0;
+            LOG("[speed] READ (%ldKB) %lu KB in %lu ticks (~%lu.%01lu s) = %lu KB/s = %lu.%02lu MB/s\n",
+                rsz / 1024, kb, ticks, ticks / 60, ((ticks % 60) * 10) / 60, kbps, kbps / 1024, ((kbps % 1024) * 100) / 1024);
+        }
+        /* untimed integrity pass over the whole file in 128KB reads (exercises the big-read chunking) */
+        rf = 0; e = FSpOpenDF(&sp, fsRdPerm, &rf);
+        if (e == noErr) {
+            long base = 0;
+            for (;;) { long k; n = 131072; e = FSRead(rf, &n, buf);
+                for (k = 0; k < n; k++) if (((unsigned char *)buf)[k] != (unsigned char)((base + k) & 0xFF)) { vbad++; break; }
+                base += n; if (e != noErr || n < 131072) break; }
+            (void)FSClose(rf);
+        }
+        LOG("[speed] read-back verify: %s\n", vbad ? "*** DATA MISMATCH ***" : "OK");
+    }
     (void)FSpDelete(&sp);   /* remove the 4MB test file */
+    HUnlock(bufH); DisposeHandle(bufH);
 }
 
 /* r51: LARGE characterizing write-verify. r48-r50 proved the USB engine returns noErr for EVERY I/O
@@ -552,7 +628,7 @@ static void write_test_manyfiles(short vref)
     if (vref == 0) { LOG("[manyfiles] no vRefNum — skipping\n"); return; }
     LOG("\n[manyfiles] FOREGROUND repro: create up to %d files (create+write+close each, varying sizes) to churn\n", kFiles);
     LOG("[manyfiles] the catalog like a UT-folder copy. The FIRST failure's ERROR CODE is what we're after.\n");
-    HLOG("[r63] A1 REWORK: per-endpoint QHs + HARDWARE data toggle (DTC=0 bulk), dummy-qTD append. Recovery OFF, 30s watchdog. Q: does the wedge DISAPPEAR (manyfiles completes / no 30s stalls) now that the software toggle is gone?\n");
+    HLOG("[r80] REMOVABLE/EJECTABLE: the USB volume now registers as an EJECTABLE removable disk (block driver diskInPlace 8->1 + Eject csCode 7 handled) instead of a fixed internal disk — Finder should offer EJECT + safe removal like USB 1.1. Device type kept 'disk'/writable (no Audio-CD misID). EXPECT: mounts WRITABLE + copies CLEAN + the volume shows Eject + ejecting removes the icon. WATCH: if it comes up read-only/'Audio CD' or won't mount, revert. Post-eject remount = reboot (v2). Throughput/reliability unchanged (20x R / ~13x W ceiling).\n");
     HLOG("[manyfiles] running (foreground repro of the per-file 'cannot be written')...\n");
     for (n = 0; n < 32768; n++) buf[n] = (unsigned char)n;
     for (f = 0; f < kFiles; f++) {
@@ -610,7 +686,7 @@ int main(void)
     LOG("     is likely many-files catalog churn. [manyfiles] creates ~800 files itself (same FM calls) and on the\n");
     LOG("     FIRST failure logs the EXACT File Mgr error code (never captured before). NO Finder copy needed — just\n");
     LOG("     run r59 and read the [manyfiles] result in 'USB Health.log'. (64MB verify skipped this run to save time.)\n");
-    LOG("==== (r63) A1: PER-ENDPOINT QHs + HARDWARE toggle (DTC=0 bulk) via dummy-qTD append — replaces the single reprogrammed QH + software toggle that desynced BOT. Recovery OFF, 30s watchdog. WIN = 64MB verify clean + manyfiles no longer wedges (downTimeouts=0).\n");
+    LOG("==== (r80) REMOVABLE/EJECTABLE (block-driver change, usb_disk.c). The USB volume now registers as EJECTABLE removable media: DrvSts.diskInPlace 8->1 in AddDrive + kStatus(8), and a new Eject control (csCode 7) handler sets diskInPlace=0 so the eject STICKS (FM already unmounted+flushed, so no in-flight I/O to drain). Was a fixed NON-ejectable disk (inherited from the eSATA driver). Device type kept 'disk'/writable (kdgDiskType) to preserve the r37 anti-Audio-CD-misID fix. EXPECT: still mounts WRITABLE + copies CLEAN + the Finder now offers EJECT (menu or drag-to-Trash) + ejecting removes the icon (safe removal, like USB 1.1). WATCH FOR REGRESSIONS: (a) volume read-only or 'Audio CD' => removability reopened the CD-misID => revert; (b) won't mount => diskInPlace value wrong. Post-eject remount = reboot (v2). Throughput (20x R / ~13x W device ceiling) + residue-check reliability UNCHANGED. r79 write sweep also present.\n");
     LOG("     and got to 52MB: the fix DIRECTION is right, the device just GC-stalls >33s sometimes. r54:\n");
     LOG("     (1) watchdog now on the RELIABLE 60Hz Ticks clock @ 60s (was a variable service-counter);\n");
     LOG("     (2) [health] now reports maxStall = the device's worst-case stall in seconds. EXPECT: 64MB\n");
@@ -771,6 +847,11 @@ int main(void)
     LOG(" LoadUIMForEntry -> %ld  (0=OK; -6xxx=err)\n", lr);
     LOG(" MOUNT CHECK: volumes %d->%d  drives %d->%d\n", vcbBase, vcbNow, drvBase, drvNow);
 park:
+    /* r84: SKIP the write self-tests + r81 replug test. They run pre-observe with the pump OFF, and the
+     * device was dropping off the port during that window (before we could watch). Go straight from mount
+     * to the observe loop so the device is freshly connected AND the pump is on when the user pulls. The
+     * disabled block is kept verbatim for reference. */
+#if 0
     /* r26: quick write self-test first (proven path — guarantees a verdict even if Finder use has
      * issues), THEN hand the desktop to the user. DO NOT close the log or block on getchar. */
     LOG("\n==== r44: FS-level write tests + TIMED throughput/sustained-write probe on the mounted volume ====\n");
@@ -781,6 +862,27 @@ park:
     write_test_verify_big(mountedVRef);                /* r63: RE-ENABLED — byte-perfect proof the NEW dummy-qTD/HW-toggle engine moves 64MB correctly (the rework's data-integrity safety net) */
     write_test_manyfiles(mountedVRef);                 /* r59: FOREGROUND repro of the Finder's per-file "cannot be written" */
     dump_cslog("post-write");
+
+    /* r81: HOT-REPLUG ISOLATION TEST. After the proven mount+read+write path (engine known-good and
+     * idle), exercise the async-schedule teardown/rebuild surgery — the reliability-critical core of
+     * hot re-mount — 20x WITHOUT a physical pull. A clean pass (20/20, read OK + stable block-0 sig,
+     * downErr/downTimeouts unmoved) means the stop/start-the-schedule mechanics are safe; the next
+     * step wires that same teardown/rebuild to a real port connect/disconnect event. */
+    {
+        long gv;
+        if (Gestalt('Eusb', &gv) == noErr && gv != 0) {
+            UsbSvc *sv = (UsbSvc *)gv;
+            if (sv->magic == 0x45555342UL && sv->simReplugFn) {
+                unsigned long passed = sv->simReplugFn(20);
+                LOG("\n[replug] simReplugFn returned %lu/20 (see the r81 [replug] block for sig/err detail)\n", passed);
+            } else {
+                LOG("\n[replug] 'Eusb' present but simReplugFn missing — rebuild the ndrv + regen the PEF blob\n");
+            }
+        } else {
+            LOG("\n[replug] no 'Eusb' service — skipping the hot-replug isolation test\n");
+        }
+    }
+#endif  /* r84: end skipped pre-observe self-tests (write tests + r81 replug) */
 
     /* Make the desktop usable: get the fullscreen console out of the way and run a REAL event loop.
      * The app STAYS ALIVE (memory + interrupt heartbeat valid), so Finder copies to the USB volume
@@ -794,13 +896,41 @@ park:
     { unsigned long dtk; short s; for (s = 0; s < 6; s++) { Delay(60, &dtk); SystemTask(); } }  /* ~6s to read */
     gQuiet = 1;                                        /* file-only from here (a printf could re-show the console) */
     { WindowPtr w = FrontWindow(); if (w) HideWindow(w); }   /* uncover the desktop */
+    /* r85: ARM the [obs] probe now that we've reached the post-desktop observe loop. Until this call,
+     * uim23's [obs] block is gated OFF, so boot enumeration is not logged + the mid-pump insertion runs clean. */
+    { long agv; if (Gestalt('Eusb', &agv) == noErr && agv != 0) { UsbSvc *asv = (UsbSvc *)agv;
+        if (asv->magic == 0x45555342UL && asv->obsArmFn) asv->obsArmFn(); } }
+    /* r82 OBSERVE (hot re-mount Phase 0): re-enable the post-mount USL pump so the hub driver + Family
+     * Expert can PROCESS port changes that happen NOW (a real unplug/re-insert), and so uim23 — which
+     * already logs PORT EVENTs + every dispatch-slot call (18/19 teardown, 6 create_bulk) — runs again.
+     * (r22/r28 dropped these as unnecessary for the DATA path; they ARE needed to service hot-plug. The
+     * data path is interrupt-driven and unaffected.) DIAGNOSTIC build: we only OBSERVE what the USL does
+     * on a real replug; no teardown/re-mount handlers yet — that is Phase 1+. */
+    LOG("\n==== r95 PHASE 1 FIX: interrupt-level takeover-arm (heartbeat SIH fences Apple the moment it parks) ====\n");
+    LOG(">>> WAIT ~15s, THEN: Finder-eject -> wait 10s -> PULL -> wait 10s -> REINSERT -> then WAIT 60-90s before snapshot.\n");
+    LOG(">>> r94 proved Apple's driver MONOPOLIZES the task loop post-reinsert. r95 arms the takeover from the 8ms\n");
+    LOG(">>> heartbeat interrupt (which survives the monopoly): when Apple's bulk probing goes QUIET it fences + arms,\n");
+    LOG(">>> and the self-probe takes over the instant the task loop is released. SUCCESS in \"EHCIUIM_init.log\":\n");
+    LOG(">>> 'SIH-armed reconnect takeover' -> SELFPROBE COMPLETE (#2) -> 'Eusb' re-published. Watch the 'r95 bulk_xfer' trace.\n");
     {
         EventRecord evt;
+        UsbSvc *svc = NULL;
+        { long agv; if (Gestalt('Eusb', &agv) == noErr && agv != 0) {   /* resolve ONCE: gSvc is static, addr stable across re-publish */
+            UsbSvc *s = (UsbSvc *)agv; if (s->magic == 0x45555342UL) svc = s; } }
         for (;;) {
             (void)WaitNextEvent(everyEvent, &evt, 3L, NULL);   /* short sleep: yield but loop often to capture */
-            /* r29: dump EVERY iteration. dump_cslog is a no-op unless the ring advanced, so this is cheap
-             * when idle and flushes the Finder's read/write records to disk right up to a freeze. (No
-             * ExpertIdleTask/USLPolledProcessDoneQueue — proven unnecessary post-mount, r22/r28.) */
+            if (svc && svc->loopFn) svc->loopFn(1);  /* r94: crumb — top of pass, BEFORE ExpertIdleTask */
+            ExpertIdleTask();                  /* r82: drive the USB Family Expert (device add/remove decisions) */
+            USLPolledProcessDoneQueue();       /* r82: drive the USL done-queue -> calls uim23 (port-event + slot tracing) */
+            if (svc && svc->loopFn) svc->loopFn(2);  /* r94: crumb — after USL, JUST BEFORE the self-probe tick */
+            if (svc && svc->tickFn) svc->tickFn();   /* r92: drive the self-probe DIRECTLY. USLPolledProcessDoneQueue
+                                                      * stops reaching uim23/slot 23 after a reinsert (r91 logs), so the
+                                                      * reconnect re-probe (gReprobe path) must be ticked from here — task
+                                                      * level (File-Mgr-safe); its bulk xfers run on our own SIH down-engine,
+                                                      * not the USL done-queue, so they don't depend on the dropped poll. */
+            if (svc && svc->loopFn) svc->loopFn(3);  /* r94: crumb — end of pass, AFTER tickFn (decrements the trace counter) */
+            /* dump_cslog is a no-op unless the ring advanced, so this is cheap when idle and flushes the
+             * Finder's read/write records to disk right up to a freeze. */
             dump_cslog("live");
             dump_health();       /* r49: THREAD-B decider — logs reject / hiwater / downTimeouts on change */
         }

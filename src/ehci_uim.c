@@ -149,8 +149,8 @@ static void ctrl_trace(UInt32 devAddr, UInt32 pid, UInt32 len, volatile UInt8 *b
     /* r36: budget the root-hub enum and the DOWNSTREAM (SanDisk) control flow SEPARATELY. The old flat
      * 44-cap let the root-hub enum consume the whole budget, hiding the SanDisk's enumeration +
      * interface-setup control transfers — exactly the window where the -6999 handoff dies. */
-    if (devAddr == ehci_vhub_roothub_addr()) { if (nRoot >= 16) return; nRoot++; }
-    else                                     { if (nDown >= 96) return; nDown++; }
+    if (devAddr == ehci_vhub_roothub_addr()) { if (nRoot >= 400) return; nRoot++; }    /* r82: raised for the observe window */
+    else                                     { if (nDown >= 2000) return; nDown++; }   /* r82: capture reconnect enumeration */
     gCtrlRec++;                                           /* total tally (kept for continuity) */
     if (pid == 2 && (UInt32)buf >= 0x1000UL) {            /* SETUP: capture the 8-byte setup packet (memory read only) */
         s0 = ((UInt32)buf[0]<<24)|((UInt32)buf[1]<<16)|((UInt32)buf[2]<<8)|buf[3];
@@ -180,7 +180,7 @@ static OSStatus uim6(UInt32 a,UInt32 b,UInt32 c,UInt32 d,UInt32 e,UInt32 f,UInt3
 {
     static int n = 0;
     (void)e; (void)f; (void)g; (void)h;
-    if (n++ < 4) { ehci_os_log("uim6 CreateBulkEndpoint"); ehci_os_logx("  devAddr", a);
+    if (n++ < 200) { ehci_os_log("uim6 CreateBulkEndpoint"); ehci_os_logx("  devAddr", a);   /* r82: raised so reconnect create_bulk logs */
         ehci_os_logx("  endpt", b); ehci_os_logx("  dirIn", c); ehci_os_logx("  maxpkt.lo", d); }
     return (OSStatus)ehci_vhub_create_bulk(a, b, c, d ? d : 512);
 }
@@ -248,7 +248,7 @@ static OSStatus uim23(UInt32 a,UInt32 b,UInt32 c,UInt32 d,UInt32 e,UInt32 f,UInt
      * what the disk driver waits on. Capped so a flood can't fill the log. */
     {
         static int nsl = 0; static UInt32 last27 = 0;
-        while (gSlotTail < gSlotHead && nsl < 500) {   /* r36: higher cap for the un-starved downstream trace */
+        while (gSlotTail < gSlotHead && nsl < 5000) {   /* r82: raised so post-mount replug slot 18/19 calls are all visible */
             volatile SlotCall *s = &gSlotLog[gSlotTail % SLOTLOG_N];
             UInt32 sl=s->slot, aa=s->a, bb=s->b, cc=s->c, dd=s->d, ee=s->e, ff=s->f, gg=s->g, hh=s->h;
             gSlotTail++; nsl++;
@@ -273,11 +273,41 @@ static OSStatus uim23(UInt32 a,UInt32 b,UInt32 c,UInt32 d,UInt32 e,UInt32 f,UInt
      * self-claiming the bulk endpoints. Task level only (File Mgr safe — the r18 hard-hang lesson). */
     {
         UInt32 ms, portsc; UInt8 port, ev; static int npe = 0;
-        while (npe < 96 && ehci_vhub_portevt_pop(&ms, &port, &ev, &portsc)) {
+        while (npe < 2000 && ehci_vhub_portevt_pop(&ms, &port, &ev, &portsc)) {   /* r82: raised for the observe window */
             npe++;
             ehci_os_log("PORT EVENT (ev 1=conn 2=disc 3=rstAssert 4=rstDeassert 5=enabled/reset-done)");
             ehci_os_logx("  ms", ms);   ehci_os_logx("  port", port);
             ehci_os_logx("  ev", ev);   ehci_os_logx("  portsc", portsc);
+        }
+    }
+    /* r83 OBSERVE: frame_ms-independent, ring-independent probe. gVhubTick advancing = the heartbeat/service
+     * loop is alive (service_ports IS scanning). Live PORTSC = the TRUE hardware state regardless of our
+     * detector; gPortConn = what our detector tracked. Edge-triggered on PORTSC so a pull/reinsert logs
+     * precisely; a ~5s "alive" line proves scanning even when idle. 60Hz Ticks clock (frame_ms freezes). */
+    if (ehci_vhub_obs_armed()) {   /* r85: gate — [obs] runs ONLY in the post-desktop observe loop, NOT during boot */
+        static UInt32 obsLast[8]; static UInt32 obsLastTick = 0; static int obsSeeded = 0, obsNChg = 0, obsNAlive = 0;
+        UInt32 svc = 0, psc[8], con[8], np2, i2, nowT = *(volatile UInt32 *)0x016AUL;
+        np2 = ehci_vhub_obs(&svc, psc, con, 8);
+        if (!obsSeeded) {                                    /* one-time baseline: steady-state PORTSC per port */
+            for (i2 = 0; i2 < np2; i2++) { ehci_os_log("[obs] baseline");
+                ehci_os_logx("  port", i2); ehci_os_logx("  portsc", psc[i2]); ehci_os_logx("  gPortConn", con[i2]); }
+            ehci_os_logx("[obs] svc(gVhubTick) baseline", svc);
+        }
+        for (i2 = 0; i2 < np2; i2++) {
+            if (obsSeeded && psc[i2] != obsLast[i2] && obsNChg < 300) {   /* a pull/reinsert toggles CONNECT here */
+                obsNChg++;
+                ehci_os_log("[obs] PORTSC CHANGE");
+                ehci_os_logx("  port", i2);            ehci_os_logx("  from", obsLast[i2]);
+                ehci_os_logx("  to", psc[i2]);         ehci_os_logx("  gPortConn(our detector)", con[i2]);
+                ehci_os_logx("  svc(gVhubTick)", svc); ehci_os_logx("  ticks", nowT);
+            }
+            obsLast[i2] = psc[i2];
+        }
+        obsSeeded = 1;
+        if ((nowT - obsLastTick) >= 300 && obsNAlive < 90) {   /* ~5s liveness heartbeat, bounded */
+            obsLastTick = nowT; obsNAlive++;
+            ehci_os_log("[obs] alive"); ehci_os_logx("  svc(gVhubTick)", svc); ehci_os_logx("  ticks", nowT);
+            for (i2 = 0; i2 < np2; i2++) { ehci_os_logx("  port", i2); ehci_os_logx("    portsc(live)", psc[i2]); }   /* r84: steady-state port view */
         }
     }
     {
