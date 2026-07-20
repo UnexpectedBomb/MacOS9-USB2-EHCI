@@ -1693,13 +1693,22 @@ static OSStatus vhub_heartbeat(void *p1, void *p2)
 static InterruptMemberNumber vhub_isr(InterruptSetMember m, void *refcon, UInt32 cnt)
 {
     UInt32 sts;
-    (void)m; (void)refcon; (void)cnt;
+    InterruptMemberNumber chained = kIsrIsNotComplete;
+    (void)refcon;
     sts = ehci_read32(gSoftc.opBase, EHCI_USBSTS) & gIntrEnabled;
-    if (!sts) return kIsrIsNotComplete;                        /* not ours -> keep chaining */
-    gIsrHits++;                                                /* r35: this IRQ was ours */
-    ehci_write32(gSoftc.opBase, EHCI_USBINTR, 0);              /* mask until the SIH clears it */
-    if (!gSihQueued) { gSihQueued = 1; QueueSecondaryInterruptHandler(vhub_sih, NULL, NULL, NULL); }
-    return kIsrIsComplete;
+    if (sts) {                                                 /* our (EHCI) interrupt */
+        gIsrHits++;                                            /* r35: this IRQ was ours */
+        ehci_write32(gSoftc.opBase, EHCI_USBINTR, 0);          /* mask until the SIH clears it */
+        if (!gSihQueued) { gSihQueued = 1; QueueSecondaryInterruptHandler(vhub_sih, NULL, NULL, NULL); }
+    }
+    /* Shared PCI IRQ: on the NEC multifunction chip (Mac Mini on-board) the EHCI
+     * shares its interrupt member with the OHCI companions that drive the keyboard
+     * and mouse. InstallInterruptFunctions REPLACED the handler that was on this
+     * member, so we must invoke it every interrupt or the companions' interrupts
+     * are never serviced (keyboard/mouse freeze). On a dedicated line the saved
+     * handler simply finds nothing pending and returns. */
+    if (gSavedHandler) chained = gSavedHandler(m, gSavedRefcon, cnt);
+    return sts ? kIsrIsComplete : chained;
 }
 void ehci_vhub_start_service(EHCIRegEntryIDPtr node)
 {

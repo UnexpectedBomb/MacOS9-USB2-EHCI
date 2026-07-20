@@ -160,6 +160,48 @@ Lesson: don't reinvent what the host controller will do for you. A per-endpoint 
 hardware-maintained data toggle is not an optimization — it's the correct design, and the
 reason the 1.1 stack was bulletproof all along.
 
+## Bug hunt #4 — coexisting with the keyboard on an on-board controller
+
+Moving from a PCI card to an **on-board** USB 2.0 controller (a Mac Mini G4) changed the game in
+one way: there, the EHCI is one function of a multi-function chip whose **OHCI companion
+controllers drive the machine's keyboard and mouse**, sharing both the physical ports *and* a
+single PCI interrupt line with the EHCI. On a card the EHCI's ports were empty and its interrupt
+was its own, so the driver simply seized the whole controller. Do that here and you take the
+keyboard down with it.
+
+The intended fix is a **per-port claim**: after routing the ports to EHCI, hand every port that
+already holds a device back to the 1.1 companion (set its Port Owner bit) and claim only the empty
+ports — so a drive inserted afterward comes up on EHCI at Hi-Speed while the keyboard and mouse
+stay on the companion. A standalone register-poke test proved the idea (keyboard released, drive
+links at high speed, input survives), but folding it into the real driver failed twice, and the
+driver's own trace log walked down why:
+
+- **Port Power Control (the keyboard "wouldn't release").** The log showed the keyboard's port
+  coming up **EHCI-owned** — claimed, not released — every time. The chip reports *Port Power
+  Control* (`HCSPARAMS` PPC=1), and per the EHCI spec **a port's Connect-Status reads 0 while the
+  port is unpowered.** The driver's `HCReset` (run just before the claim) leaves every port powered
+  off, so reading connect-status to decide "occupied vs. empty" saw the keyboard's port as *empty*
+  and claimed it. (The standalone test dodged this by never doing an `HCReset` — the ports kept
+  their power from the running OS.) Worse, once the keyboard sat on an EHCI port the USB Expert
+  spent ~40 s trying to enumerate it as a device — it's full-speed, so it never enables — which
+  starved the actual drive until the launcher timed out. **Fix:** power the ports first, wait out
+  the USB connect debounce (timed off the running controller's `FRINDEX`, no OS call), *then* read
+  connect-status and decide.
+
+- **A displaced interrupt handler (the shared line).** With the keyboard correctly released, a
+  second problem surfaced: our interrupt handler had been installed on the interrupt member the
+  OHCI companions were already using, **replacing** their handler. When an interrupt wasn't ours we
+  returned "not complete" but never called the handler we'd displaced — so the companion's
+  interrupts (keyboard and mouse) were never serviced. **Fix:** chain — always invoke the saved
+  handler, so on a shared line the companion keeps running (and on a dedicated line it simply finds
+  nothing pending).
+
+With both in place the Mac Mini G4 mounts a USB 2.0 drive on its **built-in** ports at Hi-Speed
+while the keyboard and mouse keep working — full folder copies in both directions, no freezes.
+
+Lesson: on shared silicon, claim **surgically**. Read a port's state only once it's powered, and
+never orphan a handler you replace.
+
 ## Also worth knowing
 
 - **Reset timing:** after a port reset the UIM waits for the port to actually report *Enabled*
@@ -171,12 +213,14 @@ reason the 1.1 stack was bulletproof all along.
 
 ## Roadmap / known limitations
 
-- **Throughput (~0.8 MB/s) — the main open task.** The engine still runs one BOT command in
-  flight with a data copy on the interrupt path. Bigger chunks alone were tried and
-  **backfired** — a 20 KB copy at interrupt level starves the UI (choppy Finder) and the
-  multi-page scatter was unreliable. Real speed needs the data copy moved **off** the interrupt
-  path, then multiple in-flight commands — which the **per-endpoint queue heads (Bug hunt #3)
-  now make possible**. That rework is next.
+- **Throughput — solved.** Reads ~20 MB/s and writes ~13 MB/s (the flash device's own ceiling),
+  by pre-queuing whole commands (one interrupt per command) with multi-qTD 128 KB transfer chains
+  and per-endpoint hardware toggles (Bug hunt #3). Real Finder copies land lower (~8 read / ~5
+  write) — the Finder's own I/O sizing, not the driver, is the ceiling there.
+- **On-board (shared-port) controllers — supported.** Machines like the Mac Mini G4, whose EHCI
+  shares its ports and interrupt line with the OHCI companions that drive the keyboard/mouse, now
+  work via the per-port claim (Bug hunt #4): the drive mounts at Hi-Speed on the built-in ports
+  while the keyboard and mouse coexist on the same controller.
 - **Large Finder copies: fixed.** Previously wedged on the Finder's interleaved access; the
   cause was a software data toggle on a shared queue head, resolved by per-endpoint hardware
   toggle (Bug hunt #3). A ~800 MB / 1000+ file copy now completes cleanly.

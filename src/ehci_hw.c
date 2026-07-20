@@ -9,6 +9,21 @@
 
 #define EHCI_SPIN_LIMIT 500000
 
+/* Spin ~ms milliseconds off the running controller's frame counter: FRINDEX
+ * advances one microframe (125us) per tick while RUN=1. Pure MMIO, no OS calls —
+ * used for the USB connect-debounce wait after routing the ports to EHCI. */
+static void ehci_frame_delay(volatile void *op, UInt32 ms)
+{
+    UInt32 want = ms * 8;                              /* 1 ms = 8 microframes */
+    UInt32 prev = ehci_read32(op, EHCI_FRINDEX) & 0x3FFF;
+    UInt32 elapsed = 0; long guard = 0;
+    while (elapsed < want && guard++ < 20000000L) {
+        UInt32 now = ehci_read32(op, EHCI_FRINDEX) & 0x3FFF;
+        elapsed += (now - prev) & 0x3FFF;             /* accumulate deltas (handles wrap) */
+        prev = now;
+    }
+}
+
 /* Stop the controller and issue HCReset. 0 = ok, -1 = timeout. */
 int ehci_hc_reset(ehci_softc *sc)
 {
@@ -183,13 +198,36 @@ int ehci_hc_start(ehci_softc *sc)
         EHCI_CMD_ASE | EHCI_CMD_PSE | EHCI_CMD_RUN);
 
 #if EHCI_ROUTE_PORTS_TO_EHCI
-    /* CONFIGFLAG = 1: route all root ports to the EHCI controller, taking them
-     * away from the companion (USB 1.1) controllers. Then claim each port for EHCI
-     * (clear Owner) and power it on — matching the proven app bring-up. */
+    /* CONFIGFLAG = 1 routes all root ports to EHCI (the hardware forces every
+     * Port Owner to 0). On a machine where the EHCI shares its physical ports
+     * with the companion 1.1 controllers that drive the keyboard/mouse (e.g. the
+     * Mac Mini's on-board controller), blindly claiming ALL ports would seize the
+     * keyboard. So: hand every currently-OCCUPIED port back to the companion
+     * (Owner = 1) and claim only the EMPTY ports for EHCI. The drive is inserted
+     * afterward into an empty (now EHCI-owned) port and comes up at high speed,
+     * while the keyboard/mouse stay on the companion. On a machine with dedicated
+     * EHCI ports (MDD + PCI card) nothing is attached at claim time, so every
+     * port is empty and this claims them all — identical to the old behavior.
+     * Verified on a Mac Mini G4 by the MiniClaim test (kbd on port 0 released,
+     * drive on port 1 links at high speed; kbd/mouse survive once the hosting app
+     * pumps the event loop so the companion can re-enumerate them). */
+    /* This chip has Port Power Control (HCSPARAMS PPC=1): after the HCReset above,
+     * every port is powered OFF, and Current-Connect-Status reads 0 while a port is
+     * unpowered. So POWER the ports FIRST, let the connect debounce, and only THEN
+     * read CONNECT to decide. (Earlier builds read CCS with power still off, so an
+     * attached device — the keyboard — looked empty and got CLAIMED instead of
+     * RELEASED, stranding it on an EHCI port that can't drive it.) */
     ehci_write32(op, EHCI_CONFIGFLAG, EHCI_CONFIGFLAG_CF);
-    for (i = 0; i < sc->nPorts; i++) {
+    for (i = 0; i < sc->nPorts; i++) {                     /* power every port so CCS becomes valid */
+        UInt32 pv = (ehci_read32(op, EHCI_PORTSC(i)) & ~EHCI_PORTSC_RW1C) | EHCI_PORT_POWER;
+        ehci_write32(op, EHCI_PORTSC(i), pv);
+    }
+    ehci_frame_delay(op, 500);                            /* power-good + connect debounce, power applied */
+    for (i = 0; i < sc->nPorts; i++) {                    /* release occupied ports; keep empty ones for EHCI */
         UInt32 pv = ehci_read32(op, EHCI_PORTSC(i)) & ~EHCI_PORTSC_RW1C;
-        pv &= ~EHCI_PORT_OWNER; pv |= EHCI_PORT_POWER;
+        if (pv & EHCI_PORT_CONNECT) pv |= EHCI_PORT_OWNER;   /* occupied -> hand to the companion (kbd/mouse) */
+        else                        pv &= ~EHCI_PORT_OWNER;  /* empty -> EHCI owns it (the drive lands here) */
+        pv |= EHCI_PORT_POWER;                               /* keep power on either way */
         ehci_write32(op, EHCI_PORTSC(i), pv);
     }
 #else

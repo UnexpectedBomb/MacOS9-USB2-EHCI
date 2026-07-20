@@ -123,12 +123,25 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     slog_open();
     printf("========================================================\n");
+#ifdef MINI_LAUNCHER
+    printf("  USB 2.0 for Mac OS 9 -- Mac Mini -- EARLY BETA (manual)\n");
+#else
     printf("  USB 2.0 for Mac OS 9  --  EARLY BETA  (manual launcher)\n");
+#endif
     printf("========================================================\n\n");
+#ifdef MINI_LAUNCHER
+    printf("BEFORE YOU CONTINUE: your USB drive must NOT be plugged in yet.\n");
+    printf("If it is, quit now (Cmd-Q), unplug it, REBOOT, and run this again\n");
+    printf("with the drive unplugged. (A drive attached at boot is claimed by\n");
+    printf("USB 1.1 and will not hand over cleanly.)\n\n");
+    printf("NOTE: your keyboard and mouse may PAUSE for a few seconds while the\n");
+    printf("ports are claimed -- this is normal; they come right back.\n\n");
+#else
     printf("BEFORE YOU CONTINUE: your USB drive must NOT be plugged into\n");
     printf("the card yet. If it is, quit now (Cmd-Q), unplug it, REBOOT,\n");
     printf("and run this again with the drive unplugged. (A drive attached\n");
     printf("at boot is claimed by USB 1.1 and will not hand over cleanly.)\n\n");
+#endif
     printf("Bringing up the USB 2.0 controller (claiming the ports)...\n");
     slog("EHCILauncher (beta) start; bringing up controller");
 
@@ -136,7 +149,11 @@ int main(void)
     if (RegistryEntrySearch(&iter, kRegIterDescendants, &node, &done,
                             "class-code", &wantClass, sizeof(wantClass)) != noErr) {
         RegistryEntryIterateDispose(&iter);
+#ifdef MINI_LAUNCHER
+        printf("ERROR: no on-board USB 2.0 (EHCI) controller found.\n");
+#else
         printf("ERROR: no USB 2.0 (EHCI) card found. Is the PCI card installed and seated?\n");
+#endif
         slog("ERR no EHCI card"); goto hold;
     }
     RegistryEntryIterateDispose(&iter);
@@ -164,7 +181,11 @@ int main(void)
      * high speed. Prompt loudly + audibly, and count down the insert window. */
     SysBeep(30);
     banner(">>>  INSERT USB DRIVE NOW  <<<");
+#ifdef MINI_LAUNCHER
+    printf("Plug your USB drive into a free USB port (e.g. the one next to FireWire).\n");
+#else
     printf("Plug your USB drive into the PCI card.\n");
+#endif
     printf("(You have about %ld seconds; the app quits by itself if no drive is inserted.)\n\n", kInsertTimeoutSec);
 
     /* The wait loop is intentionally SILENT: printing to the console during the insert/enumeration

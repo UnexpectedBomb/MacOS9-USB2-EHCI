@@ -61,3 +61,16 @@ target_link_libraries(EHCILauncher
     NameRegistryLib PCILib DriverServicesLib DriverLoaderLib InterfaceLib
     ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBServicesLibFull.a
     ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBFamilyExpertFull.a)
+
+# ---- Same launcher, built for on-board (Intrepid-era) machines like the Mac Mini G4,
+#      where the EHCI shares its physical ports with the OHCI companions that drive the
+#      keyboard/mouse. Identical flow + the driver's per-port claim (release the ports that
+#      hold input devices back to the 1.1 companion, claim only the empty drive port);
+#      MINI_LAUNCHER selects the on-board wording. ----
+add_application(MiniLauncher probe/ehci_launcher.c CONSOLE)
+target_compile_definitions(MiniLauncher PRIVATE MINI_LAUNCHER)
+target_include_directories(MiniLauncher PRIVATE src)
+target_link_libraries(MiniLauncher
+    NameRegistryLib PCILib DriverServicesLib DriverLoaderLib InterfaceLib
+    ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBServicesLibFull.a
+    ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBFamilyExpertFull.a)
