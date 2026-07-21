@@ -16,9 +16,10 @@ the loader app are all PEF/CFM).
   `ehci_vhub.c` + headers) and the block driver (`usb_disk.c`). `*.exp` are the CFM export
   lists. `usb2_icns_blob.h` is the "2.0" volume icon (an `'icns'` family) the block driver
   hands the Finder for a mounted 2.0 volume — committed source, not a generated blob.
-- `probe/ehci_launcher.c` — the shippable launcher/mounter app (prompt-driven). Built twice:
-  as `EHCILauncher` (PCI-card machines) and, with `-DMINI_LAUNCHER`, as `MiniLauncher` (on-board
-  USB 2.0 machines like the Mac Mini G4). Same program + driver; only the on-screen wording differs.
+- `probe/ehci_launcher.c` — the shippable launcher/mounter app (prompt-driven). Built once as a
+  single **universal** `EHCILauncher` that runs on every machine: the driver's per-port claim and
+  its `sharedCompanion` interrupt discriminator adapt to a PCI card vs. an on-board controller at
+  runtime, and the on-screen wording is neutral — so there is no per-machine build variant.
 - `probe/ehci_trigger.c` — the diagnostic/development harness (verbose logging).
 - `usl_import/` — import-stub libraries for the (never-published) USB Services Library / USB
   Family Expert UIM entry points the app links against.
@@ -45,16 +46,14 @@ python3 scripts/pef-to-blob.py build/EHCIUIM.pef src/ehci_pef_blob.h gEHCIPef
 cmake --build build --target blockdrv
 python3 scripts/pef-to-blob.py build/USBDisk.pef src/usb_disk_blob.h gUsbDiskPef
 
-# 3. build + package the launcher app(s) (MacBinary + disk image)
-#    EHCILauncher = PCI-card machines;  MiniLauncher = on-board USB 2.0 (Mac Mini G4 etc.)
+# 3. build + package the universal launcher app (MacBinary + disk image)
 cmake --build build --target EHCILauncher_APPL
-cmake --build build --target MiniLauncher_APPL
 # (the EHCITrigger / EHCITrigger_APPL targets build the diagnostic harness the same way)
 ```
 
-The results are `build/EHCILauncher.bin` and `build/MiniLauncher.bin` (MacBinary — copy to the OS 9
-machine and decode so the resource fork survives) plus `.APPL`/`.dsk` variants. Prebuilt copies are
-in `dist/` (`USB2-Launcher.bin` for the PCI card, `MiniLauncher.bin` for on-board).
+The result is `build/EHCILauncher.bin` (MacBinary — copy to the OS 9 machine and decode so the
+resource fork survives) plus `.APPL`/`.dsk` variants. A prebuilt copy is in `dist/USB2-Launcher.bin`
+(the one universal launcher, for both PCI-card and on-board machines).
 
 If you edit a driver source, re-run its build + `pef-to-blob` step and then rebuild the app —
 otherwise the app keeps embedding the old driver.
@@ -65,6 +64,6 @@ otherwise the app keeps embedding the old driver.
   fresh clone must run the steps above in order; building the app before the blobs exist will
   fail to compile. (`usb2_icns_blob.h`, the icon, is committed — it is not generated.)
 - Retro68 headers are Latin-1; `grep` them with `LC_ALL=C grep -a`.
-- Only the `ndrv`, `blockdrv`, `EHCILauncher`, `MiniLauncher`, and `EHCITrigger` targets are
-  included here. The dev tree had additional diagnostic probe apps and a resident-INIT vehicle;
+- Only the `ndrv`, `blockdrv`, `EHCILauncher` (the universal launcher), and `EHCITrigger` targets
+  are included here. The dev tree had additional diagnostic probe apps and a resident-INIT vehicle;
   those were left out of this repo.

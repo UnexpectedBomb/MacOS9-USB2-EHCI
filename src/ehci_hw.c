@@ -223,10 +223,15 @@ int ehci_hc_start(ehci_softc *sc)
         ehci_write32(op, EHCI_PORTSC(i), pv);
     }
     ehci_frame_delay(op, 500);                            /* power-good + connect debounce, power applied */
+    sc->sharedCompanion = 0;
     for (i = 0; i < sc->nPorts; i++) {                    /* release occupied ports; keep empty ones for EHCI */
         UInt32 pv = ehci_read32(op, EHCI_PORTSC(i)) & ~EHCI_PORTSC_RW1C;
-        if (pv & EHCI_PORT_CONNECT) pv |= EHCI_PORT_OWNER;   /* occupied -> hand to the companion (kbd/mouse) */
-        else                        pv &= ~EHCI_PORT_OWNER;  /* empty -> EHCI owns it (the drive lands here) */
+        if (pv & EHCI_PORT_CONNECT) {
+            pv |= EHCI_PORT_OWNER;          /* occupied -> hand to the companion (kbd/mouse) ...        */
+            sc->sharedCompanion = 1;        /* ...and a live device shares this controller's IRQ line   */
+        } else {
+            pv &= ~EHCI_PORT_OWNER;         /* empty -> EHCI owns it (the drive lands here)             */
+        }
         pv |= EHCI_PORT_POWER;                               /* keep power on either way */
         ehci_write32(op, EHCI_PORTSC(i), pv);
     }

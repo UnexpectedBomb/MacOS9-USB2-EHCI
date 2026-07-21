@@ -38,7 +38,11 @@
 
 #define kDriverPropertyName "driver,AAPL,MacOS,PowerPC"
 #define kDRVQ ((QHdrPtr)0x0308L)
-#define kInsertTimeoutSec 60L      /* how long to wait for the drive after the prompt */
+#define kInsertTimeoutSec 180L     /* how long to wait for the drive after the prompt. Generous, because on
+                                    * some machines the drive re-enumerates several times (Apple's composite
+                                    * driver intermittently fails its interface setup -6999 -> the device
+                                    * bounces) before CreateBulkEndpoint fires; the mount still lands the
+                                    * moment it stabilizes — this is just the worst-case ceiling. */
 #define kRevealDelaySec   6L       /* how long the "mounted" message stays up before hiding the window */
 
 /* DriverDescription byte-identical to the UIM's exported TheDriverDescription (see ehci_uim.c). */
@@ -123,25 +127,16 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     slog_open();
     printf("========================================================\n");
-#ifdef MINI_LAUNCHER
-    printf("  USB 2.0 for Mac OS 9 -- Mac Mini -- EARLY BETA (manual)\n");
-#else
     printf("  USB 2.0 for Mac OS 9  --  EARLY BETA  (manual launcher)\n");
-#endif
     printf("========================================================\n\n");
-#ifdef MINI_LAUNCHER
     printf("BEFORE YOU CONTINUE: your USB drive must NOT be plugged in yet.\n");
     printf("If it is, quit now (Cmd-Q), unplug it, REBOOT, and run this again\n");
     printf("with the drive unplugged. (A drive attached at boot is claimed by\n");
-    printf("USB 1.1 and will not hand over cleanly.)\n\n");
-    printf("NOTE: your keyboard and mouse may PAUSE for a few seconds while the\n");
-    printf("ports are claimed -- this is normal; they come right back.\n\n");
-#else
-    printf("BEFORE YOU CONTINUE: your USB drive must NOT be plugged into\n");
-    printf("the card yet. If it is, quit now (Cmd-Q), unplug it, REBOOT,\n");
-    printf("and run this again with the drive unplugged. (A drive attached\n");
-    printf("at boot is claimed by USB 1.1 and will not hand over cleanly.)\n\n");
-#endif
+    printf("USB 1.1 and will not hand over cleanly.) Your keyboard and mouse\n");
+    printf("can stay plugged in -- and you need at least ONE free USB port for\n");
+    printf("the drive.\n\n");
+    printf("NOTE: your keyboard and mouse may pause for a second or two while\n");
+    printf("the ports are claimed -- this is normal; they come right back.\n\n");
     printf("Bringing up the USB 2.0 controller (claiming the ports)...\n");
     slog("EHCILauncher (beta) start; bringing up controller");
 
@@ -149,11 +144,8 @@ int main(void)
     if (RegistryEntrySearch(&iter, kRegIterDescendants, &node, &done,
                             "class-code", &wantClass, sizeof(wantClass)) != noErr) {
         RegistryEntryIterateDispose(&iter);
-#ifdef MINI_LAUNCHER
-        printf("ERROR: no on-board USB 2.0 (EHCI) controller found.\n");
-#else
-        printf("ERROR: no USB 2.0 (EHCI) card found. Is the PCI card installed and seated?\n");
-#endif
+        printf("ERROR: no USB 2.0 (EHCI) controller found. Check that your USB 2.0\n");
+        printf("PCI card is seated, or that this Mac has built-in USB 2.0.\n");
         slog("ERR no EHCI card"); goto hold;
     }
     RegistryEntryIterateDispose(&iter);
@@ -175,18 +167,28 @@ int main(void)
 
     (void)loadUIM(&node);          /* claims the ports for EHCI; no drive attached yet, so nothing to disturb */
     printf("USB 2.0 controller is ready.\n");
-    slog("controller ready; prompting for insert");
+    slog("controller ready; settling input devices");
+
+    /* Settle window: claiming the ports briefly disconnects any input devices that share this
+     * controller (on an on-board machine the keyboard/mouse do), forcing them to re-enumerate. If the
+     * drive is inserted while that's still happening, the two enumerations collide on the same
+     * controller and the mount can stall intermittently. So pump the stack for a few seconds FIRST —
+     * long enough for the keyboard/mouse to come back and settle — before asking for the drive. (On a
+     * dedicated-line PCI card there's nothing to re-enumerate, so this is just a harmless short wait.) */
+    printf("Settling input devices (a few seconds)...\n");
+    { unsigned long t0 = TickCount(); while ((TickCount() - t0) < 8UL * 60UL) pump_once(&evt); }
+    slog("settle done; prompting for insert");
 
     /* THE moment that matters: the ports now belong to EHCI, so a freshly inserted drive comes up at
      * high speed. Prompt loudly + audibly, and count down the insert window. */
     SysBeep(30);
     banner(">>>  INSERT USB DRIVE NOW  <<<");
-#ifdef MINI_LAUNCHER
-    printf("Plug your USB drive into a free USB port (e.g. the one next to FireWire).\n");
-#else
-    printf("Plug your USB drive into the PCI card.\n");
-#endif
-    printf("(You have about %ld seconds; the app quits by itself if no drive is inserted.)\n\n", kInsertTimeoutSec);
+    printf("Plug your USB drive into any FREE USB port -- one that is empty right\n");
+    printf("now (NOT the port your keyboard or mouse uses). Any free port works;\n");
+    printf("the driver already left the keyboard/mouse ports on USB 1.1.\n");
+    printf("Then wait. The drive may re-try a few times before it appears -- this can\n");
+    printf("take up to a couple of minutes; it mounts as soon as it's ready. (If nothing\n");
+    printf("shows up, the app quits by itself and you can try again.)\n\n");
 
     /* The wait loop is intentionally SILENT: printing to the console during the insert/enumeration
      * window perturbs the timing-sensitive USB enumeration (a live countdown froze it). We only pump

@@ -43,6 +43,10 @@ typedef struct ehci_softc {
     ehci_dma_pool  pool;         /* DMA memory for QHs/qTDs                         */
     UInt8          nPorts;       /* root ports (from HCSPARAMS)                     */
     UInt8          started;      /* controller running                             */
+    UInt8          sharedCompanion; /* 1 = the claim released an occupied port to a companion (a live
+                                     * kbd/mouse shares this controller's IRQ) -> the ISR must chain to
+                                     * the displaced handler. 0 = dedicated line (PCI card) -> never chain
+                                     * on our own interrupts (that stalls our completion path).          */
 } ehci_softc;
 
 /* Pure EHCI bring-up (no OS calls): operate on an already-mapped sc->capBase and

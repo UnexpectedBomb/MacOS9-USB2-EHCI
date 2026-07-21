@@ -192,15 +192,24 @@ driver's own trace log walked down why:
   second problem surfaced: our interrupt handler had been installed on the interrupt member the
   OHCI companions were already using, **replacing** their handler. When an interrupt wasn't ours we
   returned "not complete" but never called the handler we'd displaced — so the companion's
-  interrupts (keyboard and mouse) were never serviced. **Fix:** chain — always invoke the saved
-  handler, so on a shared line the companion keeps running (and on a dedicated line it simply finds
-  nothing pending).
+  interrupts (keyboard and mouse) were never serviced. **Fix:** chain to the saved handler — but
+  *conditionally*, via a runtime **`sharedCompanion` discriminator** set at port-claim time. On an
+  on-board controller (a claim actually released an occupied port to a companion) the ISR invokes
+  the saved handler so the keyboard/mouse keep running; on a dedicated PCI-card line it never does
+  (chaining on our own completions there stalled the card's completion path). This is what lets the
+  **one** universal driver serve both machine types.
 
-With both in place the Mac Mini G4 mounts a USB 2.0 drive on its **built-in** ports at Hi-Speed
-while the keyboard and mouse keep working — full folder copies in both directions, no freezes.
+With both in place the Mac Mini G4 *has* mounted a USB 2.0 drive on its **built-in** ports at
+Hi-Speed with the keyboard and mouse still working, and copied a full folder in both directions.
+But it is **not yet reliable** (see Roadmap): intermittently, during the first bulk probe of a
+freshly inserted drive, servicing a completion on that shared line wedges the processor and the
+machine locks up before the mount lands. The conditional chaining above is necessary but not
+*sufficient* — taming that shared-line path under load is the open on-board problem. On a
+dedicated PCI-card line (no chaining) this never happens and mounts are reliable.
 
-Lesson: on shared silicon, claim **surgically**. Read a port's state only once it's powered, and
-never orphan a handler you replace.
+Lesson: on shared silicon, claim **surgically**. Read a port's state only once it's powered,
+never orphan a handler you replace — and expect the shared *interrupt* line to be as delicate as
+the shared ports.
 
 ## Also worth knowing
 
@@ -217,10 +226,14 @@ never orphan a handler you replace.
   by pre-queuing whole commands (one interrupt per command) with multi-qTD 128 KB transfer chains
   and per-endpoint hardware toggles (Bug hunt #3). Real Finder copies land lower (~8 read / ~5
   write) — the Finder's own I/O sizing, not the driver, is the ceiling there.
-- **On-board (shared-port) controllers — supported.** Machines like the Mac Mini G4, whose EHCI
-  shares its ports and interrupt line with the OHCI companions that drive the keyboard/mouse, now
-  work via the per-port claim (Bug hunt #4): the drive mounts at Hi-Speed on the built-in ports
-  while the keyboard and mouse coexist on the same controller.
+- **On-board (shared-port) controllers — experimental (intermittent).** Machines like the Mac
+  Mini G4, whose EHCI shares its ports *and interrupt line* with the OHCI companions that drive the
+  keyboard/mouse, are handled by the per-port claim + the `sharedCompanion` interrupt discriminator
+  (Bug hunt #4). It has genuinely worked — the drive mounts at Hi-Speed on the built-in ports and
+  copies files while input stays live — but not dependably: the shared-line interrupt path
+  intermittently locks the machine up mid-mount (kbd/mouse dead). Same drive, next cold boot, often
+  mounts fine. A robust fix for chaining into Apple's OHCI handler under load is **open** — this is
+  the main on-board blocker. Dedicated PCI-card lines are unaffected and reliable.
 - **Large Finder copies: fixed.** Previously wedged on the Finder's interleaved access; the
   cause was a software data toggle on a shared queue head, resolved by per-endpoint hardware
   toggle (Bug hunt #3). A ~800 MB / 1000+ file copy now completes cleanly.

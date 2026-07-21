@@ -1693,22 +1693,20 @@ static OSStatus vhub_heartbeat(void *p1, void *p2)
 static InterruptMemberNumber vhub_isr(InterruptSetMember m, void *refcon, UInt32 cnt)
 {
     UInt32 sts;
-    InterruptMemberNumber chained = kIsrIsNotComplete;
     (void)refcon;
     sts = ehci_read32(gSoftc.opBase, EHCI_USBSTS) & gIntrEnabled;
-    if (sts) {                                                 /* our (EHCI) interrupt */
+    if (sts) {                                                 /* OUR (EHCI) interrupt */
         gIsrHits++;                                            /* r35: this IRQ was ours */
         ehci_write32(gSoftc.opBase, EHCI_USBINTR, 0);          /* mask until the SIH clears it */
         if (!gSihQueued) { gSihQueued = 1; QueueSecondaryInterruptHandler(vhub_sih, NULL, NULL, NULL); }
+        /* Shared line (on-board chip: the claim released occupied ports -> sharedCompanion): also run
+         * the companion handler so the keyboard/mouse are serviced. On a dedicated line (PCI card)
+         * sharedCompanion is 0, so we never touch it (that call stalled the MDD completion path). */
+        if (gSoftc.sharedCompanion && gSavedHandler) (void)gSavedHandler(m, gSavedRefcon, cnt);
+        return kIsrIsComplete;
     }
-    /* Shared PCI IRQ: on the NEC multifunction chip (Mac Mini on-board) the EHCI
-     * shares its interrupt member with the OHCI companions that drive the keyboard
-     * and mouse. InstallInterruptFunctions REPLACED the handler that was on this
-     * member, so we must invoke it every interrupt or the companions' interrupts
-     * are never serviced (keyboard/mouse freeze). On a dedicated line the saved
-     * handler simply finds nothing pending and returns. */
-    if (gSavedHandler) chained = gSavedHandler(m, gSavedRefcon, cnt);
-    return sts ? kIsrIsComplete : chained;
+    if (gSoftc.sharedCompanion && gSavedHandler) return gSavedHandler(m, gSavedRefcon, cnt);
+    return kIsrIsNotComplete;
 }
 void ehci_vhub_start_service(EHCIRegEntryIDPtr node)
 {
@@ -1720,6 +1718,12 @@ void ehci_vhub_start_service(EHCIRegEntryIDPtr node)
     ehci_os_log("vhub_start_service: real-EHCI-IRQ install");
     ehci_os_logx("  driver-ist get", (unsigned long)(long)pe);      /* 0 = found; negative = absent */
     ehci_os_logx("  driver-ist sz",  (unsigned long)sz);
+    /* Install our EHCI interrupt handler for real-IRQ throughput: the self-probe/down-engine needs
+     * PROMPT completions, and heartbeat-only pacing (gA2Live=0) is far too slow (v5: ~5s per transfer,
+     * mount never completed). On a SHARED line (on-board chip, sharedCompanion==1) vhub_isr ALSO runs
+     * the displaced companion handler so the keyboard/mouse stay serviced; the launcher's settle window
+     * keeps their re-enumeration from colliding with the drive's enumeration. On a DEDICATED line (PCI
+     * card, sharedCompanion==0) vhub_isr never touches the companion handler. */
     if (pe == noErr && sz >= sizeof(InterruptSetMember)) {
         OSErr ge, ie = -1;
         gSetID = ist[0].setID; gMember = ist[0].member;
@@ -1738,6 +1742,7 @@ void ehci_vhub_start_service(EHCIRegEntryIDPtr node)
         }
     }
     ehci_os_logx("  gA2Live (1=real IRQ, 0=heartbeat-only)", (unsigned long)gA2Live);
+    ehci_os_logx("  sharedCompanion (1=shared line->ISR also chains companion, 0=dedicated)", (unsigned long)gSoftc.sharedCompanion);
     { AbsoluteTime when = AddDurationToAbsolute((Duration)VHUB_HB_MS, UpTime());
       SetInterruptTimer(&when, vhub_heartbeat, 0, &gHbTimer); }
 }
