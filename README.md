@@ -19,7 +19,7 @@ A single **universal launcher** serves two kinds of machine, at two different ma
 - **Ejects** cleanly (Finder menu or drag-to-Trash), like any removable disk.
 - **No Extension to install** — the driver rides *inside* the launcher app. Nothing is copied into your Extensions folder, and nothing loads at boot until you run it.
 - **Tells you it's really 2.0** — a volume mounted through this driver appears on the desktop with a distinct **"2.0" drive icon**, so a Hi-Speed mount is obvious at a glance versus a plain USB 1.1 one.
-- Reliable transfers: byte-verified, with a transfer watchdog and a CSW residue/signature check on every command.
+- Reliable transfers: byte-verified, with a transfer watchdog and a CSW residue/signature check on every command — and **correct block addressing across the entire volume**, so large files and volumes well past 2 GB / 4 GB read and write without corruption.
 
 ## Supported machines
 
@@ -40,7 +40,7 @@ back and claims only a free one on an on-board controller). You do not pick a bu
 
 ### Both
 
-- A USB 2.0 mass-storage device, **FAT-formatted**. (Tested with a SanDisk Ultra USB flash drive and a generic USB 2.0 stick.)
+- A USB 2.0 mass-storage device formatted **HFS — Mac OS Standard or Mac OS Extended** (either an Apple Partition Map with an `Apple_HFS` partition, or a single partitionless HFS volume). *Not FAT.* (Tested with a SanDisk Ultra USB flash drive, Mac OS Extended, on volumes up to 62 GB.)
 
 *Only a couple of hardware combinations have been tested so far. If it works — or doesn't — on your machine / card / drive, please open an issue; that data directly helps.*
 
@@ -137,4 +137,6 @@ The shippable app is a single **universal launcher**:
 
 ## Status & disclaimer
 
-Early beta, provided as-is, with no warranty. It has run for extended sessions without data loss on the tested setups (including full folder copies both directions on a Mac Mini G4), but it is new low-level code touching your disks — **keep backups, and don't trust it with your only copy of anything.** Bug reports and hardware-compatibility reports are very welcome.
+Early beta, provided as-is, with no warranty. On a PCI card it now runs reliably — full-speed reads and writes, large folder copies, and volumes well past 4 GB, with correct addressing across the whole disk — but it is new low-level code touching your disks, so **keep backups.**
+
+*Fixed in this build:* a data-corruption bug where writes past the 2 GB / 4 GB volume-offset boundary went to the wrong blocks — silently damaging large files, and sometimes the volume's own structures (boot blocks / catalog). If you ran an earlier release against a volume larger than 2 GB, re-verify or reformat that volume. Bug reports and hardware-compatibility reports are very welcome.

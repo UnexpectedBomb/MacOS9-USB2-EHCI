@@ -211,6 +211,40 @@ Lesson: on shared silicon, claim **surgically**. Read a port's state only once i
 never orphan a handler you replace — and expect the shared *interrupt* line to be as delicate as
 the shared ports.
 
+## Bug hunt #5 — silent corruption on large writes (the LBA overflow)
+
+The nastiest bug, and the last to fall. On a large volume, copying enough data would eventually
+corrupt a file — or, when the wrong write landed, the whole volume. It was intermittent and
+data-dependent (which is why it looked for a long time like a File Manager timing race), but the
+cause was entirely ours: the block driver turns the File Manager's **byte** position into a
+512-byte **block** (LBA), and that conversion was wrong at two size boundaries.
+
+**At 2 GB — a signed divide.** `ioPosOffset` is a *signed* 32-bit `long`. The first write whose
+volume offset reaches 2 GB has the sign bit set (`0x80000000`), so `(UInt32)(ioPosOffset / 512)`
+did a **signed** divide → a negative quotient → a garbage LBA (`0x80000000 / 512` → `0xffc00000`).
+The device rejected the out-of-range write and the copy failed with a disk error. Fix: cast to
+`UInt32` *before* dividing, so the divide is unsigned. (The logging path already did it that way —
+the two disagreeing was exactly why the traces looked sane while the wire got garbage.)
+
+**At 4 GB — a 32-bit offset that can't reach.** A byte offset past 4 GB doesn't fit in the 32-bit
+`ioPosOffset` at all; it *wraps*, so a write meant for 5 GB lands near block 0 — on top of the boot
+blocks, the catalog, or another file. This one is **silent**: the wrong-block write "succeeds" on
+the device, so nothing errors until you open the mangled file (or the volume won't mount). OS 9 has
+a wide-positioning driver ABI for exactly this — a driver answers the `kdgWide` DriverGestalt query
+"true", and the File Manager then passes the real **64-bit** offset in `XIOParam.ioWPosOffset`
+(flagged by `kUseWidePositioning` in `ioPosMode`). We weren't opting in. Fix: advertise `kdgWide`
+and read the 64-bit offset when the flag is set. The block *number* always fit in 32 bits (a 62 GB
+volume is ~121 M blocks) — only the byte offset overflowed.
+
+How it was cornered: a probe that recorded the *original* submitted LBA at the moment of failure.
+When it equalled the garbage LBA, with zero transfer retries, it proved the bad address was born at
+submit — in our code — not corrupted downstream and not handed to us by the File Manager. That
+killed the FM-race theory and pointed straight at the conversion.
+
+Lesson: a byte offset is unsigned and can exceed 32 bits. Convert it to a block number with an
+**unsigned** divide, and support the wide-positioning ABI (`kdgWide` + `ioWPosOffset`) before
+trusting a driver on any volume larger than 2 GB.
+
 ## Also worth knowing
 
 - **Reset timing:** after a port reset the UIM waits for the port to actually report *Enabled*
@@ -237,6 +271,13 @@ the shared ports.
 - **Large Finder copies: fixed.** Previously wedged on the Finder's interleaved access; the
   cause was a software data toggle on a shared queue head, resolved by per-endpoint hardware
   toggle (Bug hunt #3). A ~800 MB / 1000+ file copy now completes cleanly.
+- **Large writes / volumes past 2 GB & 4 GB: fixed.** The byte-offset→LBA conversion used a
+  signed divide (garbage LBA at the 2 GB boundary) and ignored the wide-positioning ABI (a 32-bit
+  offset wraps past 4 GB → wrong-block writes). Now an unsigned divide plus `kdgWide` + the 64-bit
+  `ioWPosOffset` give correct addressing across the whole volume (Bug hunt #5). Earlier builds
+  silently corrupted data past those boundaries; verified fixed on the MDD with repeated >4 GB
+  copies that launch. The completion-pacing workaround that used to mask this is retired — writes
+  run at full speed.
 - **BOT error recovery is minimal.** With the wedge gone, a *correct* one-shot Bulk-Only Reset
   (for genuine device errors, not the false-timeout churn that was removed) is a small planned
   hardening.

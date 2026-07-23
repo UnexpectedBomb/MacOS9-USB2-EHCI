@@ -370,6 +370,9 @@ static OSStatus uim23(UInt32 a,UInt32 b,UInt32 c,UInt32 d,UInt32 e,UInt32 f,UInt
             ehci_os_logx("  CSW residue", resid);
             ehci_os_logx("  writes OK before", wrok);  ehci_os_logx("  reads OK before", rdok);
             ehci_os_logx("  submit rejections", rej);
+            { extern UInt32 ehci_vhub_failsubmit(UInt32 *); UInt32 rtr = 0, sub = ehci_vhub_failsubmit(&rtr);
+              ehci_os_logx("  v40 submitLba (untouched orig)", sub);   /* == 'lba' above => FM handed us garbage; differs => corrupted after submit */
+              ehci_os_logx("  v40 gBioRetry (timeouts b4 fail)", rtr); }
         }
     }
     ehci_vhub_selfprobe_tick();   /* r21: once the mounter parks, drive INQUIRY/READ CAPACITY/READ ourselves */

@@ -155,6 +155,19 @@ typedef struct { short kind; short csCode; short ioVRefNum; short pad; long p0, 
  * reaches us (write climbing) vs failing upstream in PC Exchange. Header is now 5 longs (20B). */
 typedef struct { UInt32 magic; UInt32 count; UInt32 cap; UInt32 nReads; UInt32 nWrites; CsRec recs[kCsCap]; } CsLog;
 static CsLog gCsLog;
+/* v25: control-plane trace — EVERY DoDriverIO code + our return err (aux=csCode for ctl/status), published
+ * via Gestalt('Ucs2') so the UIM can dump it. Reveals kKillIO/Open/Close + any declined Status/Control near
+ * the Finder's abort — the last driver-side signal, since the abort reason isn't a data Prime we receive. */
+#define kDioCap 128
+typedef struct { short code; short err; long aux; } DioRec;   /* 8B */
+typedef struct { UInt32 magic; UInt32 count; DioRec recs[kDioCap]; } DioLog;
+static DioLog gDioLog;
+static void diolog(short code, short err, long aux)
+{
+    DioRec *r = &gDioLog.recs[gDioLog.count & (kDioCap - 1)];
+    r->code = code; r->err = err; r->aux = aux;
+    gDioLog.count++;
+}
 static void cslog(short kind, ParmBlkPtr pb)          /* kind: 1 = Status, 2 = Control */
 {
     CsRec *r = &gCsLog.recs[gCsLog.count & (kCsCap - 1)];
@@ -171,6 +184,19 @@ static void cslog(short kind, ParmBlkPtr pb)          /* kind: 1 = Status, 2 = C
  * partition-relative start block, and the block count. This reveals whether the Finder copy that
  * freezes is issuing ASYNC writes (our driver blocks synchronously — illegal at async/interrupt
  * time -> hard freeze) and whether reads are interleaved with writes (re-entrancy into our engine). */
+/* v42: partition-relative start BLOCK from the File Mgr's position, WIDE-AWARE. For volumes >4GB the FM sets
+ * kUseWidePositioning in ioPosMode and puts the true 64-bit byte offset in XIOParam.ioWPosOffset (it only does
+ * this because v42's disk_status now answers kdgWide=true). Narrow requests keep the 32-bit ioPosOffset with
+ * the cast-UInt32-FIRST unsigned divide (the v41 2GB fix). block = byteOffset/512, computed as (hi<<23)|(lo>>9)
+ * so it needs NO 64-bit-divide intrinsic and is exact for volumes <2TB (block fits UInt32). */
+static UInt32 pb_block(ParmBlkPtr pb)
+{
+    if (pb->ioParam.ioPosMode & kUseWidePositioning) {
+        XIOParam *x = (XIOParam *)pb;
+        return ((UInt32)x->ioWPosOffset.lo >> 9) | ((UInt32)x->ioWPosOffset.hi << 23);
+    }
+    return ((UInt32)pb->ioParam.ioPosOffset) / 512UL;
+}
 static void iolog(short kind, unsigned long iokind, ParmBlkPtr pb)  /* kind: 3=read, 4=write */
 {
     CsRec *r = &gCsLog.recs[gCsLog.count & (kCsCap - 1)];
@@ -178,7 +204,7 @@ static void iolog(short kind, unsigned long iokind, ParmBlkPtr pb)  /* kind: 3=r
     r->csCode    = (short)((UInt32)pb->ioParam.ioReqCount / 512UL);   /* block count */
     r->ioVRefNum = pb->ioParam.ioVRefNum;
     r->pad       = 0;
-    r->p0 = (long)((UInt32)pb->ioParam.ioPosOffset / 512UL);          /* partition-relative start block */
+    r->p0 = (long)pb_block(pb);                                       /* v42: partition-relative start block (wide-aware) */
     r->p1 = (long)iokind;                                             /* IOCommandKind bits */
     gCsLog.count++;
     if (kind == 3) gCsLog.nReads++; else gCsLog.nWrites++;
@@ -214,7 +240,10 @@ static OSErr scan_and_add(short refNum)
     gCsLog.nReads = 0;
     gCsLog.nWrites = 0;
     (void)NewGestaltValue('Ucsl', (long)&gCsLog);
-    dput("=== USB disk driver r40: scanning for a mountable HFS volume (APM or partitionless) via 'Eusb' ===");
+    gDioLog.magic = 0x44696f4cUL;   /* 'DioL' — v25 control-plane trace */
+    gDioLog.count = 0;
+    (void)NewGestaltValue('Ucs2', (long)&gDioLog);
+    dput("=== USB disk driver v44 (lean production; v41 2GB + v42 >4GB wide fixes; pacing retired): scanning for a mountable HFS volume (APM or partitionless) via 'Eusb' ===");
     if (!fetch_svc())         { dput("  service 'Eusb' NOT present"); return ioErr; }
     if (!svc_read(0, 1, blk)) { dput("  block0 read FAILED"); return ioErr; }
     dputx("  blk0[0..3]", ((UInt32)blk[0]<<24)|((UInt32)blk[1]<<16)|((UInt32)blk[2]<<8)|blk[3]);   /* r40: see the layout */
@@ -298,7 +327,11 @@ static long disk_submit(IOCommandID cmdID, ParmBlkPtr pb, int isWrite)
 {
     UInt32 lba, nblk;
     if (!fetch_svc() || !gSvc->submitFn) return -1;
-    lba  = gPartStart + (UInt32)(pb->ioParam.ioPosOffset / 512);
+    /* v41 fixed the 32-bit signed->unsigned divide (the 2GB wrap → 0xffc00000 garbage LBA the v40 probe caught).
+     * v42 removes the 4GB ceiling: pb_block() reads the 64-bit XIOParam.ioWPosOffset when the FM sets
+     * kUseWidePositioning (which it now does because disk_status answers kdgWide=true). Correct across the
+     * whole volume for USB sticks up to 2TB. */
+    lba  = gPartStart + pb_block(pb);
     nblk = (UInt32)(pb->ioParam.ioReqCount / 512);
     pb->ioParam.ioActCount = 0;                    /* UIM sets the real count on completion */
     return gSvc->submitFn(cmdID, lba, nblk, pb->ioParam.ioBuffer, isWrite, &pb->ioParam.ioActCount);
@@ -332,6 +365,10 @@ static OSErr disk_status(ParmBlkPtr pb)
         DriverGestaltParam *dg = (DriverGestaltParam *)pb;
         if (dg->driverGestaltSelector == kdgDeviceType) { dg->driverGestaltResponse = kdgDiskType; return noErr; }
         if (dg->driverGestaltSelector == kdgInterface)  { dg->driverGestaltResponse = kdgUSBIntf;  return noErr; }
+        /* v42: advertise WIDE positioning so the File Mgr addresses >4GB via the 64-bit XIOParam.ioWPosOffset
+         * (a boolean response, fully filled — safe, no half-filled-pointer trap). Without this the FM uses the
+         * 32-bit ioPosOffset, which wraps past 4GB -> writes to wrong blocks -> the silent corruption (-199). */
+        if (dg->driverGestaltSelector == kdgWide)       { dg->driverGestaltResponse = 1;           return noErr; }
         /* r98: our custom USB 2.0 volume icon. Return a pointer to the embedded 'icns' IconFamily for the
          * media icon (kdgMediaIconSuite, formerly csCode 22) AND the physical-drive icon (kdgPhysDriveIconSuite,
          * formerly csCode 21). This response IS fully filled (a valid pointer), so it does NOT hit the r37
@@ -386,8 +423,15 @@ OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
              * (that was the Finder freeze). Async reads from the Finder now just queue. */
             long sr;
             iolog((short)(code == kReadCommand ? 3 : 4), (unsigned long)kind, contents.pb);
+            /* v36: the v35 DebugStr breaks are REMOVED. On a USB-keyboard-only Mac (MDD) MacsBug cannot take
+             * keyboard input when it is entered from our driver's (sub-task-level) calling context, so the break
+             * wedged the machine. The FM-race signal is now captured to EHCIUIM_init.log with NO halt: every
+             * write's partition-relative LBA is in the 'Ucsl' ring (iolog above); the re-entrancy count is
+             * gSubmitReentry; and the UIM flags SUSPICIOUS writes (issued from inside our completion, or an
+             * off-device LBA) in the v36 tick dump. Run: boot unplugged -> launch -> insert -> copy the UT
+             * folder -> quit -> send EHCIUIM_init.log. */
             sr = disk_submit(cmdID, contents.pb, (code == kWriteCommand));
-            if (sr == 0) return kIOBusyStatus;     /* accepted -> UIM completes cmdID async; do NOT complete here */
+            if (sr == 0) { diolog((short)code, (short)1 /*kIOBusyStatus*/, 0); return kIOBusyStatus; }  /* v25: trace accepted-async */
             err = (sr == 1) ? noErr : ioErr;       /* 1 = zero-length (noErr); -1 = no service/queue full (ioErr) */
             break;
         }
@@ -399,6 +443,7 @@ OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
         case kKillIOCommand:     err = noErr; break;
         default:                 err = paramErr; break;
     }
+    diolog((short)code, (short)err, (code == kControlCommand || code == kStatusCommand) ? (long)contents.pb->cntrlParam.csCode : 0);  /* v25 control-plane trace */
     if (kind & kImmediateIOCommandKind) return err;                /* immediate: return completes it */
     return (OSErr)IOCommandIsComplete(cmdID, (short)err);          /* sync/async: signal the File Mgr */
 }

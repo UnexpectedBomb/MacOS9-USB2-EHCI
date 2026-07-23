@@ -29,8 +29,15 @@ void ehci_os_log(const char *s)
     FSSpec sp; long n = 0, z = 1; static int tried = 0;
     if (!tried) { tried = 1;
         (void)FSMakeFSSpec(0, 0, "\pEHCIUIM_init.log", &sp);
-        (void)FSpDelete(&sp);
-        if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) { (void)FSpOpenDF(&sp, fsRdWrPerm, &gDbgRef); gDbgVol = sp.vRefNum; }
+        /* v37: APPEND across driver loads (do NOT FSpDelete). A later mount-only run must not wipe an
+         * earlier copy session's data (that footgun cost the v36 run-1 log). Each run is delimited by the
+         * "=== v37 RUN ===" banner, and the per-run in-memory counters (gWrTotal/gSuspN/gSubmitReentry/...)
+         * reset on load, so each run's section stands alone. Open the existing file (or create it), then
+         * seek to EOF so new lines append. */
+        if (FSpOpenDF(&sp, fsRdWrPerm, &gDbgRef) != noErr) {
+            if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) (void)FSpOpenDF(&sp, fsRdWrPerm, &gDbgRef);
+        }
+        if (gDbgRef) { gDbgVol = sp.vRefNum; (void)SetFPos(gDbgRef, fsFromLEOF, 0); }
     }
     if (gDbgRef) { ParamBlockRec pbf; while (s[n]) n++; (void)FSWrite(gDbgRef, &n, (Ptr)s);
         (void)FSWrite(gDbgRef, &z, (Ptr)"\r");

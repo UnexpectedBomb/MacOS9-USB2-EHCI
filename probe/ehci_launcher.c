@@ -224,7 +224,7 @@ int main(void)
     SysBeep(30);
     if (!mounted) {
         banner("A drive was detected, but it did not mount.");
-        printf("Make sure it is FAT-formatted. Then quit, reboot unplugged, and try again.\n");
+        printf("Make sure it is Mac OS Standard/Extended (HFS) formatted. Then quit, reboot unplugged, and try again.\n");
         slog("mount FAILED"); goto hold;
     }
 
@@ -244,9 +244,12 @@ int main(void)
         slog("window hidden; hosting USB stack in background");
     }
 
-    /* resident + silent: keep the USB stack serviced so the drive stays alive and eject works */
+    /* v44: resident + silent — keep the USB stack serviced so the drive stays alive and eject works.
+     * Cmd-Q quits cleanly; the driver is hosted here, so quit only after ejecting the drive. */
     for (;;) {
         (void)WaitNextEvent(everyEvent, &evt, 6L, NULL);
+        if (evt.what == keyDown && (evt.modifiers & cmdKey) &&
+            (char)(evt.message & charCodeMask) == 'q') { printf("\nQuitting.\n"); ExitToShell(); }
         ExpertIdleTask();
         USLPolledProcessDoneQueue();
     }

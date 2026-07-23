@@ -13,7 +13,14 @@
 #include <DriverServices.h>
 #include <NameRegistry.h>
 #include <Gestalt.h>
+#include <DriverSynchronization.h>   /* IncrementAtomic — re-entrancy-safe ring slot claim */
 #include "ehci_vhub.h"
+
+/* v44: production verbosity flag. 0 = LEAN — the per-tick diagnostic logging is compiled out, so there is NO
+ * per-tick file I/O (that per-tick FSWrite+FlushVol was the Mini's shared-IRQ enumeration timing aggravator).
+ * Flip to 1 for a diagnostic build that restores the full v18–v42 per-tick trace (r88/r89 dumps, SELFPROBE-wait
+ * spam, STALL/DoDriverIO traces). One-shot mount-progress logs + the failure dump stay on regardless. */
+#define EHCI_VERBOSE 0
 
 static ehci_vhub_logfn gLog = 0;
 void ehci_vhub_set_log(ehci_vhub_logfn fn) { gLog = fn; }
@@ -236,6 +243,12 @@ static volatile UInt32 gDataBytes = 0, gDataFrames = 0, gDataFr0 = 0; static vol
 #define NBULK 6
 static struct { UInt32 addr, endpt; UInt8 dirIn, toggle; UInt16 maxpkt; UInt8 used; } gBulkEP[NBULK];
 static volatile int gDpBulkEp = -1; static volatile UInt32 gDpNpkt = 1;
+/* MINI FIX: Apple's BULK completion UPP deadlocks at interrupt level on the Mini's shared-interrupt
+ * controller -> defer it to TASK level (compl_drain from selfprobe_tick). Dedicated line (MDD) = inline. */
+typedef struct { void *upp, *pipe; long status; UInt32 actual; } ComplDef;
+#define NCOMPL 16u
+static volatile ComplDef gComplQ[NCOMPL];
+static volatile UInt32 gComplHead = 0, gComplTail = 0, gComplDrop = 0;
 /* r10 diagnostic: last bulk completion snapshot (interrupt-safe stores in down_reap; task-ctx reads
  * via ehci_vhub_bulk_stats from uim7, since down_reap runs at interrupt level where File Mgr is unsafe). */
 static volatile long gBulkLastStat = 0; static volatile UInt32 gBulkDoneN = 0, gBulkErrN = 0;
@@ -456,8 +469,19 @@ static void down_submit(void *pipe, void *upp, volatile UInt8 *buf, UInt32 addr,
  * driver needs, tested now in the app scaffold. Transfers go via pb_* (complUPP==0) so the r32 Apple
  * fence never touches them. */
 #define BIOQ_N 16
-typedef struct { IOCommandID cmdID; UInt32 lba, count, reqBytes; UInt8 *buf; long *actCount; UInt8 isWrite; } BioReq;
+typedef struct { IOCommandID cmdID; UInt32 lba, count, reqBytes; UInt8 *buf; long *actCount; UInt8 isWrite;
+                 UInt32 submitLba;                 /* v40: the ORIGINAL LBA at submit (r->lba advances per chunk) — lets the
+                                                    * failure dump tell FM-gave-garbage (submitLba bad) from corrupted-after-submit. */
+                 volatile UInt8 ready; } BioReq;   /* r+: 1 once fully filled; consumer must not touch a slot until set */
 static BioReq gBioQ[BIOQ_N];
+static volatile int    gInSubmit = 0;                       /* r+: re-entrancy detector for the enqueue race */
+static volatile UInt32 gSubmitReentry = 0, gSubmitMaxDepth = 0;
+/* v36: suspicious WRITE capture — never-wraps, so the FM-race smoking gun survives the whole folder copy
+ * regardless of the 512-entry 'Ucsl' ring. fl bit0 = the write was submitted from inside our completion
+ * (the FM re-issued it nested = the re-entrancy the source model predicts); bit1 = its LBA is off the
+ * device (a clobbered File-Manager Params offset reached us). */
+static volatile UInt32 gWrTotal = 0, gSuspN = 0;
+static volatile UInt32 gSuspLba[16], gSuspCnt[16], gSuspFlags[16];
 static volatile UInt32 gBioHead = 0, gBioTail = 0; /* ring: [tail]=in-flight, head=enqueue. r48: volatile — the ring is now the ONE cross-context hand-off: producer = ehci_usb_submit (TASK level), consumer = bio_advance (INTERRUPT level). Must not be register-cached across that boundary. */
 static int    gBioPhase = 0;                   /* 0 idle; 1 CBW issued; 2 data issued; 3 CSW issued */
 #define BIO_PH_PREREAD 5                        /* r70: a whole read command is pre-queued, terminal = CSW (defined here so down_reap can time it) */
@@ -552,9 +576,18 @@ static void down_reap(void)
         gDpLastStat = status;                                  /* r36 diag: last downstream reap status */
         gDpBusy = 0;
         if (gDpUPP) {
-            if (gDpBulkEp >= 0)   /* bulk: completion(cmdBlock, status, actualCount) — 3 args (RE-confirmed) */
+            if (gDpBulkEp >= 0) {   /* v20: defer bulk completion to task level on BOTH machines (was Mini-only via sharedCompanion). The MDD dedicated-line INLINE call intermittently DEADLOCKS Apple's bulk UPP at interrupt level = the pre-mount freeze v18/v19 hit. compl_drain (task level) delivers it. Control completions (gDpBulkEp<0) still go inline below. */
+                UInt32 hh = gComplHead;
+                if ((hh - gComplTail) < NCOMPL) {
+                    gComplQ[hh & (NCOMPL - 1u)].upp = (void *)gDpUPP;
+                    gComplQ[hh & (NCOMPL - 1u)].pipe = (void *)gDpPipe;
+                    gComplQ[hh & (NCOMPL - 1u)].status = status;
+                    gComplQ[hh & (NCOMPL - 1u)].actual = actual;
+                    gComplHead = hh + 1u;
+                } else gComplDrop++;
+            } else if (gDpBulkEp >= 0)
                 ((ehci_usl_intcomplete)gDpUPP)((void *)gDpPipe, status, (unsigned long)actual);
-            else                  /* control: completion(pipeRef, status) — 2 args */
+            else
                 ((ehci_usl_complete)gDpUPP)((void *)gDpPipe, (unsigned long)status);
         }
         if (gBioPhase && !gDpUPP) bio_advance(status);   /* r34/r57: advance the async block-I/O state machine (pass the xfer status for recovery) */
@@ -788,12 +821,14 @@ static long ehci_usb_write(UInt32 lba, UInt32 count, void *buf)
  * failing write finally names itself and we can tell a real device reject (sig='USBS',stat=1) from a
  * malformed CSW read. Reads gPB (the shared BOT scratch) which holds the just-read CSW at phase-3 time. */
 static volatile UInt32 gFailSeq = 0, gFailLba = 0, gFailCswSig = 0, gFailCswResid = 0;
+static volatile UInt32 gFailSubmitLba = 0, gFailRetry = 0;   /* v40: garbage-LBA origin discriminator (orig LBA + timeout-retries before the fail) */
 static volatile UInt16 gFailChunk = 0; static volatile UInt8 gFailIsWrite = 0, gFailCswStat = 0;
 static volatile UInt32 gBioWrOk = 0, gBioRdOk = 0, gBioReject = 0;
 static volatile UInt32 gBioHiWater = 0;   /* r49: peak ring occupancy seen at submit — decides ring-full(a) vs slow-engine-timeout(b) for the Finder large-copy "disk error" */
-static void biofail(UInt8 isWrite, UInt32 lba, UInt16 chunk)
+static void biofail(UInt8 isWrite, UInt32 lba, UInt32 submitLba, UInt32 retry, UInt16 chunk)
 {
     gFailIsWrite = isWrite; gFailLba = lba; gFailChunk = chunk;
+    gFailSubmitLba = submitLba; gFailRetry = retry;   /* v40 */
     gFailCswStat  = gPB[12];
     gFailCswSig   = ((UInt32)gPB[0]<<24)|((UInt32)gPB[1]<<16)|((UInt32)gPB[2]<<8)|gPB[3];
     gFailCswResid = (UInt32)gPB[8]|((UInt32)gPB[9]<<8)|((UInt32)gPB[10]<<16)|((UInt32)gPB[11]<<24);
@@ -808,6 +843,10 @@ UInt32 ehci_vhub_biofail(UInt8 *isWrite, UInt32 *lba, UInt16 *chunk, UInt8 *cswS
     if (wrOk) *wrOk = gBioWrOk; if (rdOk) *rdOk = gBioRdOk; if (reject) *reject = gBioReject;
     return gFailSeq;
 }
+/* v40: separate accessor so the failure dump can also show the UNTOUCHED submit LBA + the timeout-retry count —
+ * reveals whether the garbage LBA came from the FM (submitLba == the failing lba) or was corrupted after submit
+ * (submitLba valid, failing lba garbage), and whether a BOT timeout/recovery preceded the fail. */
+UInt32 ehci_vhub_failsubmit(UInt32 *retry) { if (retry) *retry = gFailRetry; return gFailSubmitLba; }
 /* r49: block-I/O engine health for the app's idle-loop THREAD-B diagnostic (exposed via 'Eusb' healthFn).
  * reject>0                 => the 16-deep async ring overflowed (Finder out-ran us) = mechanism (a); cheap
  *                             fix = deeper ring + soft back-pressure instead of hard ioErr.
@@ -1032,6 +1071,51 @@ static void bio_issue_write(const void *src, UInt32 nbytes)
 
 /* ---- r34 async block-I/O state machine (see the block comment at gBioQ). Uses the same pb_* BOT
  * primitives as the self-probe but advances on completions instead of spinning in pb_wait. ---- */
+/* v23: read-after-write verify. gDownBuf holds the just-transferred chunk's data at completion; we
+ * fingerprint its first 512B (= block r->lba). On a WRITE we cache lba->fp; on a READ of a cached lba we
+ * compare — a mismatch means HFS's read-back of a block it just wrote got data != what we wrote, the
+ * suspected trigger for HFS aborting the copy above us. Diagnostic only (side cache; changes no behavior). */
+#define RAW_N 32
+static UInt32 gRawLba[RAW_N]; static UInt32 gRawFp[RAW_N]; static UInt32 gRawHead = 0;
+static volatile UInt32 gRawChecks = 0, gRawMismatch = 0, gRawMLba = 0, gRawMExp = 0, gRawMAct = 0;
+static volatile int gRawMPending = 0;
+/* v24: write-then-read staleness (DIFFERENT block). Track the LAST write; if a later read's data equals it
+ * (but a different block), the read returned stale gDownBuf = the just-written block's bytes. */
+static volatile UInt32 gLastWrLba = 0, gLastWrFp = 0, gLastWrW0 = 0;
+static volatile UInt32 gStaleN = 0, gStaleRLba = 0, gStaleWLba = 0, gStaleRW0 = 0, gStaleWW0 = 0;
+static volatile int gStalePending = 0;
+static UInt32 raw_fp(void)
+{
+    UInt32 h = 0, i; volatile UInt32 *w;
+    if (!gDownBuf) return 0;
+    w = (volatile UInt32 *)gDownBuf;
+    for (i = 0; i < 128; i++) { h = (h << 1) | (h >> 31); h ^= w[i]; }   /* rotate-XOR over first 512B */
+    return h ? h : 1;                                                     /* never 0 (0 = empty slot) */
+}
+static void raw_note_write(UInt32 lba)
+{
+    UInt32 i, fp = raw_fp();
+    gLastWrLba = lba; gLastWrFp = fp; gLastWrW0 = gDownBuf ? *(volatile UInt32 *)gDownBuf : 0;    /* v24: remember last write */
+    for (i = 0; i < RAW_N; i++) if (gRawLba[i] == lba && gRawFp[i]) { gRawFp[i] = fp; return; }  /* update existing */
+    gRawLba[gRawHead % RAW_N] = lba; gRawFp[gRawHead % RAW_N] = fp; gRawHead++;                   /* else add */
+}
+static void raw_check_read(UInt32 lba)
+{
+    UInt32 i, fp = raw_fp();
+    /* v24: did this read return the LAST write's data but for a DIFFERENT block? = stale gDownBuf (the read
+     * got the just-written block's bytes instead of the block it asked for). The suspected abort trigger:
+     * HFS reads block 0 right after writing 0x245a and gets 0x245a's data. */
+    if (gLastWrFp > 1 && fp == gLastWrFp && lba != gLastWrLba) {
+        gStaleN++;
+        if (!gStalePending) { gStaleRLba = lba; gStaleWLba = gLastWrLba;
+            gStaleRW0 = gDownBuf ? *(volatile UInt32 *)gDownBuf : 0; gStaleWW0 = gLastWrW0; gStalePending = 1; }
+    }
+    for (i = 0; i < RAW_N; i++) if (gRawLba[i] == lba && gRawFp[i]) {   /* v23: same-block read-after-write */
+        gRawChecks++;
+        if (fp != gRawFp[i]) { gRawMismatch++; if (!gRawMPending) { gRawMLba = lba; gRawMExp = gRawFp[i]; gRawMAct = fp; gRawMPending = 1; } }
+        return;
+    }
+}
 static void bio_start_chunk(void)                 /* issue the CBW for the current request's next chunk */
 {
     BioReq *r = &gBioQ[gBioTail % BIOQ_N];
@@ -1055,6 +1139,7 @@ static void bio_start_chunk(void)                 /* issue the CBW for the curre
 static void bio_kick(void)                        /* if idle and the queue is non-empty, start the next request */
 {
     if (gBioPhase != 0 || gBioHead == gBioTail) return;
+    if (!gBioQ[gBioTail % BIOQ_N].ready) return;   /* r+: slot atomically claimed but not yet filled — wait */
     gBioResult = 0; gBioRetry = 0;                 /* r57: fresh request -> full retry budget */
     bio_start_chunk();
 }
@@ -1066,13 +1151,27 @@ static void recov_setup(UInt8 bmRT, UInt8 bReq, UInt16 wValue, UInt16 wIndex)
     gRecovSetup[4] = (UInt8)wIndex; gRecovSetup[5] = (UInt8)(wIndex >> 8);
     gRecovSetup[6] = 0; gRecovSetup[7] = 0;
 }
+/* v43: the v28 min-gap pacing (gGapUS / throttle_complete / throttle_drain / the DLYQ) is RETIRED. It only
+ * ever MASKED the 2GB signed-divide LBA bug (fixed in v41) by throttling the completion rate; with v41+v42 the
+ * driver is clean at FULL SPEED, so the throttle machinery is gone and completions go straight out (bio_finish). */
+/* v36: nonzero while we are inside IOCommandIsComplete. The File Manager can re-issue the next I/O
+ * synchronously from within a completion (see bio_finish's "completion may enqueue more" note); ehci_usb_submit
+ * samples this to flag a WRITE born from a completion — the FM-race re-entrancy the source model predicts. */
+static volatile UInt32 gInCompletion = 0;
+static void complete_now(IOCommandID cmd, long res)
+{
+    gInCompletion++;
+    (void)IOCommandIsComplete(cmd, (OSErr)res);
+    gInCompletion--;
+}
 /* r57: complete the current block request back to the File Manager (res 0=ok, else the failure code). */
 static void bio_finish(BioReq *r, long res)
 {
     IOCommandID done = r->cmdID;
     if (r->actCount) *r->actCount = (res == 0) ? (long)r->reqBytes : (long)(r->reqBytes - r->count * 512);
+    gBioQ[gBioTail % BIOQ_N].ready = 0;            /* r+: slot empty before dequeue (so it is 0 when reclaimed) */
     gBioTail++; gBioPhase = 0; gBioRetry = 0;      /* dequeue BEFORE completing (completion may enqueue more) */
-    (void)IOCommandIsComplete(done, (OSErr)res);   /* interrupt-safe: hand the block I/O back to the File Mgr */
+    complete_now(done, res);                       /* v43: pacing retired — complete immediately (full speed) */
     bio_kick();                                    /* start the next queued request */
 }
 /* r57: begin BOT reset recovery for the current (timed-out) chunk — issue the Bulk-Only Mass Storage Reset. */
@@ -1161,8 +1260,9 @@ static void bio_advance(long status)              /* r57: status = down-engine r
         int sigOk = (gCswBuf[0] == 0x55 && gCswBuf[1] == 0x53 && gCswBuf[2] == 0x42 && gCswBuf[3] == 0x53);   /* 'USBS' */
         if (gCswBuf[12] != 0 || resid != 0 || !sigOk) {         /* status!=passed OR short transfer OR bad CSW sig */
             for (i = 0; i < 13; i++) gPB[i] = gCswBuf[i];       /* mirror the failing CSW to gPB for biofail's snapshot */
-            gBioResult = -36L; biofail(r->isWrite, r->lba, (UInt16)gBioChunk);
-        } else { if (r->isWrite) gBioWrOk++; else gBioRdOk++; gBioRetry = 0; }
+            gBioResult = -36L; biofail(r->isWrite, r->lba, r->submitLba, gBioRetry, (UInt16)gBioChunk);
+        } else { if (r->isWrite) gBioWrOk++; else gBioRdOk++; gBioRetry = 0;
+                 if (r->isWrite) raw_note_write(r->lba); else raw_check_read(r->lba); }   /* v23: read-after-write verify (gDownBuf = this chunk's data) */
         r->lba += gBioChunk; r->buf += gBioChunk * 512; r->count -= gBioChunk;
         if (gBioResult == 0 && r->count > 0) bio_start_chunk();  /* more chunks in this request */
         else bio_finish(r, gBioResult);                          /* done (or CSW-failed) -> complete */
@@ -1176,7 +1276,7 @@ static void bio_advance(long status)              /* r57: status = down-engine r
         if (!r->isWrite) { for (i = 0; i < nbytes; i++) r->buf[i] = gPB[i]; }
         pb_in(13); gBioPhase = 3; break;
     case 3:                                       /* CSW done -> check, advance chunk, or complete */
-        if (gPB[12] != 0) { gBioResult = -36L; biofail(r->isWrite, r->lba, (UInt16)gBioChunk); }  /* real CSW status (the IN xfer succeeded) */
+        if (gPB[12] != 0) { gBioResult = -36L; biofail(r->isWrite, r->lba, r->submitLba, gBioRetry, (UInt16)gBioChunk); }  /* real CSW status (the IN xfer succeeded) */
         else { if (r->isWrite) gBioWrOk++; else gBioRdOk++; gBioRetry = 0; }                       /* r57: chunk OK -> refresh retry budget */
         r->lba += gBioChunk; r->buf += gBioChunk * 512; r->count -= gBioChunk;
         if (gBioResult == 0 && r->count > 0) bio_start_chunk();        /* more chunks in this request */
@@ -1190,13 +1290,39 @@ static long ehci_usb_submit(IOCommandID cmdID, UInt32 lba, UInt32 count, void *b
 {
     UInt32 depth = gBioHead - gBioTail; BioReq *r;
     if (depth > gBioHiWater) gBioHiWater = depth;       /* r49: track peak ring occupancy for the thread-B diagnostic */
-    if (count == 0) return 1;
-    if (depth >= BIOQ_N) { gBioReject++; return -1; }   /* r41: count queue-full submit rejections */
-    r = &gBioQ[gBioHead % BIOQ_N];
-    r->cmdID = cmdID; r->lba = lba; r->count = count; r->reqBytes = count * 512;
-    r->buf = (UInt8 *)buf; r->actCount = actCount; r->isWrite = (UInt8)(isWrite ? 1 : 0);
-    __asm__ __volatile__("eieio");           /* publish the BioReq fields before advancing head */
-    gBioHead++;
+    { int save = gInSubmit; gInSubmit = save + 1;       /* r+ re-entrancy detector (nested via IOCommandIsComplete) */
+      if (save) { gSubmitReentry++; if ((UInt32)gInSubmit > gSubmitMaxDepth) gSubmitMaxDepth = (UInt32)gInSubmit; } }
+    if (count == 0)      { gInSubmit--; return 1; }
+    if (depth >= BIOQ_N) {                                            /* r41: count queue-full submit rejections */
+        gBioReject++;
+        { static UInt32 rjN = 0; if (rjN++ < 64) {                   /* v19: bounded per-event detail (task level -> ehci_os_log safe); gBioReject = true total */
+            ehci_os_log("!! v19 SUBMIT REJECT (ring full)");
+            ehci_os_logx("  depth", depth);
+            ehci_os_logx("  lba", lba);
+            ehci_os_logx("  count", count);
+            ehci_os_logx("  isWrite", (UInt32)(isWrite ? 1 : 0)); } }
+        gInSubmit--; return -1;
+    }
+    if (isWrite) {                                   /* v36: FM-race write instrumentation (never-wrap capture) */
+        UInt32 fl = 0; gWrTotal++;
+        if (gInCompletion) fl |= 1;                  /* born inside our completion => the FM re-issued it (re-entrancy) */
+        if (gPBlkCnt && (lba >= gPBlkCnt || (lba + count) > gPBlkCnt || (lba + count) < lba)) fl |= 2;  /* LBA off the device */
+        if (fl) { UInt32 k = gSuspN; if (k < 16) { gSuspLba[k] = lba; gSuspCnt[k] = count; gSuspFlags[k] = fl; } gSuspN++; }
+    }
+    {   /* r+ RACE FIX: called RE-ENTRANTLY (File Mgr re-issues the next I/O from inside IOCommandIsComplete
+         * at interrupt level, nested in a task-level submit). Claim the slot ATOMICALLY so nested producers
+         * get DISTINCT slots — the old fill-then-gBioHead++ let two grab the SAME slot -> one BioReq left
+         * GARBAGE -> a write with a garbage LBA/count -> silent corruption, only under a many-small-file
+         * copy's rapid completions. Consumer gates on the per-slot 'ready' flag (set after the fill). */
+        UInt32 myHead = (UInt32)IncrementAtomic((SInt32 *)&gBioHead);   /* atomic fetch-and-increment */
+        UInt32 slot = myHead % BIOQ_N;
+        r = &gBioQ[slot];
+        r->cmdID = cmdID; r->lba = lba; r->submitLba = lba; r->count = count; r->reqBytes = count * 512;
+        r->buf = (UInt8 *)buf; r->actCount = actCount; r->isWrite = (UInt8)(isWrite ? 1 : 0);
+        __asm__ __volatile__("eieio");                     /* publish BioReq fields BEFORE ready */
+        r->ready = 1;
+    }
+    gInSubmit--;
     /* r48 RE-ENTRANCY FIX (thread B — Finder large-copy hard-crash): do NOT bio_kick() here.
      * This runs at TASK level (File Mgr kRead/kWrite). bio_kick -> bio_start_chunk mutates the shared
      * bio+down engine (gPB, gDownQH, gBioPhase) — the SAME state the INTERRUPT-level completion path
@@ -1264,7 +1390,7 @@ void ehci_vhub_engine_teardown(int resetToggles)
      * must FAIL-COMPLETE any in-flight gBioQ request (IOCommandIsComplete with an error) rather than
      * just dropping it; here the caller guarantees the engine is idle first, so draining is safe. */
     gDpBusy = 0;
-    gBioPhase = 0; gBioRetry = 0; gBioTail = gBioHead;
+    gBioPhase = 0; gBioRetry = 0; gBioTail = gBioHead; { int _i; for (_i=0;_i<BIOQ_N;_i++) gBioQ[_i].ready = 0; }
     gDownReady = 0; gDownAseOn = 0;            /* rebuild re-enables ASE + readiness */
 }
 void ehci_vhub_engine_rebuild(UInt32 ctrlAddr)
@@ -1338,7 +1464,7 @@ static void reconnect_reset(void)
     int i;
     ehci_os_log("=== RECONNECT: post-mount re-enumeration at a new address — reset stale state (r88) ===");
     epq_arm_idle(&gBulkQ[0]); epq_arm_idle(&gBulkQ[1]);   /* fresh device => bulk toggles back to DATA0 */
-    gDpBusy = 0; gBioPhase = 0; gBioRetry = 0; gBioTail = gBioHead;   /* idle the BOT/down engine */
+    gDpBusy = 0; gBioPhase = 0; gBioRetry = 0; gBioTail = gBioHead; { int _i; for (_i=0;_i<BIOQ_N;_i++) gBioQ[_i].ready = 0; }   /* idle the BOT/down engine */
     gFenceApple = 0;                                     /* r93: do NOT fence during Apple's reconnect probing. r90 set this to
                                                           * 1 immediately, to "free the pump" for a self-probe we now know was
                                                           * never being CALLED post-reconnect (not starved) — r92's tickFn is
@@ -1376,18 +1502,38 @@ void ehci_vhub_loopcrumb(UInt32 tag)
     }
 }
 /* Task-level state machine; call once per uim23. */
+static void compl_drain(void)   /* MINI FIX: deliver deferred Apple bulk completions at TASK level */
+{
+    while (gComplTail != gComplHead) {
+        UInt32 t = gComplTail & (NCOMPL - 1u);
+        void *upp = gComplQ[t].upp, *pipe = gComplQ[t].pipe;
+        long st = gComplQ[t].status; UInt32 act = gComplQ[t].actual;
+        gComplTail++;
+        if (upp) ((ehci_usl_intcomplete)upp)(pipe, st, (unsigned long)act);
+    }
+}
+/* v22: mirror of the block driver's gCsLog (usb_disk.c), published via Gestalt('Ucsl'). Lets the UIM dump
+ * the FM-level Prime trace into the reliable EHCIUIM log. Layout MUST match usb_disk.c exactly. */
+typedef struct { short kind; short csCode; short ioVRefNum; short pad; long p0, p1; } CsRecMirror;   /* 16B */
+typedef struct { UInt32 magic; UInt32 count; UInt32 cap; UInt32 nReads; UInt32 nWrites; CsRecMirror recs[512]; } CsLogMirror;
+static CsLogMirror *gCsLogPtr = 0; static int gCsDumped = 0; static UInt32 gCsLastIo = 0xFFFFFFFFUL;
+/* v25: mirror of the block driver's gDioLog (Gestalt 'Ucs2') — the DoDriverIO code+err control-plane trace. */
+typedef struct { short code; short err; long aux; } DioRecMirror;
+typedef struct { UInt32 magic; UInt32 count; DioRecMirror recs[128]; } DioLogMirror;
+static DioLogMirror *gDioLogPtr = 0;
 void ehci_vhub_selfprobe_tick(void)
 {
     static const UInt8 cdbInq[6]  = {0x12,0,0,0,36,0};
     static const UInt8 cdbCap[10] = {0x25,0,0,0,0,0,0,0,0,0};
     UInt8 cdbRd[10]; int i;
-    {   /* r88 diag: log gPState transitions so we can SEE the post-reconnect re-probe path (or lack of it) */
+    compl_drain();
+    if (EHCI_VERBOSE) {   /* r88 diag: log gPState transitions so we can SEE the post-reconnect re-probe path (or lack of it) */
         static UInt32 lastSt = 0xFFFFFFFFUL;
         if (gPState != lastSt) { lastSt = gPState;
             ehci_os_log("selfprobe_tick state:"); ehci_os_logx("  gPState", gPState);
             ehci_os_logx("  gReprobe", (UInt32)gReprobe); ehci_os_logx("  gPOut", (UInt32)(long)gPOut); }
     }
-    {   /* r89 diag: UNCONDITIONAL periodic entry log — proves selfprobe_tick is CALLED + the gPState it SEES */
+    if (EHCI_VERBOSE) {   /* r89 diag: UNCONDITIONAL periodic entry log — proves selfprobe_tick is CALLED + the gPState it SEES */
         static UInt32 stN = 0;
         if ((stN++ & 0x1FFUL) == 0) {   /* every 512 calls */
             ehci_os_log("r89 selfprobe entry:");
@@ -1395,9 +1541,96 @@ void ehci_vhub_selfprobe_tick(void)
             ehci_os_logx("  &gPState", (unsigned long)(void *)&gPState);
             ehci_os_logx("  gReprobe", (UInt32)gReprobe);
             ehci_os_logx("  gPOut", (UInt32)(long)gPOut); ehci_os_logx("  gPIn", (UInt32)(long)gPIn);
+            ehci_os_logx("  v18 gSubmitReentry", (UInt32)gSubmitReentry);
+            ehci_os_logx("  v18 gSubmitMaxDepth", (UInt32)gSubmitMaxDepth);
+            /* v36: the FM-race smoking gun. gSuspN>0 with flag bit0 => the File Manager re-issued a WRITE from
+             * inside our completion (the re-entrancy the OS 9 File Manager source model predicts); bit1 => that
+             * write's LBA was off the device (a clobbered File-Mgr Params offset reached us). Never-wraps, so it
+             * survives the whole folder copy even though the 'Ucsl' ring holds only the last 512 I/Os. */
+            ehci_os_logx("  v36 gInCompletion (now)", (UInt32)gInCompletion);
+            ehci_os_logx("  v36 gWrTotal (writes seen)", (UInt32)gWrTotal);
+            ehci_os_logx("  v36 gSuspN (SUSPICIOUS writes)", (UInt32)gSuspN);
+            { UInt32 _si, _sm = (gSuspN < 16u) ? gSuspN : 16u;
+              for (_si = 0; _si < _sm; _si++) {
+                ehci_os_log("  v36 SUSPICIOUS WRITE (flags 1=reentrant 2=off-device):");
+                ehci_os_logx("    lba",   gSuspLba[_si]);
+                ehci_os_logx("    nblk",  gSuspCnt[_si]);
+                ehci_os_logx("    flags", gSuspFlags[_si]);
+              } }
+            ehci_os_logx("  v18 gComplDrop", (UInt32)gComplDrop);
+            /* v19 diag: ring occupancy + queue-full rejections + engine drain progress.
+             * hiWater==BIOQ_N(16) => the ring is the bottleneck; reject>0 => DM over-issued (grow ring);
+             * hiWater==16 with reject==0 while WrOk/RdOk FLATLINE across samples => engine stall (dropped kick);
+             * hiWater stays low + dialog still fires => neither, look above the ring (Status/Control calls). */
+            ehci_os_logx("  v19 gBioHiWater", (UInt32)gBioHiWater);
+            ehci_os_logx("  v19 gBioReject", (UInt32)gBioReject);
+            ehci_os_logx("  v19 gBioWrOk", (UInt32)gBioWrOk);
+            ehci_os_logx("  v19 gBioRdOk", (UInt32)gBioRdOk);
+            /* v21 engine-wedge discriminator (the copy stalls with NO transport error -> read the engine state):
+             * gBioPhase!=0 & gDpBusy=0 => a transfer COMPLETED but bio_advance never ran (routing/completion bug);
+             * gBioPhase!=0 & gDpBusy=1 => transfer STUCK in flight (watchdog should have fired but didn't);
+             * gBioPhase=0 & gBioHead!=gBioTail => DROPPED KICK (a request sits in the ring, never started). */
+            ehci_os_logx("  v21 gBioPhase", (UInt32)gBioPhase);
+            ehci_os_logx("  v21 gBioHead", (UInt32)gBioHead);
+            ehci_os_logx("  v21 gBioTail", (UInt32)gBioTail);
+            ehci_os_logx("  v21 gDpBusy", (UInt32)gDpBusy);
+            /* v22: FM-level Prime trace from the block driver's gCsLog (Gestalt 'Ucsl'). nWrites > gBioWrOk
+             * ⇒ the failing write REACHED us and was lost (our path); nWrites == gBioWrOk ⇒ it never reached
+             * us ⇒ error is ABOVE us (HFS / wrong-read-data). */
+            if (!gCsLogPtr) { long _v; if (Gestalt('Ucsl', &_v) == noErr && _v) {
+                CsLogMirror *_p = (CsLogMirror *)_v; if (_p->magic == 0x5563736cUL) gCsLogPtr = _p; } }
+            if (gCsLogPtr) {
+                UInt32 _io = (UInt32)(gBioWrOk + gBioRdOk);
+                ehci_os_logx("  v22 FM nReads", (UInt32)gCsLogPtr->nReads);
+                ehci_os_logx("  v22 FM nWrites", (UInt32)gCsLogPtr->nWrites);
+                ehci_os_logx("  v22 FM count", (UInt32)gCsLogPtr->count);
+                if (!gCsDumped && gBioPhase == 0 && gBioHead == gBioTail && _io > 0 && _io == gCsLastIo) {
+                    UInt32 _n = gCsLogPtr->count, _i, _show = 16u;   /* stalled: dump the last records ONCE */
+                    gCsDumped = 1;
+                    ehci_os_log("!! v22 STALL — last FM Primes (kind 1=stat 2=ctl 3=rd 4=wr / blk / nblk / iokind):");
+                    for (_i = 0; _i < _show && _i < _n; _i++) {
+                        CsRecMirror *_r = &gCsLogPtr->recs[(_n - 1u - _i) & 511u];
+                        ehci_os_logx("  kind", (UInt32)(short)_r->kind);
+                        ehci_os_logx("   blk", (UInt32)_r->p0);
+                        ehci_os_logx("   nblk", (UInt32)(short)_r->csCode);
+                        ehci_os_logx("   iokind", (UInt32)_r->p1);
+                    }
+                    /* v25: also dump the block driver's DoDriverIO control-plane trace (Gestalt 'Ucs2').
+                     * codes: 5=Open 6=Close 7=Read 8=Write 9=Control 10=Status 11=KillIO (1=Init 2=Finalize).
+                     * err 1 = kIOBusyStatus (accepted async). Look for a Status/Control returning non-0, or a
+                     * KillIO, right before the abort. */
+                    if (!gDioLogPtr) { long _dv; if (Gestalt('Ucs2', &_dv) == noErr && _dv) {
+                        DioLogMirror *_dp = (DioLogMirror *)_dv; if (_dp->magic == 0x44696f4cUL) gDioLogPtr = _dp; } }
+                    if (gDioLogPtr) {
+                        UInt32 _dn = gDioLogPtr->count, _di, _dshow = 48u;
+                        ehci_os_log("!! v25 DoDriverIO trace (code / err / aux=csCode for ctl+stat), most-recent first:");
+                        for (_di = 0; _di < _dshow && _di < _dn; _di++) {
+                            DioRecMirror *_dr = &gDioLogPtr->recs[(_dn - 1u - _di) & 127u];
+                            ehci_os_logx("  code", (UInt32)(short)_dr->code);
+                            ehci_os_logx("   err", (UInt32)(short)_dr->err);
+                            ehci_os_logx("   aux", (UInt32)_dr->aux);
+                        }
+                    }
+                }
+                gCsLastIo = _io;
+            }
+            ehci_os_logx("  v23 gRawChecks", (UInt32)gRawChecks);
+            ehci_os_logx("  v23 gRawMismatch", (UInt32)gRawMismatch);
+            ehci_os_logx("  v24 gStaleN", (UInt32)gStaleN);
+            if (gRawMPending) {
+                ehci_os_log("!! v23 READ-AFTER-WRITE MISMATCH (read-back != written data — HFS's just-written block came back stale/wrong):");
+                ehci_os_logx("  lba", gRawMLba); ehci_os_logx("  wroteFP", gRawMExp); ehci_os_logx("  readFP", gRawMAct);
+                gRawMPending = 0;
+            }
+            if (gStalePending) {
+                ehci_os_log("!! v24 STALE READ (read returned the LAST WRITE's data for a DIFFERENT block = stale gDownBuf):");
+                ehci_os_logx("  readLba", gStaleRLba); ehci_os_logx("  wroteLba", gStaleWLba);
+                ehci_os_logx("  readWord0", gStaleRW0); ehci_os_logx("  wroteWord0", gStaleWW0);
+                gStalePending = 0;
+            }
         }
     }
-    if (gBurst > 0) {   /* r90: reconnect-triggered burst — log the self-probe's actual post-reconnect path */
+    if (EHCI_VERBOSE && gBurst > 0) {   /* r90: reconnect-triggered burst — log the self-probe's actual post-reconnect path */
         gBurst--;
         ehci_os_log("r90 burst:"); ehci_os_logx("  gPState", (UInt32)gPState);
         ehci_os_logx("  gReprobe", (UInt32)gReprobe); ehci_os_logx("  gFence", (UInt32)gFenceApple);
@@ -1418,7 +1651,7 @@ void ehci_vhub_selfprobe_tick(void)
             ehci_os_logx("  outEp.addr", gBulkEP[gPOut].addr); ehci_os_logx("  inEp.addr", gBulkEP[gPIn].addr);
             pb_cbw(cdbInq, 6, 36); gPState = 1; break;
         }
-        {   /* r31 DIAGNOSTIC: periodically log WHY we haven't parked — cracks the intermittent no-mount
+        if (EHCI_VERBOSE) {   /* r31 DIAGNOSTIC: periodically log WHY we haven't parked — cracks the intermittent no-mount
              * (user confirms identical insertion every time, so the variance is intrinsic timing). Read
              * on a stalled run: gPOut/gPIn = ffffffff => endpoints never created (enum didn't start);
              * bulkCnt stuck + gPIdle NOT climbing + vhubTick FROZEN => heartbeat died (root cause);
@@ -1743,6 +1976,7 @@ void ehci_vhub_start_service(EHCIRegEntryIDPtr node)
     }
     ehci_os_logx("  gA2Live (1=real IRQ, 0=heartbeat-only)", (unsigned long)gA2Live);
     ehci_os_logx("  sharedCompanion (1=shared line->ISR also chains companion, 0=dedicated)", (unsigned long)gSoftc.sharedCompanion);
+    ehci_os_log("=== v44 RUN (driver loaded): LEAN (pacing off, per-tick logging compiled out); v41 2GB + v42 >4GB fixes ===");
     { AbsoluteTime when = AddDurationToAbsolute((Duration)VHUB_HB_MS, UpTime());
       SetInterruptTimer(&when, vhub_heartbeat, 0, &gHbTimer); }
 }
