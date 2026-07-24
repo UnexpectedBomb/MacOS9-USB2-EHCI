@@ -25,6 +25,8 @@ the loader app are all PEF/CFM).
   Family Expert UIM entry points the app links against.
 - `scripts/pef-to-blob.py` — embeds a built PEF into a C byte array.
 - `patch-pef-main.py` — sets a native driver's PEF `main` to its `DoDriverIO` export.
+- `rom/usb_rom_inject.py`: injects the built `EHCIUIM.pef` into a Mac OS ROM as a
+  `driver,AAPL,MacOS,PowerPC` parcel (see "Injecting the driver into the Mac OS ROM" below).
 
 ## The two-phase build (important)
 
@@ -57,6 +59,36 @@ resource fork survives) plus `.APPL`/`.dsk` variants. A prebuilt copy is in `dis
 
 If you edit a driver source, re-run its build + `pef-to-blob` step and then rebuild the app —
 otherwise the app keeps embedding the old driver.
+
+> **ROM-integration note.** The shipping helper (`EHCILauncher` built with `PATHA_ROM_DRIVER`) uses
+> the driver **from the ROM**, not the embedded blob, so it no longer installs the byte array at
+> runtime. The blob is still built and embedded (it is the fallback used by the older in-app
+> injection path and the diagnostic harness), so the two-phase order above still applies.
+
+## Injecting the driver into the Mac OS ROM
+
+This release loads the driver from the **Mac OS ROM** rather than installing it from the app. After
+building `EHCIUIM.pef` (step 1 above), inject it into a Mac OS ROM file:
+
+```sh
+python3 rom/usb_rom_inject.py "Mac OS ROM" -o "Mac OS ROM (USB2)"
+```
+
+The injector adds a `driver,AAPL,MacOS,PowerPC` parcel carrying the PEF, plus a matching driver
+descriptor, bound to the EHCI controller node (`pciclass,0c0320`), so the OS loads and prepares the
+driver at boot. It builds on **Elliot Nunn's Mac OS ROM toolchain** (`tbxi` and friends), which must
+be available; the paths it expects are documented at the top of `rom/usb_rom_inject.py`.
+
+Two driver details make the ROM load safe and useful:
+
+- The driver's runtime flags are **`0x05`** (`kDriverIsLoadedUponDiscovery` + `kDriverIsUnderExpertControl`),
+  so the OS prepares it at boot but leaves opening it to the USB Expert path (`LoadUIMForEntry`, which
+  the helper calls) rather than opening it immediately.
+- `DoDriverIO`'s `kInitialize` is **stash-only**: it records the controller node and returns, with no
+  register mapping and no File Manager calls, because at the early PCI-claim phase the machine cannot
+  tolerate bring-up work. The real controller bring-up is deferred to `kOpen`.
+
+Put the patched ROM in place of the `Mac OS ROM` in the System Folder, and keep the original to revert.
 
 ## Notes
 

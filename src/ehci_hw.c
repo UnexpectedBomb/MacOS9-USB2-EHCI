@@ -243,3 +243,23 @@ int ehci_hc_start(ehci_softc *sc)
     sc->started = 1;
     return 0;
 }
+
+/* Hand every root port back to the companion 1.1 controllers and clear CONFIGFLAG.
+ * Reverses ehci_hc_start's port claim: once we stop servicing the bus (driver
+ * teardown, or the hosting app quitting), a drive plugged in is then detected by
+ * the OS's own OHCI (1.1) driver, instead of being stranded on our now-idle EHCI
+ * ports until a power-cycle. Per EHCI 4.2, CONFIGFLAG=0 routes ALL ports to the
+ * companion(s); we also set Port Owner=1 per port first so the handoff is explicit.
+ * Safe to call more than once and after the controller is stopped. */
+void ehci_hc_release_ports(ehci_softc *sc)
+{
+    volatile void *op = sc->opBase;
+    UInt32 i;
+    if (op == 0) return;
+    for (i = 0; i < sc->nPorts; i++) {
+        UInt32 pv = ehci_read32(op, EHCI_PORTSC(i)) & ~EHCI_PORTSC_RW1C;
+        pv |= EHCI_PORT_OWNER;              /* Owner=1 -> this port belongs to the companion (1.1) */
+        ehci_write32(op, EHCI_PORTSC(i), pv);
+    }
+    ehci_write32(op, EHCI_CONFIGFLAG, 0);   /* route ALL ports to the companion controllers */
+}

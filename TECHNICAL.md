@@ -34,6 +34,44 @@ Our ndrv exports only the two data symbols a UIM needs — `TheDriverDescription
 match `pciclass,0c0320`) and `ThePluginDispatchTable` (version word + 28 host-controller entry
 points). The dispatch slots are thin wrappers over the controller/virtual-hub engine.
 
+## Loading from the Mac OS ROM (this release)
+
+The method above worked, but the app had to recreate the controller's driver properties on every
+launch. This release moves that binding into the **Mac OS ROM**, so the OS itself loads the driver at
+boot, exactly as it would for a card that shipped with a declaration ROM.
+
+`rom/usb_rom_inject.py` (built on Elliot Nunn's Mac OS ROM toolchain) injects a **parcel** into the
+ROM: a `driver,AAPL,MacOS,PowerPC` property carrying our ndrv's PEF, plus the driver descriptor,
+attached to the EHCI controller node (`pciclass,0c0320`). At boot the OS finds the parcel, prepares
+the driver, and records it against the node. This is the same binding the app used to create at
+runtime, now supplied by the ROM.
+
+Two things had to be true for a ROM-loaded driver to be safe here:
+
+- **Runtime flags `0x05`** (`kDriverIsLoadedUponDiscovery` + `kDriverIsUnderExpertControl`). The OS
+  prepares the driver at boot but does not open it; opening it, and therefore the real bring-up,
+  happens later through the USB Expert path.
+- **A stash-only `kInitialize`.** `DoDriverIO`'s `kInitialize` runs at the early PCI-claim phase,
+  before the File Manager and much of the Toolbox are safe to call. It must do nothing but record the
+  node and return `noErr`. All of the actual controller bring-up (PCI enable, register map, EECP
+  hand-off, schedules, run) is deferred to `kOpen`. This mirrors what the sibling SATA project learned
+  the hard way: bring-up work at claim time hangs the boot.
+
+The helper then activates the ROM-loaded driver exactly as before, by calling `LoadUIMForEntry(node)`,
+which opens the driver (triggering `kOpen` and the bring-up) and installs it as the live UIM. So the
+helper no longer carries or installs the driver; it only *activates* the one the ROM already loaded,
+runs the self-probe, and mounts.
+
+**Port hand-back on quit.** Because the driver now persists across a session and the helper can be
+quit at will, quitting cleanly returns the root ports to the 1.1 companion: the helper clears the EHCI
+`CONFIGFLAG` and sets each port's Owner bit, so plain USB 1.1 resumes with no reboot. The same
+teardown runs from the driver's `kFinalize` / `uimFinalize`.
+
+**Honest limit.** This does not make the mount seamless. OS 9's own mass-storage mounter still will
+not advance a Hi-Speed device (it parks at `TEST UNIT READY` / `REQUEST SENSE` and never issues
+`INQUIRY`), which is why the self-probe inside the helper is still what performs the mount. The ROM
+integration is the foundation a future seamless path needs, not that path itself.
+
 ## The stack, layer by layer
 
 - **Controller bring-up** (`ehci_os.c`, `ehci_hw.c`): PCI enable, map the operational
@@ -281,9 +319,10 @@ trusting a driver on any volume larger than 2 GB.
 - **BOT error recovery is minimal.** With the wedge gone, a *correct* one-shot Bulk-Only Reset
   (for genuine device errors, not the false-timeout churn that was removed) is a small planned
   hardening.
-- **Manual launch, by design (the big one).** The shippable vehicle is a small prompt-driven
-  app: boot with the drive *unplugged*, run it (it claims the ports for EHCI), and insert when
-  prompted — so the drive enumerates fresh on EHCI. Auto-mount-at-boot and hot re-insertion are
+- **Manual mount, by design (the big one).** The driver now loads from the ROM at boot, but the
+  mount still goes through a small prompt-driven helper: boot with the drive *unplugged*, let the
+  helper run (it activates the ROM driver and claims the ports for EHCI), and insert when prompted, so
+  the drive enumerates fresh on EHCI. Auto-mount-at-boot and hot re-insertion are
   **not** supported, and for the same underlying reason: both require handing a mass-storage
   device between Apple's USB 1.1 *companion* controller and EHCI, and Mac OS 9's USB stack does
   not do that gracefully. A drive attached at boot is claimed by the 1.1 companion before our

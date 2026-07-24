@@ -17,6 +17,7 @@
 #include <Devices.h>
 #include <Files.h>
 #include "ehci.h"
+#include "ehci_vhub.h"   /* Path A: DoDriverIO kOpen drives the vhub bring-up (xfer_init + start_service) */
 
 /* Init-phase tracing to a FLUSHED disk file. uimInitialize runs synchronously in the app's
  * context via LoadUIMForEntry, so File Manager is safe here, and a per-line flush means the last
@@ -286,23 +287,50 @@ OSStatus ehci_os_init(ehci_softc *sc, EHCIRegEntryIDPtr nodeArg)
  * DoDriverIO — standard native-driver entry point. The generic driver loader
  * calls this (rather than the USB Expert calling ThePluginDispatchTable) once
  * our runtime flags request self-loading. On Initialize/Replace it hands us the
- * controller's Name Registry node in the command contents; we bring up EHCI.
+ * controller's Name Registry node in the command contents; bring-up is deferred
+ * to kOpen (Path A boot-safety — see the switch below).
  */
+static int gBroughtUp = 0;   /* Path A: guards the one-time kOpen EHCI bring-up */
 OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
                  IOCommandContents contents, IOCommandCode code, IOCommandKind kind)
 {
-    (void)spaceID; (void)cmdID; (void)kind;
+    (void)spaceID; (void)cmdID; (void)kind; (void)contents;
     switch (code) {
     case kInitializeCommand:
     case kReplaceCommand:
-        dbg("EHCIUIM: DoDriverIO Initialize");
-        return (OSErr)ehci_os_init(&gSoftc,
-                    (EHCIRegEntryIDPtr)&contents.initialInfo->deviceEntry);
+        /* Path A BOOT-SAFETY (eSATA v63/v64 lesson): when the ROM parcel makes the
+         * Device Manager load us at boot, kInitialize runs during the early PCI-claim
+         * phase, where full EHCI bring-up (HCReset/DMA/IRQ) FREEZES. So do NOTHING
+         * here except acknowledge the claim — the real bring-up is deferred to kOpen,
+         * which the headless mount app triggers post-boot (task/driver context up).
+         * (v65 proof: stash-only kInit + open-driven bring-up = stable boot-to-desktop
+         * with the card claimed.) NB the USL path (LoadUIMForEntry -> uimInitialize)
+         * still brings up inline as before; only the Device-Manager path defers. */
+        /* NB: NO logging here. ehci_os_log() uses the File Manager, which may not be
+         * up during the early PCI-claim phase — a log call here could itself hang the
+         * boot. Pure return, exactly like eSATA's stash-only kInit (sil_os_init_stash).
+         * kOpen (post-boot, File Manager up) logs the bring-up. */
+        return noErr;
     case kFinalizeCommand:
     case kSupersededCommand:
-        dbg("EHCIUIM: DoDriverIO Finalize");
+        dbg("EHCIUIM: DoDriverIO Finalize — releasing ports to the companion");
+        ehci_hc_release_ports(&gSoftc);   /* hand the ports back so 1.1 works after we're gone */
+        gBroughtUp = 0;
         return noErr;
     case kOpenCommand:
+        /* Full EHCI bring-up now, post-boot. Idempotent (guarded), so repeated opens
+         * are safe. Self-finds the node (proven app path == uimInitialize's ...,0). */
+        if (!gBroughtUp) {
+            long e;
+            dbg("EHCIUIM: DoDriverIO Open — bringing up EHCI");
+            e = ehci_os_init(&gSoftc, (EHCIRegEntryIDPtr)0);
+            if (e != 0) { ehci_os_logx("EHCIUIM: DoDriverIO Open bring-up FAILED e=", (unsigned long)e); return (OSErr)e; }
+            (void)ehci_vhub_xfer_init();          /* DMA page + downstream QHs */
+            ehci_vhub_start_service(&gSoftc.node); /* install EHCI ISR + periodic timer */
+            gBroughtUp = 1;
+            dbg("EHCIUIM: DoDriverIO Open — bring-up complete");
+        }
+        return noErr;
     case kCloseCommand:
         return noErr;
     default:

@@ -42,9 +42,14 @@ EHCIDriverDescription TheDriverDescription = {
     0,
     { 15, "pciclass,0c0320" },
     { 1, 0, 0x80 /*final*/, 0 },
-    0x00000004UL,   /* under Expert control: the Expert's LoadUIMForEntry loads us as a UIM plugin
-                     * and builds the Name Registry entry (the reset-routing fix). The generic
-                     * self-load path (0x03) was proven not to engage an EHCI node (HW tests #2/#3). */
+    0x00000005UL,   /* Path A boot-load: 0x05 = kDriverIsLoadedUponDiscovery(0x01) |
+                     * kDriverIsUnderExpertControl(0x04), NOT OpenedUponLoad — the eSATA v65-proven
+                     * value. The ROM parcel binds driver,AAPL,MacOS,PowerPC to our EHCI node; since
+                     * that node has NO device_type=usb (2026-07-24 probe), the USB Expert ignores it
+                     * and the PCI expert / Device Manager loads us via DoDriverIO at boot. kInitialize
+                     * is stash-only (boot-safe); the mount app's Open triggers bring-up. (Old 0x04 =
+                     * the USL/LoadUIMForEntry path used by the manual app; 0x03 self-load never engaged
+                     * the node in HW tests #2/#3 — the ROM parcel is what makes discovery-load fire.) */
     { 7, "EHCIUIM" },
     { 0,0,0,0,0,0,0,0 },
     0
@@ -95,7 +100,14 @@ static OSStatus uimInitialize(UInt32 a0, UInt32 a1, UInt32 a2, UInt32 a3,
     }
     return (OSStatus)e;
 }
-static OSStatus uimFinalize(void) { return noErr; }
+static OSStatus uimFinalize(void)
+{
+    /* On a clean UIM unload, hand the root ports back to the companion 1.1 controllers
+     * (+ clear CONFIGFLAG) so a drive plugged in afterward is seen by the OS's own OHCI
+     * driver rather than stranded on our idle EHCI ports. */
+    ehci_hc_release_ports(&gSoftc);
+    return noErr;
+}
 
 /* ==================== r17 slot-call trace — close the post-REQUEST-SENSE blind spot ====================
  * r16 proved the completion LEVEL is not the wall: the bulk re-issues already reach uim7 at TASK level
@@ -263,7 +275,7 @@ static OSStatus uim23(UInt32 a,UInt32 b,UInt32 c,UInt32 d,UInt32 e,UInt32 f,UInt
                 ehci_os_logx("  r7", ee); ehci_os_logx("  r8", ff); ehci_os_logx("  r9", gg); ehci_os_logx("  r10", hh);
             }
         }
-        if (gSlotCount[27] - last27 >= 512) { last27 = gSlotCount[27]; ehci_os_logx("slot27 ticks(total)", gSlotCount[27]); }
+        if (gSlotCount[27] - last27 >= 8192) { last27 = gSlotCount[27]; ehci_os_logx("slot27 ticks(total)", gSlotCount[27]); }   /* v47: throttled 512->8192 (16x less FSWrite/FlushVol) = truly lean timing + a coarse liveness heartbeat; the v47 STALL dump carries the fine-grained state during a freeze */
     }
     /* r36 RELIABILITY: drain the port-event ring + report downstream-engine health. With the un-starved
      * downstream control trace above, these DECIDE the intermittent -6999 handoff death in ONE losing

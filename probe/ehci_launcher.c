@@ -32,6 +32,7 @@
 #include <Gestalt.h>         /* Gestalt('Eusb') */
 #include <Events.h>          /* WaitNextEvent, TickCount */
 #include <Windows.h>         /* FrontWindow / HideWindow — reveal the desktop after mounting */
+#include <Menus.h>           /* File menu with Quit (friendlier than relying on Cmd-Q) */
 #include <Sound.h>           /* SysBeep — audible cue for the prompt + the mount */
 #include "ehci_pef_blob.h"   /* gEHCIPef[] / gEHCIPefLen — the UIM ndrv PEF */
 #include "usb_disk_blob.h"   /* gUsbDiskPef[] / gUsbDiskPefLen — the USB block driver */
@@ -100,6 +101,128 @@ static LoadUIMProc resolve_loaduim(void)
     if (FindSymbol(conn, "\pLoadUIMForEntry", &sym, &cls) != noErr) return 0;
     return (LoadUIMProc)sym;
 }
+
+/* Path A: on quit, hand the EHCI root ports back to the companion 1.1 controllers so a
+ * drive plugged in afterward still mounts at 1.1. The UIM stays RESIDENT when we quit, so
+ * it can't do this for us (its kFinalize won't fire) — we do it directly. Derive the
+ * operational register base the same way the driver does (assigned-addresses picks the
+ * memory BAR index; AAPL,address[index] is the CPU-logical base; opBase = capBase +
+ * CAPLENGTH) and write CONFIGFLAG=0 (EHCI 4.2: routes ALL ports to the companion).
+ * Best-effort + silent: if anything is missing we simply leave the ports as they are
+ * (a reboot always resets CONFIGFLAG). Value 0 is endian-neutral, so no byte-swap. */
+static void release_ports(RegEntryID *n)
+{
+    UInt32 aa[48], la[16]; RegPropertyValueSize aaSz = sizeof(aa), laSz = sizeof(la);
+    UInt32 nEnt, i, memIdx = 0xFFFFFFFFUL;
+    volatile UInt8 *capBase, *opBase;
+    if (RegistryPropertyGet(n, (RegPropertyName *)"assigned-addresses", aa, &aaSz) != noErr) return;
+    if (RegistryPropertyGet(n, (RegPropertyName *)"AAPL,address", la, &laSz) != noErr) return;
+    nEnt = aaSz / (5u * sizeof(UInt32));                 /* 5 UInt32 per assigned-address entry */
+    for (i = 0; i < nEnt; i++) if (((aa[i * 5u] >> 24) & 0x3u) >= 2u) { memIdx = i; break; }  /* mem32/mem64 */
+    if (memIdx == 0xFFFFFFFFUL || (memIdx * sizeof(UInt32)) >= laSz) return;
+    capBase = (volatile UInt8 *)la[memIdx];
+    if (capBase == 0) return;
+    opBase = capBase + capBase[0];                        /* opBase = capBase + CAPLENGTH */
+    *(volatile UInt32 *)(opBase + 0x40) = 0;              /* CONFIGFLAG = 0 -> all ports to the companion */
+    slog("ports handed back to the 1.1 companion on quit (CONFIGFLAG cleared)");
+}
+
+/* ---- File menu (Apple + File>Quit) so the user can quit from the menu, not just Cmd-Q ----
+ * gNodeP/gNodeReady mirror main's `node` so the menu handler can release the ports on quit. */
+#define kAppleMenuID 128
+#define kFileMenuID  129
+static RegEntryID *gNodeP = 0;
+static int gNodeReady = 0;
+static void setup_menus(void)
+{
+    MenuHandle m;
+    m = NewMenu(kAppleMenuID, "\p\024");                       /* Apple menu (\024 = apple glyph) */
+    if (m) { AppendMenu(m, "\pAbout the USB 2.0 Mount Helper"); InsertMenu(m, 0); }
+    m = NewMenu(kFileMenuID, "\pFile");
+    if (m) { AppendMenu(m, "\pQuit/Q"); InsertMenu(m, 0); }     /* Quit item, Cmd-Q equivalent */
+    DrawMenuBar();
+}
+static void do_quit(void)
+{
+    if (gNodeReady && gNodeP) release_ports(gNodeP);           /* hand the ports back to 1.1 before we go */
+    printf("\nQuitting.\n");
+    slog("quit (menu/Cmd-Q); ports handed back");
+    ExitToShell();
+}
+/* Process one event for the menu bar: File>Quit (mouse or Cmd-Q). Other events fall through
+ * untouched, exactly as before. Call this from every wait/host loop. */
+static void handle_menu_event(EventRecord *evt)
+{
+    long r = 0; WindowPtr w; short menuID, item;
+    if (evt->what == mouseDown) {
+        if (FindWindow(evt->where, &w) == inMenuBar) r = MenuSelect(evt->where);
+    } else if (evt->what == keyDown && (evt->modifiers & cmdKey)) {
+        char ch = (char)(evt->message & charCodeMask);
+        r = MenuKey((short)ch);
+        /* Safety net: quit on Cmd-Q even if the menu bar didn't map it (RetroConsole edge cases),
+         * so we never regress the previously-working Cmd-Q behaviour. */
+        if (((r >> 16) & 0xFFFF) == 0 && ch == 'q') do_quit();
+    }
+    menuID = (short)((r >> 16) & 0xFFFF); item = (short)(r & 0xFFFF);  /* hi word = menuID, lo = item */
+    if (menuID == kFileMenuID && item == 1) do_quit();          /* File > Quit (mouse or Cmd-Q) */
+    if (menuID) HiliteMenu(0);
+}
+
+/* ---- Path A node-probe: dump the EHCI node's OF identity so we can (1) lock the
+ * ROM-parcel match string and (2) tell whether the boot USB Expert (device_type
+ * == "usb") or the Device Manager loads our driver — which decides the parcel
+ * flags + TheDriverDescription.driverRuntime. Same discipline as the eSATA v61
+ * node-probe that locked "SunrichSATA3512" before the burn. ---- */
+#define PATHA_NODEPROBE 0
+/* PATH A mount vehicle: 1 = skip the driver-property injection and use the driver the ROM PARCEL already
+ * bound to the node (driver,AAPL,MacOS,PowerPC + driver-ptr, prepared by the boot loader). We only call
+ * LoadUIMForEntry to activate the ROM-shipped UIM, then self-probe + mount. 0 = the old app behaviour
+ * (embed + inject our own driver copy). Requires the SELF-PROBE ROM (USB2_PathA_ROM_selfprobe.bin) burned. */
+#define PATHA_ROM_DRIVER 1
+static void probe_prop(RegEntryID *n, const char *nm)
+{
+    RegPropertyValueSize sz = 0; unsigned char buf[260]; long i; int printable = 1;
+    if (RegistryPropertyGetSize(n, (RegPropertyName *)nm, &sz) != noErr) {
+        printf("  %-26s : (absent)\n", nm); slog(nm); slog("   (absent)"); return;
+    }
+    if (sz > 256) sz = 256;
+    if (RegistryPropertyGet(n, (RegPropertyName *)nm, buf, &sz) != noErr) {
+        printf("  %-26s : (read failed)\n", nm); return;
+    }
+    for (i = 0; i < (long)sz; i++) { unsigned char c = buf[i]; if (c != 0 && (c < 0x20 || c > 0x7e)) { printable = 0; break; } }
+    if (printable) {                                   /* string / NUL-separated string-list */
+        for (i = 0; i < (long)sz; i++) if (buf[i] == 0 && i < (long)sz - 1) buf[i] = '/';
+        buf[sz ? (sz < 256 ? sz : 256) : 0] = 0; buf[259] = 0;
+        printf("  %-26s : \"%s\"  (%ld bytes)\n", nm, (char *)buf, (long)sz);
+        slog(nm); slog((char *)buf);
+    } else {
+        char hb[80]; long n2 = sz < 8 ? sz : 8, k = 0; static const char hx[] = "0123456789abcdef";
+        for (i = 0; i < n2; i++) { hb[k++] = hx[(buf[i] >> 4) & 0xF]; hb[k++] = hx[buf[i] & 0xF]; hb[k++] = ' '; }
+        hb[k] = 0;
+        printf("  %-26s : <%ld bytes> %s\n", nm, (long)sz, hb);
+        slog(nm); slog("   <binary>");
+    }
+}
+static void probe_node(RegEntryID *n)
+{
+    printf("\n==== EHCI NODE PROBE (Path A: lock the ROM-parcel match) ====\n");
+    slog("==== EHCI NODE PROBE ====");
+    probe_prop(n, "name");
+    probe_prop(n, "compatible");
+    probe_prop(n, "device_type");
+    probe_prop(n, "class-code");
+    probe_prop(n, "vendor-id");
+    probe_prop(n, "device-id");
+    probe_prop(n, "driver,AAPL,MacOS,PowerPC");   /* the parcel's injected PEF (present => parcel matched) */
+    probe_prop(n, "driver-ref");                  /* Unit Table refnum => driver LOADED + registered (the formal claim) */
+    probe_prop(n, "driver-ptr");                  /* driver code pointer => loaded */
+    probe_prop(n, "AAPL,driver-name");            /* driver name the DM registered us under */
+    printf("=============================================================\n");
+    printf("Decides: device_type==\"usb\" -> USB Expert loads us (plugin path);\n");
+    printf("         else -> Device Manager loads us via DoDriverIO (eSATA-style).\n");
+    printf("Match the parcel on the 'compatible' entry containing pciclass,0c0320\n");
+    printf("(or the exact 'name' if compatible lacks it).\n\n");
+}
 static void banner(const char *s)
 {
     printf("\n****************************************************\n");
@@ -110,6 +233,7 @@ static void banner(const char *s)
 static void pump_once(EventRecord *evt)
 {
     (void)WaitNextEvent(everyEvent, evt, 3L, NULL);
+    handle_menu_event(evt);   /* File > Quit works during the settle/insert wait too */
     SystemTask();
     ExpertIdleTask();
     USLPolledProcessDoneQueue();
@@ -126,8 +250,9 @@ int main(void)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     slog_open();
+    setup_menus();   /* Apple + File(Quit) menu bar */
     printf("========================================================\n");
-    printf("  USB 2.0 for Mac OS 9  --  EARLY BETA  (manual launcher)\n");
+    printf("  USB 2.0 for Mac OS 9  --  Path A: ROM driver + headless mount\n");
     printf("========================================================\n\n");
     printf("BEFORE YOU CONTINUE: your USB drive must NOT be plugged in yet.\n");
     printf("If it is, quit now (Cmd-Q), unplug it, REBOOT, and run this again\n");
@@ -149,11 +274,29 @@ int main(void)
         slog("ERR no EHCI card"); goto hold;
     }
     RegistryEntryIterateDispose(&iter);
+    gNodeReady = 1; gNodeP = &node;   /* node valid from here -> release_ports() safe on menu Quit */
+
+#if PATHA_NODEPROBE
+    /* Path A: dump the node identity and STOP — no UIM load, no bring-up. Grab the
+     * "USB2 Launcher Log" (or read the console) to lock the parcel match string. */
+    probe_node(&node);
+    printf("Node probe complete. This build does NOT bring up USB — quit (Cmd-Q).\n");
+    printf("Send the 'USB2 Launcher Log' so we can finalize usb_rom_inject.py.\n");
+    slog("node-probe done; holding (no UIM load)");
+    goto hold;
+#endif
 
     loadUIM = resolve_loaduim();
     if (!loadUIM) { printf("ERROR: the USB Family loader is not available on this system.\n"); slog("ERR no loader"); goto hold; }
     USBExpertSetStatusLevel(0);
 
+#if PATHA_ROM_DRIVER
+    /* Path A: the ROM parcel already bound driver,AAPL,MacOS,PowerPC (+ driver-ptr) to this node at boot.
+     * Do NOT inject our own copy — just activate the ROM-shipped UIM. (Requires the self-probe ROM burned;
+     * the node-probe confirmed driver,AAPL,MacOS,PowerPC + driver-ptr are present post-boot.) */
+    printf("Using the USB 2.0 driver shipped in the Mac OS ROM (no injection)...\n");
+    slog("Path A: ROM-shipped driver; LoadUIMForEntry to activate");
+#else
     {
         RegPropertyValueSize nsz = 0; void *codePtr = (void *)gEHCIPef;
         Boolean hadName = (RegistryPropertyGetSize(&node, "name", &nsz) == noErr);
@@ -164,8 +307,9 @@ int main(void)
         }
         (void)set_prop(&node, "driver-ptr", &codePtr, (RegPropertyValueSize)sizeof(codePtr));
     }
+#endif
 
-    (void)loadUIM(&node);          /* claims the ports for EHCI; no drive attached yet, so nothing to disturb */
+    (void)loadUIM(&node);          /* LoadUIMForEntry: activate the UIM on this node (ROM-shipped driver) */
     printf("USB 2.0 controller is ready.\n");
     slog("controller ready; settling input devices");
 
@@ -188,7 +332,7 @@ int main(void)
     printf("the driver already left the keyboard/mouse ports on USB 1.1.\n");
     printf("Then wait. The drive may re-try a few times before it appears -- this can\n");
     printf("take up to a couple of minutes; it mounts as soon as it's ready. (If nothing\n");
-    printf("shows up, the app quits by itself and you can try again.)\n\n");
+    printf("shows up yet, this keeps waiting -- it mounts the moment the drive is ready.)\n\n");
 
     /* The wait loop is intentionally SILENT: printing to the console during the insert/enumeration
      * window perturbs the timing-sensitive USB enumeration (a live countdown froze it). We only pump
@@ -214,11 +358,16 @@ int main(void)
             }
             break;
         }
+#if !PATHA_ROM_DRIVER
         if ((long)((TickCount() - startTicks) / 60UL) >= kInsertTimeoutSec) {   /* silent timeout */
             printf("\nTimed out -- no drive detected. Quit (Cmd-Q), reboot with the drive\n");
             printf("unplugged, and run this again (insert only when prompted).\n");
             slog("insert timed out"); goto hold;
         }
+#else
+        (void)startTicks;   /* Startup-Item / headless: NO timeout — poll forever, mount whenever a drive
+                             * appears (boot with the drive out, insert any time after; it just mounts). */
+#endif
     }
 
     SysBeep(30);
@@ -248,14 +397,17 @@ int main(void)
      * Cmd-Q quits cleanly; the driver is hosted here, so quit only after ejecting the drive. */
     for (;;) {
         (void)WaitNextEvent(everyEvent, &evt, 6L, NULL);
-        if (evt.what == keyDown && (evt.modifiers & cmdKey) &&
-            (char)(evt.message & charCodeMask) == 'q') { printf("\nQuitting.\n"); ExitToShell(); }
+        handle_menu_event(&evt);   /* File > Quit (mouse or Cmd-Q) -> hand ports back + quit */
         ExpertIdleTask();
         USLPolledProcessDoneQueue();
     }
 
 hold:
     printf("\nStopped -- resolve the above, then quit (Cmd-Q) and try again.\n");
-    for (;;) { (void)WaitNextEvent(everyEvent, &evt, 30L, NULL); SystemTask(); }
+    for (;;) {
+        (void)WaitNextEvent(everyEvent, &evt, 30L, NULL);
+        handle_menu_event(&evt);   /* File > Quit (mouse or Cmd-Q) -> hand ports back + quit */
+        SystemTask();
+    }
     return 0;
 }

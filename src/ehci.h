@@ -53,6 +53,7 @@ typedef struct ehci_softc {
  * an already-allocated, physically-contiguous sc->frameList/asyncQH. */
 int ehci_hc_reset(ehci_softc *sc);   /* stop + HCReset; 0 on success, -1 timeout */
 int ehci_hc_start(ehci_softc *sc);   /* program schedules, route ports, run      */
+void ehci_hc_release_ports(ehci_softc *sc);   /* hand ports back to the companion + clear CONFIGFLAG (teardown/quit) */
 
 /* Shared controller soft state (defined in ehci_uim.c). */
 extern ehci_softc gSoftc;

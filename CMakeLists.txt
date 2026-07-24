@@ -11,7 +11,12 @@ target_link_libraries(EHCIUIM
 
 add_custom_command(OUTPUT EHCIUIM.pef
     COMMAND ${MAKE_PEF} libEHCIUIM.so -o EHCIUIM.pef
-    DEPENDS EHCIUIM)
+    # ROM path: point the fragment main at DoDriverIO so the Device Manager loads us from the
+    # ROM parcel (Retro68 leaves main unset). patch-pef-main.py only rewrites the loader main
+    # offset; DoDriverIO / TheDriverDescription / ThePluginDispatchTable stay exported, so the
+    # USL / LoadUIMForEntry path is unaffected.
+    COMMAND /usr/bin/env python3 ${CMAKE_CURRENT_SOURCE_DIR}/patch-pef-main.py EHCIUIM.pef DoDriverIO
+    DEPENDS EHCIUIM ${CMAKE_CURRENT_SOURCE_DIR}/patch-pef-main.py)
 
 if (REZ_INCLUDE_PATH)
     set(REZ_INCLUDE_FLAG -I${REZ_INCLUDE_PATH})
