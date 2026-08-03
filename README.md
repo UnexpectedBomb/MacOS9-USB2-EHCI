@@ -66,7 +66,7 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
    **Power Mac G4 MDD — use the prebuilt ROM.** The release page carries the exact ROM that has been
    hardware-tested, so this needs no toolchain at all. It is built from an MDD's own `Mac OS ROM`.
 
-   **Any other machine — patch your own.** A complete ROM is machine-specific: the prebuilt one is an
+   **Any other NewWorld Mac — patch your own.** A complete ROM is machine-specific: the prebuilt one is an
    MDD's, and it does not contain the drivers a different model needs (it has no `ATY,RockHopper2`, for
    instance, so it is not suitable for a Mac mini G4). Run the injector against your own copy, which binds
    the driver to the USB 2.0 controller's Name Registry node:
@@ -75,6 +75,11 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
    ```
    See [BUILD.md](BUILD.md) for the toolchain this needs.
 
+   > **OldWorld Macs are out of scope.** A beige G3, 8600 or 9600 has no `Mac OS ROM` file for this to patch
+   > (on those machines OS 9's whole USB stack is disk Extensions instead), so the injector will stop with
+   > *"no Parcelfile found in the dump"*. This is not the same question as whether the machine has PCI slots:
+   > a beige G3 has slots and is still out of scope, while a Mac mini G4 has none and is in scope.
+   >
    > The injector has only ever been run against two ROMs, both from the same developer's machines. If it
    > will not patch yours, or the result will not boot, please open an issue saying which Mac and OS 9
    > version you are on.
