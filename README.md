@@ -60,13 +60,29 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
 
 ### One-time setup
 
-1. **Patch the driver into your Mac OS ROM.** Work on a *copy* of your machine's `Mac OS ROM` file (it lives in the System Folder). Run the injector, which binds the driver to the USB 2.0 controller's Name Registry node:
+1. **Get a patched Mac OS ROM.** Two ways, depending on your machine. Either way, first copy your
+   machine's `Mac OS ROM` (it lives in the System Folder) somewhere safe — you will need it to revert.
+
+   **Power Mac G4 MDD — use the prebuilt ROM.** The release page carries the exact ROM that has been
+   hardware-tested, so this needs no toolchain at all. It is built from an MDD's own `Mac OS ROM`.
+
+   **Any other machine — patch your own.** A complete ROM is machine-specific: the prebuilt one is an
+   MDD's, and it does not contain the drivers a different model needs (it has no `ATY,RockHopper2`, for
+   instance, so it is not suitable for a Mac mini G4). Run the injector against your own copy, which binds
+   the driver to the USB 2.0 controller's Name Registry node:
    ```sh
    python3 rom/usb_rom_inject.py "Mac OS ROM" -o "Mac OS ROM (USB2)"
    ```
-   Then **boot from a CD or another volume** and put the patched copy into the System Folder in place of the `Mac OS ROM`. You cannot swap it while booted from that same System Folder. **Keep the original** so you can revert, and make sure you can boot from something else before you start. See [BUILD.md](BUILD.md) for the toolchain this step needs. This is the only step that touches the ROM; everything else is an ordinary file.
+   See [BUILD.md](BUILD.md) for the toolchain this needs.
 
-   > Note: every build tested so far was produced by this injector, but only ever against two particular ROMs, and never against one from a different machine. If it will not patch yours, or the result will not boot, please open an issue saying which Mac and OS 9 version you are on.
+   > The injector has only ever been run against two ROMs, both from the same developer's machines. If it
+   > will not patch yours, or the result will not boot, please open an issue saying which Mac and OS 9
+   > version you are on.
+
+   Then **boot from a CD or another volume** and put the patched ROM into the System Folder in place of the
+   original. You cannot swap it while booted from that same System Folder. **Keep the original**, and make
+   sure you can boot from something else before you start. This is the only step that touches the ROM;
+   everything else is an ordinary file.
 
 2. **Place the helper.** Decode the helper app (`dist/USB2_Activate.bin`) on the Mac and drop it into **System Folder ▸ Startup Items**. It runs faceless at every boot: it brings the ROM driver up and then hands the front back to the Finder, showing no window. (You can also double-click it when you want it, but Startup Items is the intended home.)
 
