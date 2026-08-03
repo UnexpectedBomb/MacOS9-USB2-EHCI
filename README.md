@@ -63,8 +63,15 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
 1. **Get a patched Mac OS ROM.** Two ways, depending on your machine. Either way, first copy your
    machine's `Mac OS ROM` (it lives in the System Folder) somewhere safe — you will need it to revert.
 
-   **Power Mac G4 MDD — use the prebuilt ROM.** The release page carries the exact ROM that has been
-   hardware-tested, so this needs no toolchain at all. It is built from an MDD's own `Mac OS ROM`.
+   **Power Mac G4 MDD that boots OS 9 on its stock ROM — use the prebuilt ROM.** The release page carries
+   the exact ROM that has been hardware-tested, so this needs no toolchain at all. It is built from an MDD's
+   own `Mac OS ROM`.
+
+   > ⚠ **Not if your machine only boots OS 9 thanks to a community ROM patch** — an FW800 MDD, a Mac mini G4,
+   > an aluminium PowerBook and similar. Your `Mac OS ROM` has already been modified to make OS 9 boot at
+   > all, and the prebuilt file does not contain that work, so installing it would remove the thing making
+   > your machine boot. Use the injector on your own already-patched ROM instead: it appends a parcel rather
+   > than replacing anything, so it composes. Boot patch first, then this.
 
    **Any other NewWorld Mac — patch your own.** A complete ROM is machine-specific: the prebuilt one is an
    MDD's, and it does not contain the drivers a different model needs (it has no `ATY,RockHopper2`, for
