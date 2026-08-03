@@ -14,7 +14,17 @@
 #include <NameRegistry.h>
 #include <Gestalt.h>
 #include <DriverSynchronization.h>   /* IncrementAtomic — re-entrancy-safe ring slot claim */
+#include <Devices.h>                 /* n3/n4c: InstallDriverFromMemory + PBControlSync (block driver) */
+#include <Files.h>                   /* n7: PBUnmountVol + GetVCBQHdr — unmount on unexpected removal */
+#include <Notification.h>            /* n7 */
+#include <Shutdown.h>                /* n10: quiesce the controller before a warm reboot */            /* n7: NMInstall — "please reconnect the device", as Apple's ext does */
 #include "ehci_vhub.h"
+#include "usb_disk_blob.h"           /* n3: the block driver's PEF, embedded so we can install it ourselves */
+
+/* ph0a/ph0b: hide our high-speed ports from Apple's USL so its Expert never adopts the device and we own
+ * enumeration end to end. 0 = transparent UIM (Apple enumerates and mounts, the pre-p1a behaviour). */
+#define APPLE_HIDE 1
+#define PHASE0_TRANSPARENT 0
 
 /* v44: production verbosity flag. 0 = LEAN — the per-tick diagnostic logging is compiled out, so there is NO
  * per-tick file I/O (that per-tick FSWrite+FlushVol was the Mini's shared-IRQ enumeration timing aggravator).
@@ -62,10 +72,80 @@ unsigned long ehci_vhub_ms(void) { return (unsigned long)(gMicroAcc >> 3); }    
 #define FEAT_C_PORT_RESET      20
 static UInt16 gPortChange[15];   /* accumulated wPortChange per port (we track; RW1C-safe) */
 
+/* ★★★ n11: PORT DELIBERATELY CEDED TO THE 1.1 COMPANION — the fix for the hub thrash loop.
+ *
+ * THE BUG (found on hardware 2026-08-03 with an Apple 20" Cinema Display's built-in hub, 05ac:911d:
+ * NOTHING downstream was detected — no keyboard, no mouse, no drive). We cede a port by setting EHCI
+ * Port Owner = 1, and every "have we ceded this port?" decision then re-read that bit back out of the
+ * hardware via apple_hidden_port(). When the read-back did not agree with what we wrote, the driver
+ * concluded the port was still ours, saw CCS = 0 (which is what a companion-owned port reports), decided
+ * "the device was pulled", pushed a spurious media-gone into the block driver, reset the probe state,
+ * re-applied APPLE_HIDE, re-claimed the port and re-enumerated. Measured in ONE session: 148 handoffs and
+ * 134 RECONNECT resets, running to the end of a 14,883-line log. Apple's companion never got a stable
+ * window in which to enumerate the hub, which is why the keyboard and mouse were dead too.
+ *
+ * So this flag records the DECISION in software instead of re-deriving it from a hardware bit every pass.
+ * An intent we have acted on is ours to remember; re-reading it from the controller made a 148-iteration
+ * livelock out of one disagreement with the hardware. Cleared only by a driver reload or an explicit
+ * re-scan — NOT by anything on the port-event path, which is exactly what used to un-cede it.
+ *
+ * See also the enabled-vs-disabled precondition at the n9 cede site (~L2510): both cede paths that have
+ * always worked surrender a port that is NOT enabled, which is the EHCI-spec handoff point. */
+static volatile UInt8 gPortCeded[15];
+
+/* Have we deliberately given port p to the 1.1 companion? Software intent first, hardware bit second, so
+ * a disagreement with the controller can never resurrect a port we have already handed over. */
+static int port_ceded(int p)
+{
+    if (p < 0 || p >= 15) return 0;
+    if (gPortCeded[p]) return 1;
+    if (p >= (int)gSoftc.nPorts || gSoftc.opBase == 0) return 0;
+    return (ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)) & EHCI_PORT_OWNER) ? 1 : 0;
+}
+
+/* Phase 0a: is port p hidden from Apple's USL?
+ * ★★ n3b: hide a port only if WE OWN IT (EHCI Port Owner == 0). Per-port, read from the hardware, and
+ * self-correcting as ownership changes. REPLACES a global `!gSoftc.sharedCompanion` gate that was a
+ * booby-trap: ehci_hc_start sets sharedCompanion = 1 if ANY port is merely OCCUPIED at bring-up, so
+ *   - on the MDD card, a drive left plugged in across a reboot silently DISABLED the entire hide, and
+ *   - on the Mac mini, where kbd/mouse are ALWAYS plugged in, it would have disabled the hide
+ *     PERMANENTLY — letting Apple's Expert back onto our high-speed device and resurrecting the very
+ *     ExpertIdleTask monopoly this whole architecture exists to escape.
+ * Owner == 1 means we deliberately handed the port to the 1.1 companion (kbd/mouse, or a full/low-speed
+ * device), so it is legitimately Apple's and MUST stay visible to it. Owner == 0 means the port is ours
+ * to enumerate, so Apple must not see anything on it. Safe on both machines by construction. */
+static int apple_hidden_port(int p)
+{
+#if APPLE_HIDE
+    if (p < 0 || p >= (int)gSoftc.nPorts || gSoftc.opBase == 0) return 0;
+    /* n11: a port we have deliberately ceded stays VISIBLE to Apple no matter what the Owner bit reads
+     * back as. Re-hiding a ceded port was step 4 of the thrash loop. (Checked before the register read so
+     * this stays one MMIO access — service_ports calls this per port per heartbeat.) */
+    if (gPortCeded[p]) return 0;
+    return (ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)) & EHCI_PORT_OWNER) ? 0 : 1;
+#else
+    (void)p;
+    return 0;
+#endif
+}
+
 void ehci_vhub_port_status(int p, volatile UInt8 *out)
 {
     UInt32 pv = ehci_read32(gSoftc.opBase, EHCI_PORTSC(p));
     UInt16 st = 0, ch = gPortChange[p];
+    if (apple_hidden_port(p)) {
+        /* ph0b: THE hide point. Tell Apple this port is POWERED but has NOTHING CONNECTED (CCS=0, PED=0),
+         * while PASSING THE REAL CHANGE BITS THROUGH. So the flow is: a real connect sets gPortChange =>
+         * deliver_completions notifies Apple normally => Apple issues GET_PORT_STATUS => it reads
+         * "a change happened, but nothing is connected" (i.e. plugged-then-unplugged) => it does NOT reset
+         * or enumerate => it issues ClearPortFeature(C_PORT_CONNECTION), which clears gPortChange via the
+         * existing root-hub handler => it re-arms its status-change transfer and idles. A few cheap control
+         * transfers, no work, Apple's stack stays HEALTHY (the ph0a starvation is gone) and our device is
+         * still invisible to it. Our self-probe reads the RAW EHCI PORTSC, so it sees the real device. */
+        out[0] = (UInt8)HPS_POWER; out[1] = (UInt8)(HPS_POWER >> 8);
+        out[2] = (UInt8)ch;        out[3] = (UInt8)(ch >> 8);
+        return;
+    }
     if (pv & EHCI_PORT_CONNECT) st |= HPS_CONNECTION;
     /* HS bit is LOAD-BEARING for enumeration (r20 proved clearing it dead-ends the device on the
      * TT/split path → uim20 stub → no enumeration). OS 9's hub driver v1.5.9 DOES read the HS bit.
@@ -96,6 +176,14 @@ static volatile UInt8 gSetup[8]; static int gHaveSetup = 0;
 static int    gResetSeen = 0;            /* a downstream port has been reset => real devices exist */
 static UInt32 gVhubTick = 0;             /* service-call counter (coarse timeouts)                */
 static volatile UInt32 gIsrHits = 0;     /* r35: real-EHCI-ISR invocations where USBSTS was ours (IRQ fires) */
+/* v46: shared-IRQ storm counters. gIsrConsec = consecutive ISR entries that were ours without the SIH
+ * getting a chance to run in between (it clears the counter); gIsrConsecMax = the peak. Declared here,
+ * ahead of selfprobe_tick's v47 stall dump which reads them. Diagnostic only — nothing branches on them. */
+static volatile UInt32 gIsrConsec = 0, gIsrConsecMax = 0;
+static volatile int    gStormPainted = 0;   /* v46: storm_paint is a ONE-SHOT */
+/* lc1: set by ehci_vhub_stop_service — the heartbeat stops re-arming and the SIH stops re-enabling
+ * USBINTR, so the driver goes quiet. Declared up here because vhub_heartbeat checks it. */
+static volatile int    gServiceStop = 0;
 static volatile UInt8  gPortConn[15], gResetPending[15], gPortEvent[15], gPortResetDone[15];
 static volatile UInt32 gResetAtFrame[15];/* frame-ms at which to deassert a port reset            */
 static volatile UInt8  gResetEnabling[15];   /* r38: reset deasserted, now waiting for the port to ENABLE before reporting reset-complete */
@@ -445,6 +533,8 @@ static void down_pump(void)
     down_issue(r);
     gDownQTail++;
 }
+/* Driver-owned staging for the 8-byte control SETUP — see the copy in down_submit below. */
+static UInt8 gCtlSetupStage[8];
 static void down_submit(void *pipe, void *upp, volatile UInt8 *buf, UInt32 addr, UInt32 len, UInt32 pid, int bulkEp)
 {
     UInt32 h, depth; volatile DownReq *r;
@@ -455,6 +545,12 @@ static void down_submit(void *pipe, void *upp, volatile UInt8 *buf, UInt32 addr,
     if (len > DOWN_BUF_MAX) len = DOWN_BUF_MAX;
     r->upp = upp; r->pipe = pipe; r->dest = (void *)buf; r->addr = addr; r->pid = (UInt8)pid; r->len = len; r->olen = 0; r->obig = 0; r->bulkEp = bulkEp;
     if (pid == 2) { int i; for (i = 0; i < 8; i++) r->obuf[i] = buf[i]; r->olen = 8; r->len = 8; }
+    /* ★ Restored 2026-08-01 from the disassembly. For CONTROL transfers (bulkEp < 0) the 8-byte SETUP is
+     * ALSO staged into a driver-owned static buffer. The caller's buffer may be a File-Manager or
+     * Apple-USL buffer, and bus-mastering directly out of one of those is the documented way to corrupt a
+     * mount — always DMA from memory we own. Cheap, and it makes the SETUP independent of the caller's
+     * buffer lifetime across the queue delay. */
+    if (bulkEp < 0) { int i; for (i = 0; i < 8; i++) gCtlSetupStage[i] = buf[i]; }
     else if (pid == 0 && len > 64) { r->obig = (void *)buf; r->obiglen = len; }                         /* large OUT: write data (DMA'd from src) */
     else if (pid == 0 && len) { UInt32 i; for (i = 0; i < len; i++) r->obuf[i] = buf[i]; r->olen = len; } /* small OUT: the 31-byte CBW */
     gDownQHead = h + 1;
@@ -683,17 +779,31 @@ long ehci_vhub_bulk_xfer(void *pipe, void *complUPP, volatile UInt8 *buf,
                          UInt32 addr, UInt32 endpt, UInt32 len, UInt32 dirIn)
 {
     int i;
-    if (gMountedOnce && gPState < 10) {   /* r95: reconnect-window trace. This runs at TASK level inside Apple's
-                                           * ExpertIdleTask, so it's our window INTO the monopoly: shows whether Apple
-                                           * keeps issuing (active) or stops (quiet), whether the heartbeat SIH is alive
-                                           * (gVhubTick advancing), and whether/when the SIH armed the takeover. */
+    /* ⚠ n6d: gated OFF by default. This r95 trace fires on EVERY bulk transfer while
+     * (gMountedOnce && gPState < 10) — which is open for the WHOLE of a hot re-insert, since
+     * reconnect_reset sets gPState = 0. At 5 ring entries a call for the first 60 calls that is up to 300
+     * of the ring's 384 slots, which would starve and DROP the enumeration's own messages exactly when we
+     * need them. The r92 investigation it was written for is long closed. */
+    if (EHCI_VERBOSE && gMountedOnce && gPState < 10) {   /* r95: reconnect-window trace. Shows whether Apple keeps issuing
+                                           * (active) or stops (quiet), whether the heartbeat SIH is alive
+                                           * (gVhubTick advancing), and whether/when the SIH armed the takeover.
+                                           * ★★ n6b: these were ehci_os_log (FILE MANAGER). The original comment
+                                           * asserted "this runs at TASK level inside Apple's ExpertIdleTask" —
+                                           * true when it was written, FALSE since n5. The BOT probe's
+                                           * pb_cbw/pb_in now reach here from bot_step at INTERRUPT level, and
+                                           * this gate (gMountedOnce && gPState < 10) is OPEN during exactly one
+                                           * window: a hot re-insert, because reconnect_reset sets gPState = 0
+                                           * while gMountedOnce stays 1. So the first re-insert that got as far
+                                           * as the BOT probe would have done File Manager I/O from the SIH and
+                                           * hung — the r18 trap, third time. Found by a static audit of the
+                                           * interrupt-level call graph, not on hardware. Ring only now. */
         static UInt32 nlg = 0;
         if (nlg++ < 60) {
-            ehci_os_log("r95 bulk_xfer (reconnect window):");
-            ehci_os_logx("  complUPP (0=ours, else Apple)", (UInt32)(long)complUPP);
-            ehci_os_logx("  gVhubTick (SIH alive if climbing)", (UInt32)gVhubTick);
-            ehci_os_logx("  bulkN (done+err)", gBulkDoneN + gBulkErrN);
-            ehci_os_logx("  gSihQuiet", (UInt32)gSihQuiet); ehci_os_logx("  gSihArmed", (UInt32)gSihArmed);
+            ehci_os_ilog("r95 bulk_xfer (reconnect window):");
+            ehci_os_ilogx("  complUPP (0=ours, else Apple)", (UInt32)(long)complUPP);
+            ehci_os_ilogx("  gVhubTick (SIH alive if climbing)", (UInt32)gVhubTick);
+            ehci_os_ilogx("  bulkN (done+err)", gBulkDoneN + gBulkErrN);
+            ehci_os_ilogx("  gSihQuiet", (UInt32)gSihQuiet); ehci_os_ilogx("  gSihArmed", (UInt32)gSihArmed);
         }
     }
     if (gFenceApple && complUPP != 0) return -6640L;     /* fenced: reject the Apple driver's bulk xfer */
@@ -725,6 +835,7 @@ static UInt8  gPB[DOWN_MAX_BLOCKS * 512];   /* CBW / data / CSW scratch for the 
                                             * into gDownBuf, and only the 13-byte CSW is mirrored back here. */
 /* gPState moved up to the cross-context volatile group (r95) so bulk_xfer's diagnostic can see it. */
 static volatile UInt32 gPIdle = 0, gPLastCnt = 0, gPMark = 0, gPTag = 0x50524231UL; /* 'PRB1' */
+static volatile UInt32 gPErrMark = 0;   /* p1b: gBulkErrN snapshot at issue — lets pb_failed() see a STALL */
 static UInt32 gPBlkSize = 512, gPBlkCnt = 0;
 static volatile int gPOut = -1, gPIn = -1;    /* r91 volatile: reconnect_reset resets, self-probe/pb_* read (cross-ctx) */
 
@@ -748,27 +859,33 @@ static void pb_cbw_dir(const UInt8 *cdb, int cdbLen, UInt32 dataLen, UInt8 flags
     gPB[14]=(UInt8)cdbLen;                                                    /* CDB length */
     for (i = 0; i < cdbLen && i < 16; i++) gPB[15+i] = cdb[i];
     gPTag++;
-    gPMark = gBulkDoneN + gBulkErrN;
+    gPMark = gBulkDoneN + gBulkErrN; gPErrMark = gBulkErrN;   /* p1b: also snapshot the ERROR count (see pb_failed) */
     (void)ehci_vhub_bulk_xfer(0, 0, gPB, gBulkEP[gPOut].addr, gBulkEP[gPOut].endpt, 31, 0);   /* OUT (31B, via obuf) */
 }
 static void pb_cbw(const UInt8 *cdb, int cdbLen, UInt32 dataLen) { pb_cbw_dir(cdb, cdbLen, dataLen, 0x80); }  /* data-IN CBW */
 static void pb_in(UInt32 len)   /* read len bytes on the IN endpoint into gPB */
 {
     if (gPIn < 0) return;
-    gPMark = gBulkDoneN + gBulkErrN;
+    gPMark = gBulkDoneN + gBulkErrN; gPErrMark = gBulkErrN;   /* p1b */
     (void)ehci_vhub_bulk_xfer(0, 0, gPB, gBulkEP[gPIn].addr, gBulkEP[gPIn].endpt, len, 1);     /* IN */
 }
 static void pb_out(UInt32 len)  /* write len bytes from gPB on the OUT endpoint (large OUT via obig) */
 {
     if (gPOut < 0) return;
-    gPMark = gBulkDoneN + gBulkErrN;
+    gPMark = gBulkDoneN + gBulkErrN; gPErrMark = gBulkErrN;   /* p1b */
     (void)ehci_vhub_bulk_xfer(0, 0, gPB, gBulkEP[gPOut].addr, gBulkEP[gPOut].endpt, len, 0);   /* OUT */
 }
 static int pb_ready(void) { return (gBulkDoneN + gBulkErrN) != gPMark; }      /* prior transfer finished */
+/* ★ p1b: pb_ready() means "the transfer FINISHED" — success OR error. That blindness is why the p1a probe
+ * marched straight through a STALLed READ CAPACITY and still published 'Eusb': every state advanced on
+ * pb_ready() alone, so a halted endpoint looked like progress and state 5 parsed the leftover CBW bytes
+ * ('USBC' = 0x55534243, +1 = the bogus 0x55534244 "block count" in the log). pb_failed() distinguishes them. */
+static int pb_failed(void) { return gBulkErrN != gPErrMark; }                 /* prior transfer ERRORED (e.g. STALL) */
 #define PB_BE32(o) (((UInt32)gPB[o]<<24)|((UInt32)gPB[(o)+1]<<16)|((UInt32)gPB[(o)+2]<<8)|gPB[(o)+3])
+#define BUF_BE32(b,o) (((UInt32)(b)[o]<<24)|((UInt32)(b)[(o)+1]<<16)|((UInt32)(b)[(o)+2]<<8)|(b)[(o)+3])
 
 /* ==================== r22 (BYPASS m2): synchronous block-read SERVICE for our own disk driver ==========
- * Our block driver is a separate native PEF (installed post-selfprobe, like the eSATA driver) and can't
+ * Our block driver is a separate native PEF (installed post-selfprobe) and can't
  * reach this engine by CFM link, so the UIM publishes a service struct via Gestalt('Eusb'): a synchronous
  * BOT-read TVector + the geometry it found. The block driver's kRead calls readFn(lba,count,buf) through
  * the TVector (self-contained across fragments). Completion is SIH/timer-driven, so a task-level spin-wait
@@ -1344,7 +1461,12 @@ typedef UInt32 (*ehci_usb_tostate_fn)(UInt32 *cmd, UInt32 *sts, UInt32 *async, U
 typedef UInt32 (*ehci_usb_sim_fn)(UInt32 n);   /* r81: hot-replug async-schedule teardown/rebuild isolation test */
 typedef void   (*ehci_usb_arm_fn)(void);       /* r85: arm the [obs] probe (post-desktop) */
 typedef void   (*ehci_usb_crumb_fn)(UInt32 tag); /* r94: app idle-loop breadcrumb (diagnostic) */
-static struct { UInt32 magic; ehci_usb_rw_fn readFn; ehci_usb_rw_fn writeFn; UInt32 blkSize, blkCnt; ehci_usb_submit_fn submitFn; ehci_usb_health_fn healthFn; ehci_usb_tostate_fn toStateFn; ehci_usb_sim_fn simReplugFn; ehci_usb_arm_fn obsArmFn; ehci_usb_arm_fn tickFn; ehci_usb_crumb_fn loopFn; } gSvc;
+typedef long (*ehci_usb_quit_fn)(void);
+typedef void (*ehci_usb_drain_fn)(void);
+void ehci_vhub_notify_ejected(void);   /* n8: clean-quit hook, appended LAST so the block
+                                           * driver's shorter prefix view of this struct is unaffected */
+long ehci_vhub_prepare_quit(void);
+static struct { UInt32 magic; ehci_usb_rw_fn readFn; ehci_usb_rw_fn writeFn; UInt32 blkSize, blkCnt; ehci_usb_submit_fn submitFn; ehci_usb_health_fn healthFn; ehci_usb_tostate_fn toStateFn; ehci_usb_sim_fn simReplugFn; ehci_usb_arm_fn obsArmFn; ehci_usb_arm_fn tickFn; ehci_usb_crumb_fn loopFn; ehci_usb_quit_fn quitFn; ehci_usb_drain_fn drainFn; ehci_usb_drain_fn ejectFn; UInt32 magic2; } gSvc;
 static void ehci_vhub_publish_service(void)
 {
     gSvc.magic = 0x45555342UL;  /* 'EUSB' */
@@ -1362,6 +1484,13 @@ static void ehci_vhub_publish_service(void)
                                                     * firing but uim23 goes silent at the RECONNECT line), so the
                                                     * reconnect self-probe never re-ran. This pointer lets the
                                                     * (proven-alive) app loop tick it regardless of the USL. */
+    gSvc.drainFn = ehci_os_ilog_drain;             /* n9: the BLOCK DRIVER drains our log ring — see below */
+    gSvc.ejectFn = ehci_vhub_notify_ejected;       /* n10: block driver calls this on Finder eject */
+    gSvc.magic2  = 0x45555342UL;                   /* n9: END-marker. The block driver verifies THIS before
+                                                    * touching drainFn, so if the two fragments' views of
+                                                    * this struct ever drift it fails safe instead of
+                                                    * calling a garbage pointer. */
+    gSvc.quitFn = ehci_vhub_prepare_quit;          /* n8: activator calls this before exiting */
     gSvc.loopFn = ehci_vhub_loopcrumb;             /* r94: app idle-loop breadcrumb (armed only around a reconnect) */
     (void)NewGestaltValue('Eusb', (long)&gSvc);
     ehci_os_log("=== r34: USB block service published via Gestalt 'Eusb' (sync rw + async submit) ===");
@@ -1501,6 +1630,355 @@ void ehci_vhub_loopcrumb(UInt32 tag)
         if (tag == 3) gLoopDbg--;      /* count PASSES: decrement on the end-of-pass crumb */
     }
 }
+/* ================================================================================================
+ * PHASE 1b: control transfers, the error-checked BOT probe, self-enumeration, and the n5 async engine.
+ * Placed here because it needs recov_setup, bot_reset_host_toggles, ase_quiesce and
+ * reconnect_reset, and must precede selfprobe_tick.
+ * ================================================================================================ */
+
+/* n5: split into ISSUE and POLL so the async engine can wait without blocking. Control phases retire on
+ * the DOWN counters (gDownDone/Err/Timeouts) — NOT the bulk counters pb_ready() watches, which is a trap:
+ * a control phase never moves gBulkDoneN, so polling pb_ready() for one waits forever. */
+static UInt32 gCtlMark = 0;
+static void ctl_issue(volatile UInt8 *buf, UInt32 addr, UInt32 len, UInt32 pid)
+{
+    gCtlMark = gDownDone + gDownErr + gDownTimeouts;
+    down_submit(0, 0, buf, addr, len, pid, -1);      /* -1 = control (ep0) */
+}
+static int ctl_done(void) { return (gDownDone + gDownErr + gDownTimeouts) != gCtlMark; }
+/* The blocking form. TASK LEVEL ONLY — it spin-waits on a counter the SIH advances, so calling it below
+ * task level deadlocks (which is exactly why the n5 engine exists). */
+static int pb_ctrl_phase(volatile UInt8 *buf, UInt32 addr, UInt32 len, UInt32 pid)
+{
+    UInt32 t0;
+    ctl_issue(buf, addr, len, pid);
+    t0 = frame_ms();
+    while (!ctl_done())
+        if (frame_ms() - t0 > 800UL) return -1;      /* per-phase cap (down watchdog also backstops) */
+    return 0;
+}
+static int pb_bot_reset(void)
+{
+    UInt32 addr;
+    if (gPOut < 0 || gPIn < 0) return -100;
+    addr = gBulkEP[gPOut].addr;
+    recov_setup(0x21, 0xFF, 0x0000, 0x0000);                                /* Bulk-Only Mass Storage Reset */
+    if (pb_ctrl_phase(gRecovSetup, addr, 8, 2)) return -1;                   /*   SETUP */
+    if (pb_ctrl_phase(gPB, addr, 0, 1))         return -2;                   /*   STATUS-IN (0 len) */
+    recov_setup(0x02, 0x01, 0x0000, (UInt16)(gBulkEP[gPIn].endpt | 0x80u));  /* CLEAR_FEATURE(HALT) IN first */
+    if (pb_ctrl_phase(gRecovSetup, addr, 8, 2)) return -3;
+    if (pb_ctrl_phase(gPB, addr, 0, 1))         return -4;
+    recov_setup(0x02, 0x01, 0x0000, gBulkEP[gPOut].endpt);                   /* CLEAR_FEATURE(HALT) OUT */
+    if (pb_ctrl_phase(gRecovSetup, addr, 8, 2)) return -5;
+    if (pb_ctrl_phase(gPB, addr, 0, 1))         return -6;
+    bot_reset_host_toggles();                                               /* host bulk QHs -> DATA0 */
+    return 0;
+}
+
+#if APPLE_HIDE
+/* ==================== PHASE 1b: error-checked BOT probe ====================
+ * p1a advanced purely on pb_ready() (= "finished", success OR error) and never looked at bCSWStatus, so a
+ * STALLed READ CAPACITY looked like progress and we published 'Eusb' over a HALTED endpoint. Root cause of
+ * that stall: no TEST UNIT READY and no REQUEST SENSE anywhere. Apple's mounter used to run them before we
+ * took over, clearing the UNIT ATTENTION asserted on every fresh SET_CONFIGURATION. INQUIRY is exempt from
+ * Unit Attention, which is exactly why INQUIRY passed and the next data command stalled. Now we own
+ * enumeration, so WE must clear it. */
+static UInt8 gSense[18];
+
+/* Validate the 13-byte CSW in gPB. 0 = passed, 1 = failed, 2 = phase error, -1 = not a CSW at all. */
+static int pb_csw(void)
+{
+    if (!(gPB[0] == 0x55 && gPB[1] == 0x53 && gPB[2] == 0x42 && gPB[3] == 0x53)) return -1;   /* 'USBS' */
+    if (gPB[12] == 0x00) return 0;
+    if (gPB[12] == 0x02) return 2;
+    return 1;
+}
+static int pb_clear_halt(int slot)
+{
+    UInt32 addr; UInt16 wIndex;
+    if (slot < 0) return -1;
+    addr   = gBulkEP[slot].addr;
+    wIndex = (UInt16)(gBulkEP[slot].endpt | (gBulkEP[slot].dirIn ? 0x80u : 0u));
+    recov_setup(0x02, 0x01, 0x0000, wIndex);
+    if (pb_ctrl_phase(gRecovSetup, addr, 8, 2)) return -2;
+    if (pb_ctrl_phase(gPB, addr, 0, 1))         return -3;
+    return 0;
+}
+/* One data-IN (or no-data) BOT command, synchronous, with stall recovery. save/saveLen copies the data
+ * phase out BEFORE the 13-byte CSW read overwrites the head of gPB. Returns the CSW status, or negative
+ * on a transport failure. */
+static int pb_cmd_in(const UInt8 *cdb, int cdbLen, UInt32 dataLen, UInt8 *save, UInt32 saveLen)
+{
+    pb_cbw(cdb, cdbLen, dataLen);
+    if (pb_wait())   return -1;
+    if (pb_failed()) return -2;                              /* the CBW itself never went out */
+    if (dataLen) {
+        pb_in(dataLen);
+        if (pb_wait()) return -3;
+        if (pb_failed()) {                                   /* data phase STALLED (BOT 5.3.4): clear the
+                                                              * halt, then STILL read the CSW so the device
+                                                              * stays in sync */
+            (void)pb_clear_halt(gPIn);
+        } else if (save && saveLen) {
+            UInt32 k; for (k = 0; k < saveLen; k++) save[k] = gPB[k];
+        }
+    }
+    pb_in(13);
+    if (pb_wait()) return -4;
+    if (pb_failed()) { (void)pb_clear_halt(gPIn); return -5; }
+    return pb_csw();
+}
+/* Bring the drive to READY — the step Apple's mounter used to perform for us.
+ * ★ Both CDBs are 6 bytes and we DECLARE 6 — Apple hardcodes bCBWCBLength=12 for every command
+ * (DDK USBSampleStorageDriver), a BOT spec violation strict devices dislike. We stay honest. */
+static int pb_unit_ready(void)
+{
+    static const UInt8 cdbTur[6]   = {0x00,0,0,0,0,0};       /* TEST UNIT READY, no data */
+    static const UInt8 cdbSense[6] = {0x03,0,0,0,18,0};      /* REQUEST SENSE, 18 bytes */
+    int t, st;
+    for (t = 0; t < 8; t++) {
+        st = pb_cmd_in(cdbTur, 6, 0, 0, 0);
+        if (st == 0) { if (t) ehci_os_logx("  unit ready after TUR attempts", (UInt32)(t + 1)); return 0; }
+        if (st < 0)  { ehci_os_logx("  SELFPROBE: TUR transport failure rc", (UInt32)(long)st); return -1; }
+        gSense[2] = gSense[12] = gSense[13] = 0;
+        (void)pb_cmd_in(cdbSense, 6, 18, gSense, 18);        /* clears UNIT ATTENTION */
+        ehci_os_logx("  REQUEST SENSE senseKey/ASC/ASCQ",
+                     ((UInt32)(gSense[2] & 0x0Fu) << 16) | ((UInt32)gSense[12] << 8) | gSense[13]);
+    }
+    ehci_os_log("  SELFPROBE: device never reported ready");
+    return -2;
+}
+
+/* ==================== n3/n4c: install our own block driver — no application needed ====================
+ * The last thing a launcher was doing for us. MUST run AFTER ehci_vhub_publish_service(): the block
+ * driver's kInitialize reads the disk THROUGH the 'Eusb' service and AddDrives, and it fails with ioErr if
+ * there is no media. One-shot: installing twice would add a duplicate Drive-Queue entry. */
+static int   gBlkInstalled = 0;
+static short gBlkDref = 0;
+/* n4c: tell the ALREADY-INSTALLED block driver that the media state changed, via its private
+ * kCsUsbDiskMedia control (magic-guarded; see usb_disk.c). This is the piece hot-plug was missing: the
+ * re-enumeration and re-probe were always correct, but AddDrive + PostEvent(diskEvt) live in the block
+ * driver's kInitialize, which only ever runs at install time — so on a re-insert nothing told the File
+ * Manager the media was back. TASK LEVEL ONLY: the block driver re-scans the volume synchronously through
+ * 'Eusb' and writes its log, exactly as kInitialize does from this same context. NEVER from the ISR. */
+static void blk_notify_media(int present)
+{
+    ParamBlockRec pb;
+    OSErr e;
+    if (!gBlkInstalled || gBlkDref == 0) return;
+    pb.cntrlParam.ioCompletion = 0;
+    pb.cntrlParam.ioNamePtr    = 0;
+    pb.cntrlParam.ioVRefNum    = 0;
+    pb.cntrlParam.ioCRefNum    = gBlkDref;
+    pb.cntrlParam.csCode       = 20481;                  /* kCsUsbDiskMedia */
+    pb.cntrlParam.csParam[0]   = (short)0x4548;          /* 'EH' \  magic guard 0x45484349 */
+    pb.cntrlParam.csParam[1]   = (short)0x4349;          /* 'CI' /                         */
+    pb.cntrlParam.csParam[2]   = (short)(present ? 1 : 0);
+    e = PBControlSync(&pb);
+    ehci_os_logx(present ? "n4c media-ARRIVED control -> block driver, err"
+                         : "n4c media-GONE control -> block driver, err", (UInt32)(long)e);
+}
+/* ★★ n7: UNEXPECTED REMOVAL — unmount the volume and, if it is busy, tell the user, exactly as Apple's own
+ * "USB Mass Storage Support" extension does. Reverse-engineering that extension (re-work/) shows precisely
+ * this design: it imports UnmountVol, Eject, NMInstall and NMRemove, and carries the strings
+ *   "Please reconnect the USB device …"
+ *   "Before disconnecting the device, you must close all files and applications using it and choose
+ *    [Eject] from the [Special] menu."
+ * i.e. on removal it unmounts, and when the volume is BUSY it posts a Notification Manager alert asking the
+ * user to plug the device back in. Without this the volume just stays mounted over absent media and the
+ * File Manager eventually reports it as damaged, which is the behaviour this replaces.
+ *
+ * ⚠ TASK LEVEL ONLY, and deliberately NOT called from inside the block driver's own Control handler: doing
+ * it there would re-enter the File Manager from inside a Device Manager call. We run here, in
+ * selfprobe_tick, AFTER blk_notify_media(0)'s PBControlSync has fully returned — no nesting.
+ * ⚠ Depends on the n6e offLinErr fix: UnmountVol flushes first, and that flush must FAIL FAST against the
+ * absent device rather than stalling in the transfer engine. */
+static NMRec  gNM;
+static Str255 gNMMsg;
+static int    gNMPosted = 0;
+/* ★ n8: WORD-FOR-WORD Apple. Recovered from their USB Mass Storage Support extension's resource fork
+ * (re-work/USBMassStorageSupport.rsrc), which carries this exact text with the device name substituted
+ * between Mac Roman curly quotes (0xD2/0xD3) and CR (\r) as the line break:
+ *
+ *   Please reconnect the USB device "^".
+ *
+ *   It is in use and must be reconnected now to prevent damage to its contents.
+ *
+ *   Before disconnecting the device, you must close all files and applications using it and choose
+ *   "Eject" from the "Special" menu.
+ *
+ * The whole point of this driver is to feel like Apple shipped it, so the wording is theirs, not mine. */
+#define MACQ_OPEN  0xD2u      /* Mac Roman left  double quote */
+#define MACQ_CLOSE 0xD3u      /* Mac Roman right double quote */
+static void nm_cat(int *i, const char *s)
+{ while (*s && *i < 250) { gNMMsg[++(*i)] = (unsigned char)*s++; } }
+/* ★ n10: the USB DEVICE name, built from the INQUIRY vendor (bytes 8..15) + product (16..31), each trimmed
+ * of trailing spaces. Apple's alerts name the DEVICE, not the volume — their screenshot reads
+ * "the USB device ⟨SanDisk Ultra⟩", which is exactly vendor+product from INQUIRY. */
+static Str63 gDevName;
+static void capture_device_name(const UInt8 *inq)
+{
+    int i, n = 0, end;
+    for (end = 15; end >= 8 && inq[end] == ' '; end--) ;
+    for (i = 8; i <= end && n < 40; i++) gDevName[++n] = inq[i];
+    if (n) gDevName[++n] = ' ';
+    for (end = 31; end >= 16 && inq[end] == ' '; end--) ;
+    for (i = 16; i <= end && n < 60; i++) gDevName[++n] = inq[i];
+    gDevName[0] = (unsigned char)n;
+}
+/* ★ n10: Apple's EJECT alert, word for word from their resource fork:
+ *   "You may now remove the cartridge from the USB device ⟨name⟩ because your Macintosh is finished with it.
+ *    The cartridge will not be remounted until it is removed from the drive."
+ * Posted when the Finder ejects our volume — the case that previously produced no message at all. */
+static void notify_reconnect(const unsigned char *volName);
+void ehci_vhub_notify_ejected(void)
+{
+    int i = 0;
+    if (gNMPosted) { (void)NMRemove(&gNM); gNMPosted = 0; }
+    nm_cat(&i, "You may now remove the cartridge from the USB device ");
+    gNMMsg[++i] = MACQ_OPEN;
+    { int n; for (n = 1; n <= gDevName[0] && i < 200; n++) gNMMsg[++i] = gDevName[n]; }
+    gNMMsg[++i] = MACQ_CLOSE;
+    nm_cat(&i, " because your Macintosh is finished with it.");
+    nm_cat(&i, "\r\rThe cartridge will not be remounted until it is removed from the drive.");
+    gNMMsg[0] = (unsigned char)i;
+    gNM.qType = nmType; gNM.nmMark = 0; gNM.nmIcon = 0; gNM.nmSound = 0;
+    gNM.nmStr = gNMMsg; gNM.nmResp = (NMUPP)-1L; gNM.nmRefCon = 0;
+    if (NMInstall(&gNM) == noErr) gNMPosted = 1;
+}
+static void notify_reconnect(const unsigned char *volName)
+{
+    int i = 0, n;
+    if (gNMPosted) { (void)NMRemove(&gNM); gNMPosted = 0; }
+    nm_cat(&i, "Please reconnect the USB device ");
+    gNMMsg[++i] = MACQ_OPEN;
+    if (volName) for (n = 1; n <= volName[0] && i < 200; n++) gNMMsg[++i] = volName[n];
+    gNMMsg[++i] = MACQ_CLOSE;
+    nm_cat(&i, ".\r\rIt is in use and must be reconnected now to prevent damage to its contents.");
+    nm_cat(&i, "\r\rBefore disconnecting the device, you must close all files and applications using it "
+               "and choose ");
+    gNMMsg[++i] = MACQ_OPEN; nm_cat(&i, "Eject"); gNMMsg[++i] = MACQ_CLOSE;
+    nm_cat(&i, " from the ");
+    gNMMsg[++i] = MACQ_OPEN; nm_cat(&i, "Special"); gNMMsg[++i] = MACQ_CLOSE;
+    nm_cat(&i, " menu.");
+    gNMMsg[0] = (unsigned char)i;
+    gNM.qType    = nmType;
+    gNM.nmMark   = 0;
+    gNM.nmIcon   = 0;
+    gNM.nmSound  = 0;
+    gNM.nmStr    = gNMMsg;
+    gNM.nmResp   = (NMUPP)-1L;                         /* the NM dequeues it once the user dismisses */
+    gNM.nmRefCon = 0;
+    if (NMInstall(&gNM) == noErr) gNMPosted = 1;
+}
+/* Returns the number of OUR volumes that could NOT be unmounted (busy). notifyIfBusy posts Apple's
+ * "please reconnect" alert, which is right for a REMOVAL but not for a clean quit — hence the flag. */
+static long blk_unmount_our_volumes(int notifyIfBusy)
+{
+    QHdrPtr q = GetVCBQHdr();
+    void *v, *next;
+    long busy = 0;
+    if (!gBlkDref) return 0;
+    for (v = (void *)(q ? q->qHead : 0); v; v = next) {
+        VCB *vcb = (VCB *)v;
+        next = (void *)vcb->qLink;
+        if (vcb->vcbDRefNum != gBlkDref) continue;     /* not one of ours */
+        {
+            HParamBlockRec pb; OSErr e;
+            Str27 nm; int k;
+            for (k = 0; k <= vcb->vcbVN[0] && k < 28; k++) nm[k] = vcb->vcbVN[k];
+            pb.volumeParam.ioCompletion = 0;
+            pb.volumeParam.ioNamePtr    = 0;
+            pb.volumeParam.ioVRefNum    = vcb->vcbVRefNum;
+            e = PBUnmountVol((ParmBlkPtr)&pb);
+            ehci_os_logx("n7 UnmountVol on our volume, err", (UInt32)(long)e);
+            if (e != noErr) {
+                busy++;
+                /* Busy (fBsyErr = open files) — Apple's exact fallback: ask for the device back. */
+                if (notifyIfBusy) {
+                    ehci_os_log("n7 volume BUSY — asking the user to reconnect the device (Apple's behaviour)");
+                    notify_reconnect(nm);
+                }
+            }
+        }
+    }
+    return busy;
+}
+static void blk_unmount_removed_volumes(void) { (void)blk_unmount_our_volumes(1); }
+
+/* ★★ n8: CLEAN QUIT. The activator calls this through the 'Eusb' service BEFORE it exits.
+ * WHY IT EXISTS (found on hardware): quitting the activator with a drive still mounted SHADOWED the
+ * volume, produced "please insert the disk", and FROZE THE FINDER. The driver is not torn down at quit —
+ * the log proves no Finalize and no stop_service ran — so the cause is that slot 23 stops and something
+ * the mounted volume still needs stops with it. My earlier claim that a mounted volume keeps working with
+ * no app was reasoning, never tested, and that freeze disproves it.
+ * Until the underlying dependency is found and removed, the honest fix is to make the dangerous state
+ * unreachable: unmount our volumes before the app goes away. Returns the number that were BUSY, so the
+ * activator can refuse to quit and tell the user rather than leaving a live volume with no pump. */
+long ehci_vhub_prepare_quit(void)
+{
+    long busy = blk_unmount_our_volumes(0);
+    ehci_os_logx("n8 prepare-quit: our volumes still busy (0 = safe to quit)", (UInt32)busy);
+    return busy;
+}
+static void install_block_driver(void)
+{
+    OSErr e; short dref = 0;
+    /* n4c: already installed = this is a RE-insert. Do not install twice (and do not AddDrive twice, which
+     * would leak a drive number per insertion) — just re-announce the media. */
+    if (gBlkInstalled) { blk_notify_media(1); return; }
+    e = InstallDriverFromMemory((Ptr)gUsbDiskPef, (ByteCount)gUsbDiskPefLen, "\pUSBDisk",
+                                (RegEntryID *)&gSoftc.node, 48, 127, &dref);
+    ehci_os_logx("n3 InstallDriverFromMemory(block driver) err", (UInt32)(long)e);
+    ehci_os_logx("  drefNum", (UInt32)dref);
+    if (e == noErr && dref != 0) {
+        gBlkInstalled = 1; gBlkDref = dref;   /* n4c: keep the refNum so re-inserts can reach the driver */
+        ehci_os_log("=== n3: block driver installed BY THE DRIVER (no app) — it AddDrives + posts diskEvt, so the OS mounts ===");
+    } else {
+        ehci_os_log("!! n3: block-driver install FAILED — no mount will happen");
+    }
+}
+
+/* The whole probe, error-checked. 0 = the disk was genuinely read and geometry is sane (safe to publish).
+ * ⚠ RECONSTRUCTED: only this function's first lines were captured verbatim. The body is re-derived from
+ * its log strings (which survive in EHCIUIM_n5.strings.txt) and from the n5 async engine below, which is a
+ * faithful transcription of this same sequence. Behaviourally equivalent; not guaranteed line-identical. */
+static int selfprobe_sync(void)
+{
+    static const UInt8 cdbInq[6]  = {0x12,0,0,0,36,0};
+    static const UInt8 cdbCap[10] = {0x25,0,0,0,0,0,0,0,0,0};
+    UInt8 inq[36], cap[8], head[16], cdbRd[10];
+    int st, i;
+
+    st = pb_cmd_in(cdbInq, 6, 36, inq, 36);                  /* INQUIRY (exempt from Unit Attention) */
+    if (st != 0) { ehci_os_logx("SELFPROBE FAIL: INQUIRY st", (UInt32)(long)st); return -1; }
+    ehci_os_log("SELFPROBE INQUIRY:");
+    ehci_os_logx("  periphType", inq[0]);
+    ehci_os_logx("  vendor0_3", BUF_BE32(inq, 8));  ehci_os_logx("  vendor4_7", BUF_BE32(inq, 12));
+    ehci_os_logx("  prod0_3",   BUF_BE32(inq, 16)); ehci_os_logx("  prod4_7",   BUF_BE32(inq, 20));
+
+    if (pb_unit_ready() != 0) return -2;                     /* TUR + REQUEST SENSE until ready */
+
+    st = pb_cmd_in(cdbCap, 10, 8, cap, 8);                   /* READ CAPACITY */
+    if (st != 0) { ehci_os_logx("SELFPROBE FAIL: READ CAPACITY st", (UInt32)(long)st); return -3; }
+    gPBlkCnt  = BUF_BE32(cap, 0) + 1UL;                      /* returns the LAST LBA */
+    gPBlkSize = BUF_BE32(cap, 4);
+    ehci_os_log("SELFPROBE READ CAPACITY:");
+    ehci_os_logx("  blocks", gPBlkCnt);
+    ehci_os_logx("  blockSize", gPBlkSize);
+    if (gPBlkSize != 512UL || gPBlkCnt < 4UL) {
+        ehci_os_log("SELFPROBE FAIL: implausible geometry (stale/garbage data phase)"); return -4; }
+
+    for (i = 0; i < 10; i++) cdbRd[i] = 0;                   /* READ(10) block 0 = proof we can read */
+    cdbRd[0] = 0x28; cdbRd[8] = 1;
+    st = pb_cmd_in(cdbRd, 10, 512, head, 16);
+    if (st != 0) { ehci_os_logx("SELFPROBE FAIL: READ block 0 st", (UInt32)(long)st); return -5; }
+    ehci_os_log("SELFPROBE READ block 0:");
+    ehci_os_logx("  b0_3", BUF_BE32(head, 0));
+    return 0;
+}
+#endif /* APPLE_HIDE */
+
 /* Task-level state machine; call once per uim23. */
 static void compl_drain(void)   /* MINI FIX: deliver deferred Apple bulk completions at TASK level */
 {
@@ -1521,12 +1999,824 @@ static CsLogMirror *gCsLogPtr = 0; static int gCsDumped = 0; static UInt32 gCsLa
 typedef struct { short code; short err; long aux; } DioRecMirror;
 typedef struct { UInt32 magic; UInt32 count; DioRecMirror recs[128]; } DioLogMirror;
 static DioLogMirror *gDioLogPtr = 0;
+#if APPLE_HIDE
+/* ==================== PHASE 1a: WE enumerate the hidden device ====================
+ * With APPLE_HIDE the device is invisible to Apple's USL, so NOTHING resets the port, assigns an address,
+ * or configures it. We do the whole of USB enumeration ourselves. RECONSTRUCTED verbatim. */
+#define SELFENUM_ADDR 1u                 /* the address we assign our device (our bus, our namespace) */
+static volatile int   gSelfEnumDone = 0; /* 1 once endpoints are registered (or the port went to the companion) */
+static int            gSelfEnumPort = -1;
+static UInt32         gSelfEnumTries = 0;
+static volatile int   gSelfEnumRearm = 0;  /* set at ISR when an ENUMERATED device is pulled; consumed at task
+                                            * level, because reconnect_reset does File-Mgr logging and must
+                                            * NOT run at interrupt level */
+/* n4b: ports whose hidden connect still needs LOGGING, as a bitmask set at interrupt level and drained at
+ * task level. service_ports runs from vhub_sih / the heartbeat, and ehci_os_log is synchronous File Manager
+ * I/O — which is the r18 hang, and hung the machine again on the first connect in n4. Flags at the ISR,
+ * File-Mgr work at task level; same shape as gSelfEnumRearm above. */
+static volatile UInt32 gHideLogMask = 0;
+static UInt8 gEnumSetup[8];
+static UInt8 gEnumDesc[320];               /* device + full config descriptor scratch (a BOT config is ~32B) */
+
+static void enum_setup(UInt8 bmRT, UInt8 bReq, UInt16 wValue, UInt16 wIndex, UInt16 wLength)
+{
+    gEnumSetup[0] = bmRT;                gEnumSetup[1] = bReq;
+    gEnumSetup[2] = (UInt8)wValue;       gEnumSetup[3] = (UInt8)(wValue >> 8);
+    gEnumSetup[4] = (UInt8)wIndex;       gEnumSetup[5] = (UInt8)(wIndex >> 8);
+    gEnumSetup[6] = (UInt8)wLength;      gEnumSetup[7] = (UInt8)(wLength >> 8);
+}
+/* Control READ (device->host): SETUP -> DATA-IN -> STATUS-OUT(0). Returns bytes requested, or <0. */
+static int enum_ctrl_in(UInt8 bmRT, UInt8 bReq, UInt16 wValue, UInt16 wIndex,
+                        UInt32 addr, volatile UInt8 *dst, UInt32 len)
+{
+    enum_setup(bmRT, bReq, wValue, wIndex, (UInt16)len);
+    if (pb_ctrl_phase(gEnumSetup, addr, 8, 2)) return -1;    /* SETUP  */
+    if (pb_ctrl_phase(dst, addr, len, 1))      return -2;    /* DATA-IN */
+    if (pb_ctrl_phase(gEnumDesc, addr, 0, 0))  return -3;    /* STATUS-OUT (zero length) */
+    return (int)len;
+}
+/* Control WRITE with no data phase (SET_ADDRESS / SET_CONFIGURATION): SETUP -> STATUS-IN(0). */
+static int enum_ctrl_nodata(UInt8 bmRT, UInt8 bReq, UInt16 wValue, UInt16 wIndex, UInt32 addr)
+{
+    enum_setup(bmRT, bReq, wValue, wIndex, 0);
+    if (pb_ctrl_phase(gEnumSetup, addr, 8, 2)) return -1;    /* SETUP */
+    if (pb_ctrl_phase(gEnumDesc, addr, 0, 1))  return -2;    /* STATUS-IN (zero length) */
+    return 0;
+}
+static void enum_delay_ms(UInt32 ms) { UInt32 t0 = frame_ms(); while (frame_ms() - t0 < ms) ; }
+
+/* Drive a USB reset on port p using the existing interrupt-level machinery, then wait for the verdict.
+ * Returns 1 = port ENABLED (high-speed, ours), 0 = not enabled (full/low-speed or gone). */
+static int selfenum_reset_port(int p)
+{
+    UInt32 v, t0;
+    v = ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)) & ~EHCI_PORTSC_RW1C;
+    v &= ~EHCI_PORT_ENABLE; v |= EHCI_PORT_RESET;
+    ehci_write32(gSoftc.opBase, EHCI_PORTSC(p), v);
+    gPortResetDone[p] = 0;
+    gResetAtFrame[p] = frame_ms() + 50; gResetPending[p] = 1; gResetSeen = 1;
+    gResetEnabling[p] = 0;
+    pevt((UInt8)p, PEV_RST_ASSERT, ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)));
+    t0 = frame_ms();                                  /* service_ports (SIH) deasserts + waits for enable */
+    while (!gPortResetDone[p]) if (frame_ms() - t0 > 500UL) break;
+    return (ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)) & EHCI_PORT_ENABLE) ? 1 : 0;
+}
+
+/* Full self-enumeration of the device on port p. 0 = endpoints registered, ready for the BOT self-probe.
+ * TASK LEVEL (it blocks in pb_ctrl_phase). Superseded on the live path by the n5 async engine below, but
+ * kept as the reference the state machine was transcribed from, and for the non-APPLE_HIDE path. */
+static int selfenum_run(int p)
+{
+    UInt32 addr0 = 0, a = SELFENUM_ADDR, tot, o;
+    int epIn = -1, epOut = -1, mpIn = 512, mpOut = 512, inMSC = 0, iface = -1, cfgVal = 1;
+    UInt32 portsc;
+
+    ehci_os_log("=== SELFENUM: enumerating the hidden device OURSELVES (no Apple) ===");
+    ehci_os_logx("  port", (UInt32)p);
+
+    /* 1. Reset the port and read the speed verdict (EHCI enables the port only for HIGH SPEED). */
+    if (!selfenum_reset_port(p)) {
+        portsc = ehci_read32(gSoftc.opBase, EHCI_PORTSC(p));
+        if (portsc & EHCI_PORT_CONNECT) {
+            /* Not high speed => this device belongs to the 1.1 companion. Hand the PORT over (EHCI Port
+             * Owner = 1): the companion sees a fresh connect and Apple's NATIVE OHCI enumerates it. This is
+             * the OS-X routing rule ("connected but not enabled after reset" = the full-speed hand-off
+             * signal, NOT an error) and it is already HW-proven on this machine via CONFIGFLAG=0. */
+            UInt32 w = ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)) & ~EHCI_PORTSC_RW1C;
+            w |= EHCI_PORT_OWNER;
+            ehci_write32(gSoftc.opBase, EHCI_PORTSC(p), w);
+            gPortCeded[p] = 1;                        /* n11: record the decision, don't re-read it back */
+            ehci_os_log("  SELFENUM: not high-speed (port not enabled after reset) -> handed port to the 1.1 companion");
+            ehci_os_logx("  portsc", portsc);
+            gSelfEnumDone = 1;                        /* the companion owns it now; don't retry */
+            return -1;
+        }
+        ehci_os_log("  SELFENUM: port did not enable and nothing is connected -> abort");
+        return -2;
+    }
+    ehci_os_logx("  port ENABLED at high speed; portsc", ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)));
+
+    /* 2. Device descriptor at address 0 (first 8 bytes give bMaxPacketSize0). */
+    gEnumDesc[0] = gEnumDesc[1] = 0;
+    if (enum_ctrl_in(0x80, 0x06, 0x0100, 0, addr0, gEnumDesc, 8) < 0) {
+        ehci_os_log("  SELFENUM FAIL: GET_DESCRIPTOR(device,8) @addr0"); return -3; }
+    /* VALIDATE: pb_ctrl_phase only detects a TIMEOUT (no completion), not an error status — a STALLed phase
+     * still bumps the completion counters and looks like success. */
+    if (gEnumDesc[1] != 0x01 || gEnumDesc[0] < 18) {
+        ehci_os_logx("  SELFENUM FAIL: bad device descriptor @addr0 (type/len)",
+                     ((UInt32)gEnumDesc[1] << 8) | gEnumDesc[0]); return -3; }
+    ehci_os_logx("  addr0 devDesc bLength/bMaxPacketSize0", ((UInt32)gEnumDesc[0] << 8) | gEnumDesc[7]);
+
+    /* 3. SET_ADDRESS, then the mandatory recovery time before using the new address. */
+    if (enum_ctrl_nodata(0x00, 0x05, (UInt16)a, 0, addr0) < 0) {
+        ehci_os_log("  SELFENUM FAIL: SET_ADDRESS"); return -4; }
+    enum_delay_ms(4);
+    ehci_os_logx("  SET_ADDRESS ok; device now at", a);
+
+    /* 4. Full device descriptor at the new address (confirms the address took). */
+    gEnumDesc[0] = gEnumDesc[1] = 0;
+    if (enum_ctrl_in(0x80, 0x06, 0x0100, 0, a, gEnumDesc, 18) < 0) {
+        ehci_os_log("  SELFENUM FAIL: GET_DESCRIPTOR(device,18) @new addr"); return -5; }
+    if (gEnumDesc[1] != 0x01) {   /* the address did not take, or the read stalled */
+        ehci_os_logx("  SELFENUM FAIL: bad device descriptor at new addr (type)", (UInt32)gEnumDesc[1]); return -5; }
+    ehci_os_logx("  VID", ((UInt32)gEnumDesc[9] << 8) | gEnumDesc[8]);
+    ehci_os_logx("  PID", ((UInt32)gEnumDesc[11] << 8) | gEnumDesc[10]);
+
+    /* 5. Config descriptor header -> wTotalLength, then the whole thing. */
+    gEnumDesc[0] = gEnumDesc[1] = 0;
+    if (enum_ctrl_in(0x80, 0x06, 0x0200, 0, a, gEnumDesc, 9) < 0) {
+        ehci_os_log("  SELFENUM FAIL: GET_DESCRIPTOR(config,9)"); return -6; }
+    if (gEnumDesc[1] != 0x02) {   /* bDescriptorType 2 = CONFIGURATION */
+        ehci_os_logx("  SELFENUM FAIL: bad config descriptor (type)", (UInt32)gEnumDesc[1]); return -6; }
+    tot = ((UInt32)gEnumDesc[3] << 8) | gEnumDesc[2];
+    if (tot < 9 || tot > sizeof(gEnumDesc)) { ehci_os_logx("  SELFENUM FAIL: bad wTotalLength", tot); return -7; }
+    gEnumDesc[1] = 0;
+    if (enum_ctrl_in(0x80, 0x06, 0x0200, 0, a, gEnumDesc, tot) < 0) {
+        ehci_os_log("  SELFENUM FAIL: GET_DESCRIPTOR(config,full)"); return -8; }
+    if (gEnumDesc[1] != 0x02) {
+        ehci_os_logx("  SELFENUM FAIL: bad full config descriptor (type)", (UInt32)gEnumDesc[1]); return -8; }
+    cfgVal = gEnumDesc[5];
+    ehci_os_logx("  config wTotalLength", tot);
+    ehci_os_logx("  bConfigurationValue", (UInt32)cfgVal);
+
+    /* 6. Walk the config: find the Mass-Storage / Bulk-Only interface, then ITS bulk endpoints.
+     *    (interface: class 0x08, protocol 0x50 = BOT, altSetting 0; endpoint: bmAttributes&3 == 2 = bulk) */
+    o = 0;
+    while (o + 2u <= tot) {
+        UInt8 blen = gEnumDesc[o], btype = gEnumDesc[o + 1];
+        if (blen == 0) break;
+        if (btype == 0x04 && blen >= 9) {                          /* INTERFACE */
+            inMSC = (gEnumDesc[o + 5] == 0x08 && gEnumDesc[o + 7] == 0x50 && gEnumDesc[o + 3] == 0x00);
+            if (inMSC) iface = gEnumDesc[o + 2];
+        } else if (btype == 0x05 && blen >= 7 && inMSC) {           /* ENDPOINT of that interface */
+            UInt8 eaddr = gEnumDesc[o + 2], attr = gEnumDesc[o + 3];
+            int mp = (int)(((UInt32)gEnumDesc[o + 5] << 8) | gEnumDesc[o + 4]);
+            if ((attr & 0x03) == 0x02) {                           /* bulk */
+                if (eaddr & 0x80) { if (epIn  < 0) { epIn  = eaddr & 0x0F; mpIn  = mp ? mp : 512; } }
+                else              { if (epOut < 0) { epOut = eaddr & 0x0F; mpOut = mp ? mp : 512; } }
+            }
+        }
+        o += blen;
+    }
+    if (iface < 0 || epIn < 0 || epOut < 0) {
+        ehci_os_log("  SELFENUM FAIL: no Mass-Storage/Bulk-Only interface with both bulk endpoints");
+        ehci_os_logx("  iface", (UInt32)iface); ehci_os_logx("  epIn", (UInt32)epIn); ehci_os_logx("  epOut", (UInt32)epOut);
+        return -9;
+    }
+    ehci_os_logx("  MSC interface", (UInt32)iface);
+    ehci_os_logx("  bulk-IN ep / maxpkt",  ((UInt32)epIn  << 16) | (UInt32)mpIn);
+    ehci_os_logx("  bulk-OUT ep / maxpkt", ((UInt32)epOut << 16) | (UInt32)mpOut);
+
+    /* 7. Configure the device (bulk endpoints are dead until this is done). */
+    if (enum_ctrl_nodata(0x00, 0x09, (UInt16)cfgVal, 0, a) < 0) {
+        ehci_os_log("  SELFENUM FAIL: SET_CONFIGURATION"); return -10; }
+    ehci_os_log("  SET_CONFIGURATION ok");
+
+    /* 8. Register the bulk endpoints — exactly what Apple's slot-6 CreateBulkEndpoint used to do. */
+    (void)ehci_vhub_create_bulk(a, (UInt32)epOut, 0, (UInt32)mpOut);
+    (void)ehci_vhub_create_bulk(a, (UInt32)epIn,  1, (UInt32)mpIn);
+    ehci_os_log("  bulk endpoints registered (we replaced Apple's CreateBulkEndpoint)");
+    return 0;
+}
+
+/* ==================== n3b: PORT MAP / insert visibility ====================
+ * Every port's raw PORTSC is logged whenever it changes, so (a) any insert is visible even when we do not
+ * act on it, and (b) the values are a permanent SOCKET -> PORT NUMBER map. Task level only. Active only
+ * while we have NOT yet enumerated, so it can never spam a working session.
+ * Log format 0xPnnnn: top nibble = port, low 16 = PORTSC.
+ *   bit0 CCS  bit1 CSC  bit2 PED(=high speed)  bit8 PR  bits11:10 LineStatus  bit12 PP
+ *   bit13 Port Owner (1 = the 1.1 companion owns it, 0 = we do) */
+static UInt32 gPmLast[15];
+static UInt32 gPmNextIdle = 0;
+static int    gPmPrimed = 0;
+static void portmap_tick(void)
+{
+    UInt32 now = *(volatile UInt32 *)0x016AUL;          /* lowmem Ticks (60 Hz) */
+    int p, np = (int)gSoftc.nPorts, changed = 0;
+    if (gSelfEnumDone || np <= 0 || np > 15 || gSoftc.opBase == 0) return;
+    for (p = 0; p < np; p++) {
+        UInt32 v = ehci_read32(gSoftc.opBase, EHCI_PORTSC(p));
+        if ((v & 0x3005UL) != (gPmLast[p] & 0x3005UL)) changed = 1;   /* CCS|PED|PP|Owner — ignore RW1C churn */
+        gPmLast[p] = v;
+    }
+    if (!gPmPrimed) { gPmPrimed = 1; changed = 1; }      /* always emit one baseline map */
+    if (!changed && (long)(now - gPmNextIdle) < 0) return;
+    gPmNextIdle = now + 900UL;                           /* ~15 s between idle reminders */
+    ehci_os_log(changed ? "n3b PORTMAP (CHANGED) 0xPnnnn = port<<28 | PORTSC; bit0=connected bit2=enabled bit12=power bit13=companion-owns:"
+                        : "n3b PORTMAP (idle — nothing connected on any port we poll):");
+    for (p = 0; p < np; p++)
+        ehci_os_logx("  port|PORTSC", ((UInt32)p << 28) | (gPmLast[p] & 0xFFFFUL));
+}
+
+/* ================================================================================================
+ * ★★★★ n5: ASYNC ENUMERATION + PROBE ENGINE ★★★★
+ *
+ * WHY: everything above runs at TASK level and blocks in pb_wait()/pb_ctrl_phase, which spin-wait on
+ * counters the SIH updates. That is why discovery has always needed an application — slot 23 is only
+ * called from USLPolledProcessDoneQueue, i.e. an app's pump loop. Calling the synchronous probe from our
+ * own heartbeat instead would DEADLOCK: the heartbeat IS the thing that would have to retire the transfer
+ * it is now blocked waiting for. So the sequence has to stop blocking. Same sequence, every wait a return.
+ *
+ * Three layers, so the conversion stays faithful to the proven code above rather than being a rewrite:
+ *   ctl_step()   one control transfer (SETUP -> [DATA] -> STATUS) = enum_ctrl_in/nodata
+ *   bot_step()   one BOT command (CBW -> [DATA] -> CSW) incl. BOT 5.3.4 stall recovery = pb_cmd_in
+ *   as_advance() the enumeration + probe sequence = selfenum_run then selfprobe_sync
+ *
+ * ⚠ RUNS AT INTERRUPT LEVEL. Every log call here MUST be ehci_os_ilog/ilogx (the ring), never
+ * ehci_os_log — that one is File Manager and hangs the machine below task level (r18, and again in n4).
+ * ================================================================================================ */
+
+/* ---------- layer 1: one control transfer ---------- */
+typedef struct {
+    int    pc, dir;            /* dir: 1 = control-IN (has DATA-IN), 0 = no-data */
+    UInt32 addr, len, t0;
+    volatile UInt8 *buf;
+} CtlState;
+static CtlState gCtl;
+static void ctl_begin(UInt8 bmRT, UInt8 bReq, UInt16 wValue, UInt16 wIndex,
+                      UInt32 addr, volatile UInt8 *buf, UInt32 len, int dir)
+{
+    enum_setup(bmRT, bReq, wValue, wIndex, (UInt16)(dir ? len : 0));
+    gCtl.pc = 0; gCtl.addr = addr; gCtl.buf = buf; gCtl.len = len; gCtl.dir = dir;
+}
+/* 0 = still running, 1 = complete, -1 = failed. Waits on ctl_done() — the DOWN counters — never pb_ready(). */
+static int ctl_step(void)
+{
+    switch (gCtl.pc) {
+    case 0:
+        ctl_issue(gEnumSetup, gCtl.addr, 8, 2);                         /* SETUP */
+        gCtl.pc = 1; gCtl.t0 = frame_ms(); return 0;
+    case 1:
+        if (!ctl_done()) return (frame_ms() - gCtl.t0 > 800UL) ? -1 : 0;
+        if (gCtl.dir) {
+            ctl_issue(gCtl.buf, gCtl.addr, gCtl.len, 1);                /* DATA-IN */
+            gCtl.pc = 2; gCtl.t0 = frame_ms(); return 0;
+        }
+        ctl_issue(gEnumDesc, gCtl.addr, 0, 1);                          /* STATUS-IN (no-data control) */
+        gCtl.pc = 3; gCtl.t0 = frame_ms(); return 0;
+    case 2:
+        if (!ctl_done()) return (frame_ms() - gCtl.t0 > 800UL) ? -1 : 0;
+        ctl_issue(gEnumDesc, gCtl.addr, 0, 0);                          /* STATUS-OUT */
+        gCtl.pc = 3; gCtl.t0 = frame_ms(); return 0;
+    case 3:
+        if (!ctl_done()) return (frame_ms() - gCtl.t0 > 800UL) ? -1 : 0;
+        return 1;
+    }
+    return -1;
+}
+
+/* ---------- layer 2: one BOT command (the async pb_cmd_in) ---------- */
+typedef struct {
+    int    pc, cdbLen, csw, stalled;
+    UInt32 dataLen, saveLen, t0;
+    const UInt8 *cdb;
+    UInt8 *save;
+} BotState;
+static BotState gBot;
+static void bot_begin(const UInt8 *cdb, int cdbLen, UInt32 dataLen, UInt8 *save, UInt32 saveLen)
+{
+    gBot.pc = 0; gBot.cdb = cdb; gBot.cdbLen = cdbLen; gBot.dataLen = dataLen;
+    gBot.save = save; gBot.saveLen = saveLen; gBot.csw = -1; gBot.stalled = 0;
+}
+/* 0 = running, 1 = complete (gBot.csw = CSW status), -1 = transport failure. */
+static int bot_step(void)
+{
+    switch (gBot.pc) {
+    case 0:
+        pb_cbw(gBot.cdb, gBot.cdbLen, gBot.dataLen);
+        gBot.pc = 1; gBot.t0 = frame_ms(); return 0;
+    case 1:
+        if (!pb_ready()) return (frame_ms() - gBot.t0 > 800UL) ? -1 : 0;
+        if (pb_failed()) return -1;                       /* the CBW itself never went out */
+        if (gBot.dataLen) { pb_in(gBot.dataLen); gBot.pc = 2; gBot.t0 = frame_ms(); return 0; }
+        pb_in(13); gBot.pc = 4; gBot.t0 = frame_ms(); return 0;
+    case 2:
+        if (!pb_ready()) return (frame_ms() - gBot.t0 > 800UL) ? -1 : 0;
+        if (pb_failed()) {                                /* data phase STALLED (BOT 5.3.4): clear the halt,
+                                                           * but STILL read the CSW so the device stays in sync */
+            gBot.stalled = 1;
+            ctl_begin(0x02, 0x01, 0x0000,
+                      (UInt16)(gBulkEP[gPIn].endpt | 0x80u), gBulkEP[gPIn].addr, gPB, 0, 0);
+            gBot.pc = 3; return 0;
+        }
+        if (gBot.save && gBot.saveLen) {
+            UInt32 k; for (k = 0; k < gBot.saveLen; k++) gBot.save[k] = gPB[k];
+        }
+        pb_in(13); gBot.pc = 4; gBot.t0 = frame_ms(); return 0;
+    case 3: {
+        int r = ctl_step();
+        if (r == 0) return 0;
+        pb_in(13); gBot.pc = 4; gBot.t0 = frame_ms(); return 0;   /* recovery is advisory; read the CSW */
+    }
+    case 4:
+        if (!pb_ready()) return (frame_ms() - gBot.t0 > 800UL) ? -1 : 0;
+        if (pb_failed()) {
+            ctl_begin(0x02, 0x01, 0x0000,
+                      (UInt16)(gBulkEP[gPIn].endpt | 0x80u), gBulkEP[gPIn].addr, gPB, 0, 0);
+            gBot.pc = 5; return 0;
+        }
+        gBot.csw = pb_csw(); return 1;
+    case 5: {
+        int r = ctl_step();
+        if (r == 0) return 0;
+        return -1;                                        /* the CSW itself stalled = transport failure */
+    }
+    }
+    return -1;
+}
+
+/* ---------- layer 3: the enumeration + probe sequence ---------- */
+/* CDBs must have STATIC lifetime: bot_begin only keeps a pointer and the command is issued across ticks,
+ * long after the caller's frame is gone. */
+static const UInt8 gAsCdbInq[6]   = {0x12,0,0,0,36,0};          /* INQUIRY            */
+static const UInt8 gAsCdbTur[6]   = {0x00,0,0,0,0,0};           /* TEST UNIT READY    */
+static const UInt8 gAsCdbSense[6] = {0x03,0,0,0,18,0};          /* REQUEST SENSE, 18B */
+static const UInt8 gAsCdbCap[10]  = {0x25,0,0,0,0,0,0,0,0,0};   /* READ CAPACITY      */
+static UInt8 gAsCdbRd[10];                                      /* READ(10), built per use */
+static UInt8 gAsInq[36], gAsCap[8], gAsBlk0[512];
+typedef struct {
+    int    pc, port, running, done, failed;
+    UInt32 addr, tot, o, t0;
+    int    epIn, epOut, mpIn, mpOut, inMSC, iface, cfgVal, tur;
+    UInt32 blocks, blkSize;
+} AsState;
+static AsState gAs;
+static volatile int gAsBusy = 0;      /* re-entrancy guard: heartbeat and uim23 may both call in */
+/* Set at interrupt level when the async probe has fully verified the medium; consumed at TASK level, which
+ * is where 'Eusb' publication and the block-driver handoff have to happen (NewGestaltValue and
+ * InstallDriverFromMemory are both task-only). This flag IS the interrupt->task boundary of the design. */
+static volatile int gAsProbeOK = 0;
+/* Set by the engine at interrupt level when it needs TASK level to register the bulk endpoints; cleared by
+ * selfprobe_tick once done. create_bulk must not run from the SIH — see the note at its call site. */
+static volatile int gAsNeedBulk = 0;
+
+static void as_fail(const char *why, UInt32 v)
+{
+    ehci_os_ilogx(why, v);
+    gAs.running = 0; gAs.failed = 1; gAs.pc = 0;
+    gSelfEnumTries++;                                     /* bounded retry, same policy as the sync path */
+}
+/* Park until the outstanding transfer retires; on timeout, abort the whole sequence. */
+#define AS_AWAIT(L) \
+    do { gAs.pc = (L); gAs.t0 = frame_ms(); return; \
+         case (L): \
+            if (!pb_ready()) { \
+                if (frame_ms() - gAs.t0 > 800UL) { as_fail("!! n5 SELFENUM/PROBE: transfer TIMEOUT at step", (L)); return; } \
+                return; \
+            } \
+    } while (0)
+/* Park for a fixed delay (the SET_ADDRESS recovery time). */
+#define AS_DELAY(L, MS) \
+    do { gAs.pc = (L); gAs.t0 = frame_ms(); return; \
+         case (L): if (frame_ms() - gAs.t0 < (UInt32)(MS)) return; \
+    } while (0)
+/* Drive the control sub-machine to completion. */
+#define AS_CTL(L) \
+    do { gAs.pc = (L); return; \
+         case (L): { int _r = ctl_step(); \
+                     if (_r == 0) return; \
+                     if (_r < 0) { as_fail("!! n5 SELFENUM: control transfer FAILED at step", (L)); return; } } \
+    } while (0)
+/* Park until TASK level has done a piece of work the engine must not do from the SIH. */
+#define AS_TASK(L) \
+    do { gAs.pc = (L); gAs.t0 = frame_ms(); return; \
+         case (L): \
+            if (gAsNeedBulk) { \
+                if (frame_ms() - gAs.t0 > 5000UL) { as_fail("!! n5: task-level endpoint registration never ran (no pump?)", (L)); } \
+                return; \
+            } \
+    } while (0)
+/* Drive the BOT sub-machine to completion. */
+#define AS_BOT(L) \
+    do { gAs.pc = (L); return; \
+         case (L): { int _r = bot_step(); \
+                     if (_r == 0) return; \
+                     if (_r < 0) { as_fail("!! n5 PROBE: BOT transport failure at step", (L)); return; } } \
+    } while (0)
+
+static void as_advance(void)
+{
+    switch (gAs.pc) {
+    case 0:
+        ehci_os_ilog("=== n5 SELFENUM (ASYNC, no application): enumerating the hidden device ourselves ===");
+        ehci_os_ilogx("  port", (UInt32)gAs.port);
+        gAs.addr = SELFENUM_ADDR;
+        gAs.epIn = gAs.epOut = -1; gAs.mpIn = gAs.mpOut = 512;
+        gAs.inMSC = 0; gAs.iface = -1; gAs.cfgVal = 1; gAs.tur = 0;
+        /* ★★ 0. CONNECT DEBOUNCE — USB 2.0 §7.1.7.3 T_ATTDB = 100 ms. A port must be debounced for 100 ms
+         * after a connect is detected and BEFORE reset is issued; resetting a device that has not finished
+         * attaching is exactly what makes it bounce.
+         * NEITHER path ever implemented this explicitly. The synchronous selfenum satisfied it BY ACCIDENT:
+         * it ran from selfprobe_tick (uim23), which the app pumps at roughly 10/sec, so the reset landed
+         * ~100 ms after the connect. This engine arms from the 8 ms heartbeat and reset ~8 ms after — which
+         * is why the post-reset bounce appeared with n5 and had never been seen before. The retry guard in
+         * case 1 treats the symptom; this removes the cause. */
+        gAs.t0 = frame_ms();
+        gAs.pc = 20; return;
+    case 20:
+        if (frame_ms() - gAs.t0 < 100UL) return;          /* T_ATTDB */
+        /* 1. Port reset. The existing interrupt-level machinery deasserts at +50ms and reports enable. */
+        {
+            UInt32 v = ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)) & ~EHCI_PORTSC_RW1C;
+            v &= ~EHCI_PORT_ENABLE; v |= EHCI_PORT_RESET;
+            ehci_write32(gSoftc.opBase, EHCI_PORTSC(gAs.port), v);
+            gPortResetDone[gAs.port] = 0;
+            gResetAtFrame[gAs.port] = frame_ms() + 50; gResetPending[gAs.port] = 1; gResetSeen = 1;
+            gResetEnabling[gAs.port] = 0;
+            pevt((UInt8)gAs.port, PEV_RST_ASSERT, ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)));
+        }
+        gAs.pc = 1; gAs.t0 = frame_ms(); return;
+    case 1:
+        if (!gPortResetDone[gAs.port] && frame_ms() - gAs.t0 <= 500UL) return;
+        /* ★★ BOUNCE GUARD (the n5 bug, found on hardware 2026-08-01). The port events from a real insert
+         * read: connect -> reset-assert -> reset-deassert -> ENABLED -> **DISCONNECT**. The device bounces
+         * right after a perfectly good high-speed reset. The synchronous selfenum tolerated this because
+         * reset-and-check happened inside one tight task-level block; this engine spreads the check across
+         * heartbeats, so the transient lands exactly in the middle of the decision — we read PORTSC while
+         * CCS was momentarily down, concluded "not high-speed", and handed the port to the companion.
+         * That handover is a ONE-WAY DOOR (Owner=1 + gSelfEnumDone=1): Apple's OHCI then mounts the drive
+         * at 1.1 and we never retry. It is what produced every "mounted as USB 1.1" run.
+         * service_ports clears gSelfEnumPort to -1 the instant it sees a disconnect, so that is our
+         * bounce flag: abandon this attempt WITHOUT surrendering the port, and let the re-connect re-arm. */
+        if (gSelfEnumPort != gAs.port) {
+            ehci_os_ilog("  n5 SELFENUM: device bounced during reset — abandoning this attempt, port KEPT");
+            gAs.running = 0; gAs.pc = 0;      /* deliberately NOT gSelfEnumDone, NOT a tries++ */
+            return;
+        }
+        if (!(ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)) & EHCI_PORT_ENABLE)) {
+            UInt32 portsc = ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port));
+            if (portsc & EHCI_PORT_CONNECT) {
+                /* Not enabled but still connected. This is the documented full/low-speed hand-off signal —
+                 * BUT only trust it once the bounce has had chances to settle, because a mid-bounce read
+                 * looks identical. Retry first; surrender the port only on the last attempt. */
+                if (gSelfEnumTries + 1 < 3u) {
+                    as_fail("!! n5 SELFENUM: not enabled but still connected — retrying before surrendering; portsc",
+                            portsc);
+                    return;
+                }
+                /* Genuinely not high speed => the 1.1 companion's device. Hand the PORT over (Owner = 1). */
+                { UInt32 w = portsc & ~EHCI_PORTSC_RW1C; w |= EHCI_PORT_OWNER;
+                  ehci_write32(gSoftc.opBase, EHCI_PORTSC(gAs.port), w); }
+                gPortCeded[gAs.port] = 1;   /* n11: record the decision, don't re-read it back */
+                ehci_os_ilog("  n5 SELFENUM: not high-speed after 3 attempts -> handed the port to the 1.1 companion");
+                ehci_os_ilogx("  portsc", portsc);
+                gSelfEnumDone = 1; gAs.running = 0; gAs.pc = 0;   /* companion owns it; do not retry */
+                return;
+            }
+            as_fail("!! n5 SELFENUM: port did not enable and nothing is connected; portsc", portsc);
+            return;
+        }
+        ehci_os_ilogx("  port ENABLED at high speed; portsc",
+                      ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)));
+
+        /* 2. Device descriptor at address 0 (first 8 bytes give bMaxPacketSize0). */
+        gEnumDesc[0] = gEnumDesc[1] = 0;
+        ctl_begin(0x80, 0x06, 0x0100, 0, 0, gEnumDesc, 8, 1);
+        AS_CTL(2);
+        if (gEnumDesc[1] != 0x01 || gEnumDesc[0] < 18) {
+            as_fail("!! n5 SELFENUM: bad device descriptor @addr0 (type/len)",
+                    ((UInt32)gEnumDesc[1] << 8) | gEnumDesc[0]); return; }
+        ehci_os_ilogx("  addr0 devDesc bLength/bMaxPacketSize0", ((UInt32)gEnumDesc[0] << 8) | gEnumDesc[7]);
+
+        /* 3. SET_ADDRESS, then the mandatory recovery time before using the new address. */
+        ctl_begin(0x00, 0x05, (UInt16)gAs.addr, 0, 0, gEnumDesc, 0, 0);
+        AS_CTL(3);
+        AS_DELAY(4, 4);
+        ehci_os_ilogx("  SET_ADDRESS ok; device now at", gAs.addr);
+
+        /* 4. Full device descriptor at the new address (confirms the address took). */
+        gEnumDesc[0] = gEnumDesc[1] = 0;
+        ctl_begin(0x80, 0x06, 0x0100, 0, gAs.addr, gEnumDesc, 18, 1);
+        AS_CTL(5);
+        if (gEnumDesc[1] != 0x01) {
+            as_fail("!! n5 SELFENUM: bad device descriptor at new addr (type)", (UInt32)gEnumDesc[1]); return; }
+        ehci_os_ilogx("  VID", ((UInt32)gEnumDesc[9] << 8) | gEnumDesc[8]);
+        ehci_os_ilogx("  PID", ((UInt32)gEnumDesc[11] << 8) | gEnumDesc[10]);
+
+        /* 5. Config descriptor header -> wTotalLength, then the whole thing. */
+        gEnumDesc[0] = gEnumDesc[1] = 0;
+        ctl_begin(0x80, 0x06, 0x0200, 0, gAs.addr, gEnumDesc, 9, 1);
+        AS_CTL(6);
+        if (gEnumDesc[1] != 0x02) {
+            as_fail("!! n5 SELFENUM: bad config descriptor (type)", (UInt32)gEnumDesc[1]); return; }
+        gAs.tot = ((UInt32)gEnumDesc[3] << 8) | gEnumDesc[2];
+        if (gAs.tot < 9 || gAs.tot > sizeof(gEnumDesc)) {
+            as_fail("!! n5 SELFENUM: bad wTotalLength", gAs.tot); return; }
+        gEnumDesc[1] = 0;
+        ctl_begin(0x80, 0x06, 0x0200, 0, gAs.addr, gEnumDesc, gAs.tot, 1);
+        AS_CTL(7);
+        if (gEnumDesc[1] != 0x02) {
+            as_fail("!! n5 SELFENUM: bad full config descriptor (type)", (UInt32)gEnumDesc[1]); return; }
+        gAs.cfgVal = gEnumDesc[5];
+        ehci_os_ilogx("  config wTotalLength", gAs.tot);
+        ehci_os_ilogx("  bConfigurationValue", (UInt32)gAs.cfgVal);
+
+        /* 6. Walk the config for the Mass-Storage / Bulk-Only interface and ITS bulk endpoints.
+         *    Pure computation — no waiting, so this stays exactly as the synchronous version. */
+        gAs.o = 0;
+        while (gAs.o + 2u <= gAs.tot) {
+            UInt8 blen = gEnumDesc[gAs.o], btype = gEnumDesc[gAs.o + 1];
+            if (blen == 0) break;
+            if (btype == 0x04 && blen >= 9) {                          /* INTERFACE */
+                gAs.inMSC = (gEnumDesc[gAs.o + 5] == 0x08 && gEnumDesc[gAs.o + 7] == 0x50 &&
+                             gEnumDesc[gAs.o + 3] == 0x00);
+                if (gAs.inMSC) gAs.iface = gEnumDesc[gAs.o + 2];
+            } else if (btype == 0x05 && blen >= 7 && gAs.inMSC) {      /* ENDPOINT of that interface */
+                UInt8 eaddr = gEnumDesc[gAs.o + 2], attr = gEnumDesc[gAs.o + 3];
+                int mp = (int)(((UInt32)gEnumDesc[gAs.o + 5] << 8) | gEnumDesc[gAs.o + 4]);
+                if ((attr & 0x03) == 0x02) {
+                    if (eaddr & 0x80) { if (gAs.epIn  < 0) { gAs.epIn  = eaddr & 0x0F; gAs.mpIn  = mp ? mp : 512; } }
+                    else              { if (gAs.epOut < 0) { gAs.epOut = eaddr & 0x0F; gAs.mpOut = mp ? mp : 512; } }
+                }
+            }
+            gAs.o += blen;
+        }
+        if (gAs.iface < 0 || gAs.epIn < 0 || gAs.epOut < 0) {
+            /* ★★ n9 COEXISTENCE FIX. This device enumerated fine at high speed but is not Bulk-Only mass
+             * storage — a USB 2.0 hub, webcam, printer, whatever. We cannot drive it and we never will.
+             * The OLD behaviour was as_fail() -> three retries -> give up, which left the port HIDDEN from
+             * Apple (Owner = 0 keeps apple_hidden_port() true) and unused by us: the device ended up
+             * invisible to the OS *and* dead, which is STRICTLY WORSE than not installing this driver at
+             * all — without us the companion would have run it at 1.1. Found by code review, not on
+             * hardware, and it is any non-storage USB 2.0 device, so it is not an edge case.
+             * Do exactly what the not-high-speed path does: give the port to the 1.1 companion and stop.
+             *
+             * ★★★ n11: DISABLE THE PORT BEFORE SURRENDERING IT. n9 set Owner = 1 on a port that was still
+             * ENABLED at high speed, and the bit never read back as 1 — the device stayed on the HS bus and
+             * the companion never saw it. Both cede paths that have always worked (the two not-high-speed
+             * sites) surrender a port that is NOT enabled, which is precisely the EHCI-spec handoff point:
+             * §2.3.9 says software releases ownership "when the attached device is not a high-speed device",
+             * i.e. after a reset that did not enable the port. Here the device DID chirp high-speed and we
+             * enumerated it, so we have to undo that first: clear Port Enable to take it off the HS bus, and
+             * only then hand the port over, so the companion sees a fresh connect and enumerates it at full
+             * speed. The read-backs are logged either side because this is a hardware-behaviour claim and the
+             * next run should settle it rather than leave it inferred. */
+            UInt32 pv = ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port));
+            UInt32 w  = pv & ~EHCI_PORTSC_RW1C;
+            w &= ~EHCI_PORT_ENABLE;                  /* off the high-speed bus first */
+            ehci_write32(gSoftc.opBase, EHCI_PORTSC(gAs.port), w);
+            (void)ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port));   /* posted-write flush */
+            w = ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)) & ~EHCI_PORTSC_RW1C;
+            w |= EHCI_PORT_OWNER;                    /* now the spec's precondition holds */
+            ehci_write32(gSoftc.opBase, EHCI_PORTSC(gAs.port), w);
+            (void)ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port));
+            gPortCeded[gAs.port] = 1;                /* n11: remember the DECISION — see the flag's comment */
+            ehci_os_ilog("  n9 SELFENUM: high-speed but NOT Bulk-Only mass storage -> handed the port to the 1.1 companion");
+            ehci_os_ilogx("  iface/epIn/epOut",
+                          ((UInt32)(gAs.iface & 0xFF) << 16) | ((UInt32)(gAs.epIn & 0xFF) << 8) | (UInt32)(gAs.epOut & 0xFF));
+            ehci_os_ilogx("  n11 PORTSC before cede", pv);
+            ehci_os_ilogx("  n11 PORTSC after cede (bit13 = 0x2000 set means the handoff took)",
+                          ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)));
+            gSelfEnumDone = 1; gAs.running = 0; gAs.pc = 0;   /* Apple owns it now; do not retry */
+            return;
+        }
+        ehci_os_ilogx("  MSC interface", (UInt32)gAs.iface);
+        ehci_os_ilogx("  bulk-IN ep / maxpkt",  ((UInt32)gAs.epIn  << 16) | (UInt32)gAs.mpIn);
+        ehci_os_ilogx("  bulk-OUT ep / maxpkt", ((UInt32)gAs.epOut << 16) | (UInt32)gAs.mpOut);
+
+        /* 7. Configure the device (bulk endpoints are dead until this is done). */
+        ctl_begin(0x00, 0x09, (UInt16)gAs.cfgVal, 0, gAs.addr, gEnumDesc, 0, 0);
+        AS_CTL(8);
+        ehci_os_ilog("  SET_CONFIGURATION ok");
+
+        /* 8. Register the bulk endpoints (what Apple's slot-6 CreateBulkEndpoint used to do).
+         * ★★ HAND THIS TO TASK LEVEL. ehci_vhub_create_bulk() calls ase_quiesce() — a 200,000-iteration
+         * MMIO spin waiting for the async schedule to stop — and then epq_program()s the bulk QHs.
+         * Reprogramming a QH from the SIH is the documented r84/r85 freeze, and the spin alone is far too
+         * long to sit in an interrupt handler. In n4c this only ever ran at TASK level, from selfenum_run;
+         * moving enumeration to interrupt level in n5 quietly dragged it below task level with it. That is
+         * what froze the machine on hot re-insert: the reinsert path had just quiesced and re-armed ASE via
+         * reconnect_reset, so create_bulk hit a live ring from the SIH.
+         * Same interrupt->task boundary as gAsProbeOK: park here, let selfprobe_tick do it, then resume. */
+        gAsNeedBulk = 1;
+        AS_TASK(15);
+        if (gPOut < 0 || gPIn < 0) {
+            as_fail("!! n5 SELFENUM: bulk endpoints registered but pb_find_eps found none; gPOut/gPIn",
+                    ((UInt32)(gPOut & 0xFF) << 8) | (UInt32)(gPIn & 0xFF));
+            return;
+        }
+        ehci_os_ilog("=== n5 SELFENUM COMPLETE — we enumerated + own the device; starting BOT probe ===");
+        ehci_os_ilogx("  outEp.addr/ep", ((UInt32)gBulkEP[gPOut].addr << 16) | gBulkEP[gPOut].endpt);
+        ehci_os_ilogx("  inEp.addr/ep",  ((UInt32)gBulkEP[gPIn].addr  << 16) | gBulkEP[gPIn].endpt);
+
+        /* ---- 9. BOT probe: INQUIRY ---- */
+        bot_begin(gAsCdbInq, 6, 36, gAsInq, 36);
+        AS_BOT(9);
+        if (gBot.csw != 0) { as_fail("!! n5 PROBE: INQUIRY CSW status", (UInt32)gBot.csw); return; }
+        capture_device_name(gAsInq);   /* n10: for Apple's device-named alerts */
+        ehci_os_ilog("  n5 SELFPROBE INQUIRY ok:");
+        ehci_os_ilogx("    periphType", gAsInq[0]);
+        ehci_os_ilogx("    vendor0_3",  BUF_BE32(gAsInq, 8));
+        ehci_os_ilogx("    prod0_3",    BUF_BE32(gAsInq, 16));
+
+        /* ---- 10. TEST UNIT READY, clearing UNIT ATTENTION via REQUEST SENSE (up to 8 attempts) ---- */
+        gAs.tur = 0;
+    case 10:
+        bot_begin(gAsCdbTur, 6, 0, 0, 0);
+        AS_BOT(11);
+        if (gBot.csw == 0) { ehci_os_ilogx("  unit ready after TUR attempts", (UInt32)(gAs.tur + 1)); goto ready; }
+        gSense[2] = gSense[12] = gSense[13] = 0;
+        bot_begin(gAsCdbSense, 6, 18, gSense, 18);
+        AS_BOT(12);
+        ehci_os_ilogx("  REQUEST SENSE senseKey/ASC/ASCQ",
+                      ((UInt32)(gSense[2] & 0x0Fu) << 16) | ((UInt32)gSense[12] << 8) | gSense[13]);
+        if (++gAs.tur < 8) { gAs.pc = 10; return; }
+        as_fail("!! n5 PROBE: device never reported ready after TUR attempts", (UInt32)gAs.tur);
+        return;
+    ready:
+
+        /* ---- 11. READ CAPACITY ---- */
+        bot_begin(gAsCdbCap, 10, 8, gAsCap, 8);
+        AS_BOT(13);
+        if (gBot.csw != 0) { as_fail("!! n5 PROBE: READ CAPACITY CSW status", (UInt32)gBot.csw); return; }
+        gAs.blocks  = BUF_BE32(gAsCap, 0) + 1UL;      /* READ CAPACITY returns the LAST LBA */
+        gAs.blkSize = BUF_BE32(gAsCap, 4);
+        ehci_os_ilogx("  n5 SELFPROBE READ CAPACITY blocks",  gAs.blocks);
+        ehci_os_ilogx("                     blockSize", gAs.blkSize);
+        if (gAs.blkSize != 512UL || gAs.blocks < 4UL) {
+            as_fail("!! n5 PROBE: implausible geometry (stale/garbage data phase); blockSize", gAs.blkSize);
+            return; }
+        gPBlkCnt = gAs.blocks; gPBlkSize = gAs.blkSize;   /* feed the 'Eusb' geometry the block driver reads */
+
+        /* ---- 12. READ block 0 — the proof we can really read the medium ---- */
+        gAsCdbRd[0] = 0x28;
+        gAsCdbRd[1] = gAsCdbRd[2] = gAsCdbRd[3] = gAsCdbRd[4] = gAsCdbRd[5] = 0;
+        gAsCdbRd[6] = 0; gAsCdbRd[7] = 0; gAsCdbRd[8] = 1; gAsCdbRd[9] = 0;
+        bot_begin(gAsCdbRd, 10, 512, gAsBlk0, 512);
+        AS_BOT(14);
+        if (gBot.csw != 0) { as_fail("!! n5 PROBE: READ block 0 CSW status", (UInt32)gBot.csw); return; }
+        ehci_os_ilogx("  n5 SELFPROBE READ block 0 b0_3", BUF_BE32(gAsBlk0, 0));
+
+        ehci_os_ilog("=== n5 SELFPROBE COMPLETE (async, interrupt-driven — no application involved) ===");
+        gAs.running = 0; gAs.done = 1; gAs.pc = 0;
+        gSelfEnumDone = 1;
+        gFenceApple   = 1;         /* belt-and-braces: Apple must never touch our endpoints */
+        gAsProbeOK    = 1;         /* task level picks this up to publish 'Eusb' + hand the mount over */
+        return;
+    }
+}
+#undef AS_AWAIT
+#undef AS_DELAY
+#undef AS_CTL
+#undef AS_BOT
+
+/* Kick the engine. Safe to call from ANY level; called from the heartbeat and (harmlessly) from uim23.
+ * ★ ARMING HAPPENS HERE, not at task level. service_ports sets gSelfEnumPort at interrupt level when a
+ * hidden port connects; if arming lived in selfprobe_tick then discovery would still need slot 23 and n5
+ * would have achieved nothing. This is the line that actually makes the driver self-starting. */
+static void as_tick(void)
+{
+    if (gAsBusy) return;
+    gAsBusy = 1;
+    if (!gAs.running && !gSelfEnumDone && gSelfEnumPort >= 0 && gSelfEnumTries < 3u && gPState != 10) {
+        gAs.pc = 0; gAs.port = gSelfEnumPort; gAs.running = 1; gAs.done = 0; gAs.failed = 0;
+        gAsProbeOK = 0;
+    }
+    if (gAs.running) as_advance();
+    gAsBusy = 0;
+}
+#endif /* APPLE_HIDE */
+
 void ehci_vhub_selfprobe_tick(void)
 {
     static const UInt8 cdbInq[6]  = {0x12,0,0,0,36,0};
     static const UInt8 cdbCap[10] = {0x25,0,0,0,0,0,0,0,0,0};
     UInt8 cdbRd[10]; int i;
     compl_drain();
+    if (PHASE0_TRANSPARENT) return;   /* Phase 0: transparent UIM — no self-probe / fence / takeover.
+                                       * compl_drain (above) still delivers Apple's bulk completions and
+                                       * OS 9's own stack mounts the device. */
+#if APPLE_HIDE
+    /* ★ n5: this function is now only the TASK-LEVEL half of the async design, and only these things
+     * need it.
+     * (1) Flush whatever the interrupt-level engine logged into the ring. With no app running nothing
+     *     drains it, so the ring simply ACCUMULATES and appears in the log the next time anything pumps
+     *     us — which is exactly how to read back an appless run: insert with nothing running, then launch
+     *     the activator afterwards and the whole enumeration trace lands in EHCIUIM_init.log. */
+    ehci_os_ilog_drain();
+    /* ★★ n5d LIVENESS PROBE — the one diagnostic that settles the n5r failure.
+     * Symptom being chased: the app stays RESPONSIVE (so its pump loop is returning) yet nothing from this
+     * function reaches the log after Apple's root-hub enumeration — no PORTMAP idle reminders, no port
+     * events. Exactly two explanations remain and they need opposite fixes:
+     *   (a) uim23 is NOT being called at all -> these lines will be ABSENT, and the fault is upstream of us
+     *       (the USL has stopped servicing our bus).
+     *   (b) uim23 IS being called and the state gates are wrong -> these lines APPEAR, and the values say
+     *       which gate: gSelfEnumDone silences portmap_tick; gSelfEnumPort<0 means service_ports never saw
+     *       the connect; a frozen gVhubTick means the heartbeat/SIH is dead so nothing is polling the ports.
+     * Deliberately NOT EHCI_VERBOSE: that flag restores the whole per-tick v18-v42 trace, and its per-tick
+     * FSWrite+FlushVol is itself a known enumeration-timing aggravator. This is one line per 512 calls. */
+    { static UInt32 gLiveN = 0;
+      /* n5d2: every 64 calls, not 512. The first run produced exactly ONE block, which told us the state
+       * was clean at call 1 but gave no TIME SERIES — and the decisive question is whether gVhubTick keeps
+       * CLIMBING (heartbeat alive) or freezes (heartbeat dead, so service_ports never sees the insert,
+       * which would explain both the missing port event and the 1.1 mount). ~10 calls/sec means a block
+       * every ~6 s. */
+      if ((gLiveN++ & 0x3FUL) == 0) {
+          ehci_os_log("n5d uim23 ALIVE:");
+          ehci_os_logx("  callN",         gLiveN);
+          ehci_os_logx("  gVhubTick (heartbeat/SIH alive if climbing)", gVhubTick);
+          ehci_os_logx("  gServiceStop (1 = heartbeat suppressed!)", (UInt32)gServiceStop);
+          ehci_os_logx("  gIsrHits",      gIsrHits);
+          ehci_os_logx("  gPState",       (UInt32)gPState);
+          ehci_os_logx("  gSelfEnumDone (1 silences PORTMAP)", (UInt32)gSelfEnumDone);
+          ehci_os_logx("  gSelfEnumPort (-1 = no connect seen)", (UInt32)(long)gSelfEnumPort);
+          ehci_os_logx("  gSelfEnumTries", gSelfEnumTries);
+          ehci_os_logx("  gAs.running",   (UInt32)gAs.running);
+          ehci_os_logx("  gAs.pc",        (UInt32)gAs.pc);
+          ehci_os_logx("  gHideLogMask",  gHideLogMask);
+          ehci_os_logx("  port0 PORTSC",  ehci_read32(gSoftc.opBase, EHCI_PORTSC(0)));
+          ehci_os_logx("  port4 PORTSC",  ehci_read32(gSoftc.opBase, EHCI_PORTSC(4)));
+      } }
+    /* (2) Complete the handoff the engine cannot do itself: NewGestaltValue and InstallDriverFromMemory
+     *     are both task-only, so the engine sets gAsProbeOK and we finish the job here. ⚠ THIS is the
+     *     remaining app dependency — the probe is appless, the first MOUNT is not yet. Closing it means
+     *     installing once at activation (no media) and reducing the runtime path to AddDrive-once +
+     *     PostEvent, both of which are interrupt-safe. */
+    /* n6b: the engine parks and asks US to register the bulk endpoints, because create_bulk does
+     * ase_quiesce() + epq_program() and neither may run from the SIH (the hot-re-insert freeze). */
+    if (gAsNeedBulk) {
+        (void)ehci_vhub_create_bulk(gAs.addr, (UInt32)gAs.epOut, 0, (UInt32)gAs.mpOut);
+        (void)ehci_vhub_create_bulk(gAs.addr, (UInt32)gAs.epIn,  1, (UInt32)gAs.mpIn);
+        pb_find_eps();          /* pb_cbw/pb_in index gBulkEP via gPOut/gPIn; nothing else sets them */
+        ehci_os_logx("  n6b bulk endpoints registered at task level; gPOut/gPIn",
+                     ((UInt32)(gPOut & 0xFF) << 8) | (UInt32)(gPIn & 0xFF));
+        gAsNeedBulk = 0;        /* releases the engine's AS_TASK park */
+    }
+    if (gAsProbeOK) {
+        gAsProbeOK = 0;
+        pb_find_eps();
+        ehci_os_logx("  n5 handoff at task level; gIsrHits (real IRQ during probe; 0 = heartbeat-only)", gIsrHits);
+        if (gPOut >= 0 && gPIn >= 0) {
+            ehci_vhub_publish_service(); gPState = 10; gMountedOnce = 1;
+            install_block_driver();   /* first insert: install + AddDrive + diskEvt. Later: re-announce. */
+        } else {
+            ehci_os_log("!! n5: probe reported OK but the bulk endpoints are missing — not publishing 'Eusb'");
+            gSelfEnumDone = 0;
+        }
+    }
+    /* p1a: an enumerated device was unplugged. Reset the probe state HERE (task level — reconnect_reset
+     * does File-Mgr logging and must never run at interrupt level) so gPState returns to 0 and the case-0
+     * hook can re-enumerate on the next insert. */
+    if (gSelfEnumRearm) {
+        gSelfEnumRearm = 0;
+        ehci_os_log("=== SELFENUM: enumerated device was pulled — resetting probe state for re-enumeration ===");
+        blk_notify_media(0);   /* n4c: mark the media gone BEFORE we tear the endpoints down, so kStatus
+                                * stops reporting "disk present" for a volume that is no longer there. */
+        blk_unmount_removed_volumes();   /* n7: and actually UNMOUNT it, as Apple's extension does. MUST
+                                          * follow blk_notify_media(0) — gDiskInPlace has to be 0 first so
+                                          * UnmountVol's flush fails fast with offLinErr rather than
+                                          * stalling in the transfer engine against absent media. */
+        ase_quiesce();         /* n4c: reconnect_reset's own contract is that the async schedule must
+                                * already be STOPPED before it epq_arm_idles the bulk QHs — create_bulk
+                                * honours that and this path did not. It is the documented r84/r85 freeze
+                                * shape, so close it rather than keep relying on luck. */
+        reconnect_reset();
+        gSelfEnumDone = 0; gSelfEnumTries = 0;
+    }
+    /* n4b: drain the hidden-connect log flags set by service_ports at interrupt level. */
+    if (gHideLogMask) {
+        UInt32 m = gHideLogMask; int q;
+        gHideLogMask = 0;
+        for (q = 0; q < 15; q++)
+            if (m & (1UL << q))
+                ehci_os_logx("APPLE_HIDE ph0b: port connect hidden from Apple (reported empty-but-changed) (port)",
+                             (UInt32)q);
+    }
+    portmap_tick();   /* n3b: log port state changes so an insert is always visible */
+    /* v47 TARGETED STALL DUMP (task level — the frozen log proved the task stays alive here: slot27 keeps
+     * ticking steadily to the end). The Mini freeze stalls in the self-probe read sequence (seen at
+     * gPState=1, post-takeover INQUIRY) with gDpBusy=1 = a bulk transfer issued whose completion never
+     * arrives. Log the engine state ~1/sec while stuck so we see WHY, with NO per-tick flood. Reads:
+     *   gIsrHits climbing = EHCI IRQs still firing (-> reap/routing bug) vs FLAT = no IRQ for our completion;
+     *   gDownDone advancing = transfers retire on the wire vs FROZEN = nothing completing;
+     *   gDownTimeouts climbing = the down watchdog IS firing (recovery failing) vs 0 = watchdog never runs;
+     *   USBCMD bit5 (ASE 0x20) / USBSTS bit15 (ASS 0x8000) = is the async schedule actually RUNNING;
+     *   USBSTS 0x1000 (HCHalted) / 0x10 (host system error) = controller faulted. */
+    if (gDpBusy) {
+        static UInt32 nextStall = 0;
+        UInt32 nowT = *(volatile UInt32 *)0x016AUL;          /* lowmem Ticks (60 Hz) */
+        if ((long)(nowT - nextStall) >= 0) {
+            nextStall = nowT + 60UL;                         /* ~1 s */
+            ehci_os_log("!! v47 STALL — self-probe transfer not completing:");
+            ehci_os_logx("  gPState", (UInt32)gPState);
+            ehci_os_logx("  gDpBusy", (UInt32)gDpBusy);
+            ehci_os_logx("  gDpIsIn", (UInt32)gDpIsIn);
+            ehci_os_logx("  gDpBulkEp", (UInt32)gDpBulkEp);
+            ehci_os_logx("  gIsrHits (climbing=IRQ firing / flat=no IRQ)", gIsrHits);
+            ehci_os_logx("  gIsrConsec (now)", gIsrConsec);
+            ehci_os_logx("  gIsrConsecMax", gIsrConsecMax);
+            ehci_os_logx("  gDownDone (advancing=xfers retire)", gDownDone);
+            ehci_os_logx("  gDownErr", gDownErr);
+            ehci_os_logx("  gDownTimeouts (watchdog fired)", gDownTimeouts);
+            ehci_os_logx("  USBCMD (0x20=ASE async-enable)", ehci_read32(gSoftc.opBase, EHCI_USBCMD));
+            ehci_os_logx("  USBSTS (0x8000=ASS run/0x1000=halt/0x10=hosterr)", ehci_read32(gSoftc.opBase, EHCI_USBSTS));
+        }
+    }
+    /* n5: give the engine a step from here too. Harmless duplication of the heartbeat's call (as_tick is
+     * idempotent and re-entrancy-guarded); it just saves a heartbeat of latency when an app IS pumping. */
+    as_tick();
+    if (gAs.running) return;          /* engine mid-sequence: leave the legacy machine alone */
+#endif
     if (EHCI_VERBOSE) {   /* r88 diag: log gPState transitions so we can SEE the post-reconnect re-probe path (or lack of it) */
         static UInt32 lastSt = 0xFFFFFFFFUL;
         if (gPState != lastSt) { lastSt = gPState;
@@ -1649,6 +2939,9 @@ void ehci_vhub_selfprobe_tick(void)
             ehci_os_log("=== SELFPROBE: SIH-armed reconnect takeover (Apple parked+fenced) ===");
             ehci_os_logx("  gSihArmTick", (UInt32)gSihArmTick); ehci_os_logx("  gVhubTick(now)", (UInt32)gVhubTick);
             ehci_os_logx("  outEp.addr", gBulkEP[gPOut].addr); ehci_os_logx("  inEp.addr", gBulkEP[gPIn].addr);
+            /* v49: the device may be mid-BOT from Apple's abandoned probe, so reset the transport and put
+             * both bulk toggles back to DATA0 before we issue our first CBW on the taken-over endpoints. */
+            ehci_os_logx("  v49 takeover BOT reset rc (0=ok)", (UInt32)(long)pb_bot_reset());
             pb_cbw(cdbInq, 6, 36); gPState = 1; break;
         }
         if (EHCI_VERBOSE) {   /* r31 DIAGNOSTIC: periodically log WHY we haven't parked — cracks the intermittent no-mount
@@ -1711,6 +3004,7 @@ void ehci_vhub_selfprobe_tick(void)
     case 9: if (pb_ready()) { ehci_os_log("=== SELFPROBE COMPLETE — we read the disk ourselves ===");
                               /* r35 R2a: after ~10 self-probe transfers, did the real EHCI IRQ fire? */
                               ehci_os_logx("  gIsrHits (real IRQ fired during selfprobe; 0 = heartbeat-only)", gIsrHits);
+                              ehci_os_logx("  v46 gIsrConsecMax (shared-IRQ storm peak)", gIsrConsecMax);
                               ehci_vhub_publish_service(); gPState = 10; gMountedOnce = 1; } break;   /* m2: expose block-read; r87: arm reconnect logic */
     default: break;   /* 10 = done */
     }
@@ -1808,7 +3102,33 @@ static void service_ports(void)
         UInt32 pv = ehci_read32(gSoftc.opBase, EHCI_PORTSC(p));
         UInt8 conn = (pv & EHCI_PORT_CONNECT) ? 1 : 0;
         if (conn != gPortConn[p]) { gPortConn[p] = conn; gPortChange[p] |= HPC_CONNECTION; changed = 1; gPortEvent[p] = conn ? 1 : 2;
-            pevt((UInt8)p, conn ? PEV_CONNECT : PEV_DISCONN, pv); }   /* r36 diag: a DISCONN straddling reset = the bounce */
+            pevt((UInt8)p, conn ? PEV_CONNECT : PEV_DISCONN, pv);   /* r36 diag: a DISCONN straddling reset = the bounce */
+#if APPLE_HIDE
+            /* n4b: NO File-Manager logging here — this is INTERRUPT level and ehci_os_log is synchronous
+             * File Manager I/O (the r18 hang; it hung the machine on first connect in n4). Flag it and let
+             * selfprobe_tick log it at task level. */
+            if (conn && apple_hidden_port(p)) gHideLogMask |= (1UL << p);
+            /* p1a: arm/disarm OUR OWN enumeration. Interrupt level: flags only, no work here — the n5
+             * engine (as_tick, driven from the heartbeat) does the reset/descriptors/SET_ADDRESS. A
+             * reinsert re-arms it, which is how hot-plug re-enumeration falls out for free.
+             *
+             * ★★★ n11: SKIP A PORT WE HAVE CEDED. This block is the engine of the hub thrash loop. Once the
+             * port belongs to the companion, EHCI reports CCS = 0 for it — which arrives here as a connect
+             * DISCONNECT transition and used to mean "our enumerated device was pulled": it set
+             * gSelfEnumRearm (spurious media-gone + probe reset at task level) and cleared gSelfEnumDone,
+             * so the next pass re-armed enumeration on a port we had deliberately given away. 148 rounds of
+             * that in one session. A ceded port generates no arm, no disarm and no rearm — the device is
+             * Apple's now and its comings and goings are not our business. */
+            if (apple_hidden_port(p) && !port_ceded(p)) {
+                if (conn) { gSelfEnumPort = p; gSelfEnumDone = 0; gSelfEnumTries = 0; }
+                else {
+                    if (gSelfEnumDone) gSelfEnumRearm = 1;   /* an ENUMERATED device was pulled: ask task
+                                                              * level to reset the probe state */
+                    gSelfEnumPort = -1; gSelfEnumDone = 0; gSelfEnumTries = 0;
+                }
+            }
+#endif
+            }
         if (pv & (EHCI_PORT_CONNECT_CH | EHCI_PORT_ENABLE_CH))     /* clear hardware change bits (RW1C) */
             ehci_write32(gSoftc.opBase, EHCI_PORTSC(p), (pv & ~EHCI_PORTSC_RW1C) | (pv & (EHCI_PORT_CONNECT_CH | EHCI_PORT_ENABLE_CH)));
         if (gResetPending[p] && frame_ms() >= gResetAtFrame[p]) {  /* ~50 ms elapsed -> deassert reset */
@@ -1878,6 +3198,13 @@ void ehci_vhub_service(void)
                                 * stuck-but-now-linked transfer can complete instead of freezing the machine */
     service_ports();
     deliver_completions();
+#if APPLE_HIDE
+    /* ★ n5: THE POINT OF THE WHOLE EXERCISE — drive enumeration + probe from our OWN heartbeat, so
+     * discovery no longer depends on slot 23 and therefore no longer depends on an application existing.
+     * Must come AFTER deliver_completions() so a transfer that retired in this same pass is already
+     * visible to pb_ready(), which lets the state machine advance a step per heartbeat, not per two. */
+    as_tick();
+#endif
     bio_kick();          /* r48: SOLE task-independent driver of the async block-I/O engine. Runs at
                           * interrupt level (real EHCI ISR + the 8ms heartbeat SIH), so starting/advancing
                           * a bio request never races a task-level submit. deliver_completions() already
@@ -1900,19 +3227,45 @@ static TimerID gHbTimer = 0;
 static InterruptSetID gSetID = 0; static InterruptMemberNumber gMember = 0;
 static void *gSavedRefcon = 0; static InterruptHandler gSavedHandler = 0;
 static InterruptEnabler gSavedEnabler = 0; static InterruptDisabler gSavedDisabler = 0;
+/* v46: paint a bright bar to the top of the main screen straight from the ISR. ScrnBase (lowmem 0x0824)
+ * holds the base of the main screen buffer; a generous run of solid 0xFF longs shows a white band at any
+ * depth/rowBytes. Best-effort — if the base looks bogus, do nothing (never fault). This is the ONLY
+ * readout that survives an interrupt-level CPU lockup. RECONSTRUCTED verbatim. */
+static void storm_paint(void)
+{
+    UInt32 *fb = *(UInt32 * volatile *)0x0824UL;     /* ScrnBase */
+    if (fb && (unsigned long)fb >= 0x1000UL) {
+        UInt32 i;
+        fb += 1024u;                                 /* nudge in ~4KB from the top-left corner */
+        for (i = 0; i < 8192u; i++) fb[i] = 0xFFFFFFFFUL;   /* ~32KB = a visible bright band */
+    }
+}
 
 static OSStatus vhub_sih(void *p1, void *p2)
 {
     (void)p1; (void)p2;
     ehci_vhub_service();
-    if (gA2Live) ehci_write32(gSoftc.opBase, EHCI_USBINTR, gIntrEnabled);   /* re-unmask */
+    /* SHARED-IRQ FIX #1 (Mini mount): clear gSihQueued BEFORE re-unmasking. The old order (unmask then
+     * clear) left a window where a completion arriving after the unmask re-entered vhub_isr, which masked
+     * again but saw gSihQueued still 1 and did NOT queue a fresh SIH -> that completion was dropped until
+     * the 8ms heartbeat. Clearing first means any post-unmask IRQ sees gSihQueued==0 and queues a new SIH.
+     * ⚠ RESTORED 2026-08-01: the Jul 24 base still had the OLD order. This is a LOGIC-ONLY fix with no log
+     * string attached, so the string/function gates could never have flagged it — see the reconstruction
+     * plan's note about that blind spot. */
     gSihQueued = 0;
+    gIsrConsec = 0;                                                         /* v46: storm depth resets */
+    if (gA2Live) ehci_write32(gSoftc.opBase, EHCI_USBINTR, gIntrEnabled);   /* re-unmask */
     return noErr;
 }
 static OSStatus vhub_heartbeat(void *p1, void *p2)
 {
     AbsoluteTime when;
     (void)p1; (void)p2;
+    /* ★ lc1 (restored 2026-08-01 from the disassembly): the teardown flag is checked HERE, first. Without
+     * it ehci_vhub_stop_service cancels the pending timer but this handler re-arms a new one on its way
+     * out, so the heartbeat never actually stops and the driver keeps touching hardware after kFinalize.
+     * Returning before frame_time_update() is what makes the driver go quiet. */
+    if (gServiceStop) return noErr;
     frame_time_update();        /* advance the USL frame clock on a steady 8 ms cadence (single writer) */
     /* QUEUE the secondary handler (like the ISR path) rather than running the service inline at timer
      * level — so EVERY transfer completion is delivered to the USL/class driver at secondary-interrupt
@@ -1927,6 +3280,17 @@ static InterruptMemberNumber vhub_isr(InterruptSetMember m, void *refcon, UInt32
 {
     UInt32 sts;
     (void)refcon;
+    /* ★ v46 SHARED-IRQ STORM DETECTOR (restored 2026-08-01 from the disassembly of the surviving binary —
+     * this whole block was lost with the source and no string or symbol pointed at it).
+     * On a SHARED line EVERY companion interrupt also enters here, so count consecutive entries BEFORE
+     * looking at USBSTS — that is what measures the storm. The SIH clears gIsrConsec, so a climbing value
+     * means the SIH is not getting to run. Past ~500 we are wedged at interrupt level, where no log can be
+     * written; paint the screen ONCE instead, which is the only readout that survives a lockup. */
+    if (gSoftc.sharedCompanion) {
+        gIsrConsec++;
+        if (gIsrConsec > gIsrConsecMax) gIsrConsecMax = gIsrConsec;
+        if (gIsrConsec > 499u && gStormPainted == 0) { gStormPainted = 1; storm_paint(); }
+    }
     sts = ehci_read32(gSoftc.opBase, EHCI_USBSTS) & gIntrEnabled;
     if (sts) {                                                 /* OUR (EHCI) interrupt */
         gIsrHits++;                                            /* r35: this IRQ was ours */
@@ -1948,6 +3312,10 @@ void ehci_vhub_start_service(EHCIRegEntryIDPtr node)
     /* r35 R2a: log EXACTLY why the real EHCI IRQ does/doesn't install. Suspicion: a force-loaded
      * (LoadUIMForEntry) node has NO "driver-ist" interrupt-set property -> pe != noErr -> we never
      * install the ISR and fall back to the 8ms timer (= the slow, heartbeat-paced I/O observed). */
+    /* ★ Restored 2026-08-01 from the disassembly: clear the teardown flag on (re)start. stop_service sets
+     * it to 1 to make the heartbeat and the SIH go quiet; without clearing it here, a driver that is
+     * stopped and started again never ticks again. */
+    gServiceStop = 0;
     ehci_os_log("vhub_start_service: real-EHCI-IRQ install");
     ehci_os_logx("  driver-ist get", (unsigned long)(long)pe);      /* 0 = found; negative = absent */
     ehci_os_logx("  driver-ist sz",  (unsigned long)sz);
@@ -1976,9 +3344,133 @@ void ehci_vhub_start_service(EHCIRegEntryIDPtr node)
     }
     ehci_os_logx("  gA2Live (1=real IRQ, 0=heartbeat-only)", (unsigned long)gA2Live);
     ehci_os_logx("  sharedCompanion (1=shared line->ISR also chains companion, 0=dedicated)", (unsigned long)gSoftc.sharedCompanion);
-    ehci_os_log("=== v44 RUN (driver loaded): LEAN (pacing off, per-tick logging compiled out); v41 2GB + v42 >4GB fixes ===");
+    /* ★ v50 (restored 2026-08-01 from the disassembly — the reconstruction had only the log line below,
+     * not this write). On the Mac mini's SHARED on-board controller, force USBCMD's Interrupt Threshold
+     * Control to 1 = interrupt on every microframe, no coalescing. Coalescing there delays our completions
+     * behind the companion's traffic, which is what made the Mini's transfers crawl. PCI-card (dedicated
+     * line) machines are left at whatever the controller came up with. */
+    if (gSoftc.sharedCompanion) {
+        UInt32 cmd = ehci_read32(gSoftc.opBase, EHCI_USBCMD);
+        cmd = (cmd & ~0x00FF0000UL) | 0x00010000UL;      /* ITC field = 0x01 */
+        ehci_write32(gSoftc.opBase, EHCI_USBCMD, cmd);
+    }
+    ehci_os_logx("  v50 Mini ITC (0x01=stock/no coalescing); USBCMD now", ehci_read32(gSoftc.opBase, EHCI_USBCMD));
+    ehci_os_log("=== PATH A: ROM-integrated self-probe/mount (headless). This driver ships in the Mac OS ROM via a driver,AAPL,MacOS,PowerPC parcel on the EHCI node; the mount vehicle activates it with LoadUIMForEntry, EHCI comes up, then our self-probe fences Apple's parked mounter, takes the bulk endpoints, and does INQUIRY / READ CAPACITY / mount. WATCH: SELFPROBE INQUIRY + READ CAPACITY, then MOUNTED; timeouts should stay 0. Block-driver LBA-math + re-entrancy fixes as of 33d0f45. ===");
     { AbsoluteTime when = AddDurationToAbsolute((Duration)VHUB_HB_MS, UpTime());
       SetInterruptTimer(&when, vhub_heartbeat, 0, &gHbTimer); }
+}
+
+/* ============================================================================================
+ * Driver lifecycle: teardown, the warm-reboot shutdown hook, and stop-service. Call sites are
+ * ehci_uim.c:138/311/320 and ehci_os.c:454.
+ * ============================================================================================ */
+
+/* lc1: clean teardown for kFinalize/kClose. Mirror of ehci_vhub_start_service above, in reverse:
+ * stop the heartbeat re-arming, mask EHCI interrupts, hand the interrupt-set member back to whoever
+ * owned it before us, and stop the schedules. Order matters — quiesce the source BEFORE restoring the
+ * handler, so no interrupt can arrive addressed to a handler we have already given away. */
+/* ★★★ n10: WARM-REBOOT TEARDOWN — the fix for the frozen mouse cursor after Special > Restart.
+ *
+ * ROOT CAUSE: ehci_os_boot_quiesce() exists precisely to tame a controller left HOT by a previous session,
+ * and it is called from kInitialize in DoDriverIO — which n0 PROVED is never called. So it has never once
+ * run. Nothing else tears us down either: kFinalize never fires, and the activator deliberately does not
+ * release the ports. A warm boot therefore inherits a controller that is still RUNNING, still bus-mastering
+ * DMA into memory the new boot is about to reuse, and still asserting interrupts — with the old ISR gone.
+ * That is a textbook recipe for the wedged desktop this produced, and it was cured by a cold boot, which
+ * matches exactly.
+ *
+ * FIX: hook the Shutdown Manager at activation, so we quiesce BEFORE the restart instead of hoping the next
+ * boot cleans up after us. This is the standard mechanism and it runs at task level during shutdown.
+ *
+ * ⚠ The proc must be MINIMAL and must NOT touch the File Manager — the system is going down. So: set
+ * gServiceStop first (the restored heartbeat guard makes the timer stop re-arming without us cancelling
+ * it), mask every interrupt source, halt the schedules, and hand the ports back so the next boot — and
+ * Apple's 1.1 companion — get a clean controller. No logging, no allocation, no Device Manager. */
+static ShutDwnUPP gShutUPP = 0;
+static pascal void ehci_shutdown_proc(short stage)
+{
+    (void)stage;
+    gServiceStop = 1;                       /* heartbeat returns immediately and stops re-arming */
+    if (gSoftc.opBase) {
+        UInt32 cmd;
+        ehci_write32(gSoftc.opBase, EHCI_USBINTR, 0);            /* mask all interrupt sources */
+        (void)ehci_read32(gSoftc.opBase, EHCI_USBSTS);           /* posted-write flush */
+        cmd = ehci_read32(gSoftc.opBase, EHCI_USBCMD);
+        ehci_write32(gSoftc.opBase, EHCI_USBCMD,
+                     cmd & ~(EHCI_CMD_ASE | EHCI_CMD_PSE | EHCI_CMD_RUN));   /* stop schedules + halt */
+        (void)ehci_read32(gSoftc.opBase, EHCI_USBSTS);
+    }
+    ehci_hc_release_ports(&gSoftc);         /* ports back to the 1.1 companion, CONFIGFLAG cleared */
+}
+void ehci_vhub_install_shutdown_hook(void)
+{
+    if (gShutUPP) return;                                        /* once only */
+    gShutUPP = NewShutDwnUPP(ehci_shutdown_proc);
+    if (gShutUPP) {                                  /* ShutDwnInstall returns void — the UPP is the only
+                                                      * thing that can fail here */
+        ShutDwnInstall(gShutUPP, sdRestartOrPower);
+        ehci_os_log("n10 shutdown hook installed — the controller will be quiesced before restart/power-off");
+    } else {
+        ehci_os_log("!! n10 NewShutDwnUPP FAILED — a warm reboot may inherit a hot controller");
+    }
+}
+void ehci_vhub_stop_service(void)
+{
+    gServiceStop = 1;
+    if (gSoftc.opBase) {
+        ehci_write32(gSoftc.opBase, EHCI_USBINTR, 0);           /* mask every EHCI interrupt source */
+        (void)ehci_read32(gSoftc.opBase, EHCI_USBSTS);          /* posted-write flush */
+    }
+    if (gHbTimer) { (void)CancelTimer(gHbTimer, NULL); gHbTimer = 0; }
+    if (gA2Live) {                                              /* give the interrupt member back */
+        if (gSavedDisabler) { InterruptSetMember mm; mm.setID = gSetID; mm.member = gMember;
+                              gSavedDisabler(mm, gSavedRefcon); }
+        (void)InstallInterruptFunctions(gSetID, gMember, gSavedRefcon, gSavedHandler,
+                                        gSavedEnabler, gSavedDisabler);
+        if (gSavedEnabler)  { InterruptSetMember mm; mm.setID = gSetID; mm.member = gMember;
+                              gSavedEnabler(mm, gSavedRefcon); }
+        gA2Live = 0;
+    }
+    if (gSoftc.opBase) {                                        /* stop the async + periodic schedules */
+        UInt32 cmd = ehci_read32(gSoftc.opBase, EHCI_USBCMD);
+        ehci_write32(gSoftc.opBase, EHCI_USBCMD, cmd & ~(EHCI_CMD_ASE | EHCI_CMD_PSE));
+    }
+    gDownAseOn = 0;
+    ehci_os_log("EHCIUIM: vhub_stop_service — timer cancelled, IRQ restored, schedules stopped");
+}
+
+/* p0i3: descriptor-spoof patch counters. ⚠ RECONSTRUCTION NOTE — the spoof CAPTURE side (which
+ * increments these from inside the control-transfer path) has NOT been restored yet, so these read 0
+ * until it is. The accessor is real and its contract is right; only the producer is outstanding.
+ * Under APPLE_HIDE the spoof is believed vestigial anyway (Apple never sees our device), which is why
+ * it is not on the critical path for the rebuild. */
+static UInt32 gSpoofBcd = 0, gSpoofMp = 0;
+void ehci_vhub_spoof_stats(UInt32 *bcd, UInt32 *mp)
+{
+    if (bcd) *bcd = gSpoofBcd;
+    if (mp)  *mp  = gSpoofMp;
+}
+
+/* p0i3b: config-descriptor diagnostic capture. Same reconstruction caveat as above — the producers
+ * live in the control-transfer path and are not restored yet, so this reports zeros. Shapes come from
+ * the header contract and the call site at ehci_uim.c:320. */
+static UInt32 gGdDev = 0, gGdCfg = 0, gGdStr = 0, gGdOther = 0, gCfgFull = 0;
+static UInt32 gCfgMaxActual = 0, gCfgSetupLen = 0, gCfgEpN = 0, gCfgEp4[4];
+static UInt8  gCfgSnap48[48];
+void ehci_vhub_cfgcap(UInt32 *gdDev, UInt32 *gdCfg, UInt32 *gdStr, UInt32 *gdOther, UInt32 *cfgFull,
+                      UInt32 *maxActual, UInt32 *setupLen, UInt32 *epN, UInt32 *ep4, UInt8 *snap48)
+{
+    int i;
+    if (gdDev)     *gdDev     = gGdDev;
+    if (gdCfg)     *gdCfg     = gGdCfg;
+    if (gdStr)     *gdStr     = gGdStr;
+    if (gdOther)   *gdOther   = gGdOther;
+    if (cfgFull)   *cfgFull   = gCfgFull;
+    if (maxActual) *maxActual = gCfgMaxActual;
+    if (setupLen)  *setupLen  = gCfgSetupLen;
+    if (epN)       *epN       = gCfgEpN;
+    if (ep4)  for (i = 0; i < 4;  i++) ep4[i]    = gCfgEp4[i];
+    if (snap48) for (i = 0; i < 48; i++) snap48[i] = gCfgSnap48[i];
 }
 
 /* r35: task-context accessor so the trigger can show whether the real EHCI IRQ is FIRING (isrHits

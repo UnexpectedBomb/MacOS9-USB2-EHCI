@@ -64,6 +64,12 @@ long ehci_os_init(ehci_softc *sc, EHCIRegEntryIDPtr node);
 /* Init-phase tracing to a flushed disk file (ehci_os.c); safe from the app-context Initialize. */
 void ehci_os_log(const char *s);
 void ehci_os_logx(const char *label, unsigned long v);
+/* n5: interrupt-safe log ring — use these from ANY code reachable below task level (the async
+ * enumeration/probe engine). Callers MUST pass string literals; the ring stores the pointer, not a copy.
+ * ehci_os_ilog_drain() does the File Manager work and is TASK LEVEL ONLY. */
+void ehci_os_ilog(const char *s);
+void ehci_os_ilogx(const char *label, unsigned long v);
+void ehci_os_ilog_drain(void);
 
 /* DMA pool (ehci_os.c): wired-page allocator for QHs/qTDs.
  * ehci_dma_alloc returns a zeroed, `align`-aligned logical block and writes its

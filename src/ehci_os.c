@@ -61,6 +61,64 @@ void ehci_os_logx(const char *label, unsigned long v)
 }
 #define dbg(s) ehci_os_log(s)
 
+/* ★★ n5 INTERRUPT-SAFE LOG RING ★★
+ * ehci_os_log/logx above are synchronous File Manager I/O and are FATAL below task level (the r18 hang, and
+ * again in n4 — see the project's standing rule). n5 moves enumeration and the BOT probe onto our own
+ * heartbeat, i.e. interrupt level, so every log call on that path must go through here instead: the ISR only
+ * records a POINTER, and a task-level drain does the actual writing.
+ *
+ * Storing the pointer rather than a copy is what makes this nearly free, and it is safe ONLY because every
+ * caller passes a STRING LITERAL — those live in the PEF's constant data for the life of the fragment.
+ * ⚠ NEVER pass a stack buffer or anything else with a shorter lifetime to ehci_os_ilog/ilogx.
+ *
+ * Draining is opportunistic by design: once no application is running there is no task-level context of our
+ * own, so the ring is flushed from wherever a task-level call happens to reach us — uim23 if something is
+ * pumping, and the block driver's DoDriverIO (File Manager calls, definitely task level) once a volume is
+ * mounted. Enumeration lines may therefore appear LATE, in a burst. Overflow is counted, never silent. */
+#define ILOG_N 384
+typedef struct { const char *msg; UInt32 val; UInt8 kind; } ILogRec;   /* kind 1 = msg, 2 = msg + value */
+static volatile ILogRec gILog[ILOG_N];
+static volatile UInt32  gILogHead = 0, gILogTail = 0, gILogDropped = 0;
+
+void ehci_os_ilog(const char *s)
+{
+    UInt32 i = gILogHead;
+    if (i - gILogTail >= ILOG_N) { gILogDropped++; return; }   /* ring full: count, never block, never wrap */
+    gILog[i % ILOG_N].msg = s; gILog[i % ILOG_N].val = 0; gILog[i % ILOG_N].kind = 1;
+    __asm__ __volatile__("eieio");                             /* publish payload before the index */
+    gILogHead = i + 1;
+}
+void ehci_os_ilogx(const char *label, unsigned long v)
+{
+    UInt32 i = gILogHead;
+    if (i - gILogTail >= ILOG_N) { gILogDropped++; return; }
+    gILog[i % ILOG_N].msg = label; gILog[i % ILOG_N].val = (UInt32)v; gILog[i % ILOG_N].kind = 2;
+    __asm__ __volatile__("eieio");
+    gILogHead = i + 1;
+}
+/* TASK LEVEL ONLY — this is the one place the ring touches the File Manager. */
+void ehci_os_ilog_drain(void)
+{
+    UInt32 d, budget = ILOG_N;
+    /* ⚠ BOUNDED, and it must stay bounded. The producer runs at INTERRUPT level and can refill the ring
+     * while we are draining — each line here is a File Manager write, so the drain is orders of magnitude
+     * slower than the producer. An unbounded `while (tail != head)` can therefore livelock at TASK level,
+     * which wedges whatever called us: for n5 that is the application's pump loop, so the machine keeps
+     * running while our driver silently stops being serviced. Draining at most one ring's worth per call
+     * guarantees we return; anything still queued goes out on the next tick.
+     * The `!=` is also deliberately paired with the budget: if tail ever overshot head, `!=` alone would
+     * spin ~4 billion times. */
+    while (gILogTail != gILogHead && budget--) {
+        volatile ILogRec *r = &gILog[gILogTail % ILOG_N];
+        const char *m = r->msg; UInt32 v = r->val; UInt8 k = r->kind;
+        gILogTail++;                                           /* consume BEFORE writing: a File-Mgr stall must
+                                                                * not make us re-emit the same line */
+        if (k == 2) ehci_os_logx(m, v); else if (k == 1) ehci_os_log(m);
+    }
+    d = gILogDropped;
+    if (d) { gILogDropped = 0; ehci_os_logx("!! n5 log ring OVERFLOWED — lines dropped", d); }
+}
+
 /* PCI config space + Command register bits */
 #define kPCICommandReg    0x04
 #define kPCICmdMemSpace   0x0002
@@ -290,30 +348,117 @@ OSStatus ehci_os_init(ehci_softc *sc, EHCIRegEntryIDPtr nodeArg)
  * controller's Name Registry node in the command contents; bring-up is deferred
  * to kOpen (Path A boot-safety — see the switch below).
  */
-static int gBroughtUp = 0;   /* Path A: guards the one-time kOpen EHCI bring-up */
+/* Minimal, boot-safe quiesce (called from kInitialize, every boot). If a PREVIOUS session left the EHCI
+ * controller HOT (interrupts enabled / schedules running) and the machine was WARM-restarted (so the PCI
+ * card kept power), the controller keeps asserting interrupts + DMAing into this boot, where our driver
+ * is dormant (kOpen not yet called) -> unserviced-interrupt storm + stale DMA = the "unhealthy boot".
+ * Tame it with a HANDFUL of MMIO ops and NOTHING heavy: no HCReset, no DMA alloc, no IRQ install, no spin
+ * loop -- so it stays clear of the early-boot hazards that make full bring-up freeze. Guarded: bails if
+ * the BAR isn't responding, and on a cold boot (controller already quiet) it just reads two registers and
+ * returns. NO logging (File Manager may be down this early). Best-effort + silent. */
+static void ehci_os_boot_quiesce(void)
+{
+    RegEntryIter it; RegEntryID node; Boolean done = false; UInt32 want = 0x000c0320UL;
+    UInt32 *aa = NULL, *la = NULL; ByteCount aaSz = 0, laSz = 0;
+    UInt32 nEnt, i, memIdx = 0xFFFFFFFFUL, cmd, intr;
+    volatile UInt8 *capBase, *opBase;
+
+    if (RegistryEntryIterateCreate(&it) != noErr) return;
+    if (RegistryEntrySearch(&it, kRegIterDescendants, &node, &done, "class-code", &want, sizeof(want)) != noErr) {
+        RegistryEntryIterateDispose(&it); return;
+    }
+    RegistryEntryIterateDispose(&it);
+
+    /* enable Memory Space so the BAR is readable (harmless if the PCI enumerator already did it) */
+    (void)ExpMgrConfigWriteWord(&node, (LogicalAddress)kPCICommandReg, (UInt16)(kPCICmdMemSpace | kPCICmdBusMaster));
+
+    if (get_prop(&node, "assigned-addresses", (void **)&aa, &aaSz) != noErr) return;
+    if (get_prop(&node, "AAPL,address", (void **)&la, &laSz) != noErr) { PoolDeallocate(aa); return; }
+    nEnt = aaSz / (kAddrEntryWords * sizeof(UInt32));
+    for (i = 0; i < nEnt; i++) if (AA_SPACE(aa[i * kAddrEntryWords]) >= 2) { memIdx = i; break; }
+    if (memIdx == 0xFFFFFFFFUL || (memIdx * sizeof(UInt32)) >= laSz) { PoolDeallocate(la); PoolDeallocate(aa); return; }
+    capBase = (volatile UInt8 *)la[memIdx];
+    PoolDeallocate(la); PoolDeallocate(aa);
+    if (capBase == 0) return;
+    opBase = capBase + ehci_read8(capBase, EHCI_CAPLENGTH);
+
+    intr = ehci_read32(opBase, EHCI_USBINTR);
+    cmd  = ehci_read32(opBase, EHCI_USBCMD);
+    if (intr == 0xFFFFFFFFUL || cmd == 0xFFFFFFFFUL) return;                          /* BAR not responding -> don't poke it */
+    if (intr == 0 && !(cmd & (EHCI_CMD_RUN | EHCI_CMD_ASE | EHCI_CMD_PSE))) return;   /* already quiet (normal cold boot) */
+
+    ehci_write32(opBase, EHCI_USBINTR, 0);                                                    /* stop interrupts (de-asserts the line) */
+    ehci_write32(opBase, EHCI_USBCMD, cmd & ~(EHCI_CMD_RUN | EHCI_CMD_ASE | EHCI_CMD_PSE));   /* stop schedules + halt (no wait) */
+    ehci_write32(opBase, EHCI_CONFIGFLAG, 0);                                                 /* route ports to the companion */
+}
+
+int gBroughtUp = 0;   /* Path A: guards the one-time EHCI bring-up. SHARED (non-static): uimInitialize
+                       * (ehci_uim.c, the LoadUIMForEntry path) checks it too, so a SECOND app launch does
+                       * NOT re-run the bring-up (which armed a 2nd orphaned heartbeat timer, corrupted the
+                       * saved companion-IRQ handler, re-HCReset mid-session, and leaked the DMA pool -- the
+                       * cause of the warm-reboot interrupt-level crash after running the launcher twice). */
+/* ==================== n0: DoDriverIO command trace ====================
+ * QUESTION IT ANSWERS: does the Device Manager send us kOpen at BOOT, with no application running? That
+ * decides whether the native (app-less) design needs a boot-time INIT to poke us, or whether we are opened
+ * for free. See docs/NATIVE_INTEGRATION_DESIGN.md phase n0.
+ * WHY IT IS BUFFERED, NOT LOGGED: every command is recorded with PURE MEMORY WRITES only. We deliberately
+ * add NO logging at kInitialize/kOpen — ehci_os_log() uses the File Manager, and if the Device Manager opens
+ * us during early boot a log call there could hang the boot (the r18 lesson: File-Mgr I/O at the wrong level
+ * hard-hung the MDD). The trace is flushed later from uimInitialize (i.e. only once an app has deliberately
+ * been run, when logging is known safe). The Ticks stamp makes boot-time entries obvious, so the trace still
+ * reveals everything that arrived BEFORE the app existed. ZERO added boot risk. */
+#define N0_N 32
+static volatile UInt32 gN0Code[N0_N], gN0Tick[N0_N];
+static volatile UInt32 gN0Count = 0;
+static void n0_record(UInt32 code)
+{
+    UInt32 i = gN0Count++;
+    if (i < N0_N) { gN0Code[i] = code; gN0Tick[i] = *(volatile UInt32 *)0x016AUL; }   /* lowmem Ticks (60Hz) */
+}
+void ehci_os_n0_dump(void)   /* called from uimInitialize — task level, logging safe */
+{
+    UInt32 i, n = (gN0Count < N0_N) ? gN0Count : N0_N;
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    ehci_os_log("=== n0 DoDriverIO TRACE — every command received, incl. BEFORE any app ran ===");
+    ehci_os_log("  codes: 1=Initialize 2=Finalize 3=Replace 4=Superseded 5=Open 6=Close 7=Read 8=Write 9=Control 10=Status 11=KillIO");
+    ehci_os_logx("  total commands received", gN0Count);
+    ehci_os_logx("  gBroughtUp at dump time (1 = we were ALREADY brought up before the app)", (UInt32)gBroughtUp);
+    for (i = 0; i < n; i++) {
+        ehci_os_logx("  cmd code", gN0Code[i]);
+        ehci_os_logx("    at Ticks", gN0Tick[i]);
+    }
+    ehci_os_log("=== n0 READ THIS: a code 5 (Open) with an EARLY tick => the Device Manager opened us at BOOT with no app (native path is free). Only code 1 (Initialize) => kOpen does NOT fire at boot; the native design needs its own trigger. ===");
+}
 OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
                  IOCommandContents contents, IOCommandCode code, IOCommandKind kind)
 {
     (void)spaceID; (void)cmdID; (void)kind; (void)contents;
+    n0_record((UInt32)code);   /* n0: memory-only record; see the comment above (never log here) */
     switch (code) {
     case kInitializeCommand:
     case kReplaceCommand:
-        /* Path A BOOT-SAFETY (eSATA v63/v64 lesson): when the ROM parcel makes the
-         * Device Manager load us at boot, kInitialize runs during the early PCI-claim
+        /* ROM-PATH BOOT-SAFETY (hardware-proven on a G4 MDD): when the ROM parcel makes
+         * the Device Manager load us at boot, kInitialize runs during the early PCI-claim
          * phase, where full EHCI bring-up (HCReset/DMA/IRQ) FREEZES. So do NOTHING
          * here except acknowledge the claim — the real bring-up is deferred to kOpen,
-         * which the headless mount app triggers post-boot (task/driver context up).
-         * (v65 proof: stash-only kInit + open-driven bring-up = stable boot-to-desktop
-         * with the card claimed.) NB the USL path (LoadUIMForEntry -> uimInitialize)
-         * still brings up inline as before; only the Device-Manager path defers. */
+         * which the headless mount helper triggers post-boot (task/driver context up).
+         * Stash-only kInit + open-driven bring-up = stable boot-to-desktop with the card
+         * claimed. NB the USL path (LoadUIMForEntry -> uimInitialize) still brings up
+         * inline as before; only the Device-Manager path defers. */
         /* NB: NO logging here. ehci_os_log() uses the File Manager, which may not be
          * up during the early PCI-claim phase — a log call here could itself hang the
-         * boot. Pure return, exactly like eSATA's stash-only kInit (sil_os_init_stash).
-         * kOpen (post-boot, File Manager up) logs the bring-up. */
+         * boot. Pure return; kOpen (post-boot, File Manager up) logs the bring-up. */
+        /* Lifecycle fix: DO tame a controller left HOT by a previous session (warm reboot), so its
+         * unserviced interrupts + stale DMA can't storm this boot (the "unhealthy boot"). This is a
+         * handful of guarded MMIO ops only — NOT the bring-up that must stay out of early boot. */
+        ehci_os_boot_quiesce();
         return noErr;
     case kFinalizeCommand:
     case kSupersededCommand:
-        dbg("EHCIUIM: DoDriverIO Finalize — releasing ports to the companion");
+        dbg("EHCIUIM: DoDriverIO Finalize — stop service + release ports");
+        ehci_vhub_stop_service();         /* stop the heartbeat timer/ISR/interrupts/schedules BEFORE we go */
         ehci_hc_release_ports(&gSoftc);   /* hand the ports back so 1.1 works after we're gone */
         gBroughtUp = 0;
         return noErr;

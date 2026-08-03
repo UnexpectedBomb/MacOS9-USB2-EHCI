@@ -7,7 +7,8 @@ set_target_properties(EHCIUIM PROPERTIES
 
 # CFM import libraries the OS glue calls into (all present in the toolchain).
 target_link_libraries(EHCIUIM
-    PCILib DriverServicesLib NameRegistryLib InterfaceLib)
+    # DriverLoaderLib supplies InstallDriverFromMemory: the driver installs its own block driver.
+    PCILib DriverServicesLib NameRegistryLib InterfaceLib DriverLoaderLib)
 
 add_custom_command(OUTPUT EHCIUIM.pef
     COMMAND ${MAKE_PEF} libEHCIUIM.so -o EHCIUIM.pef
@@ -69,6 +70,21 @@ target_link_libraries(EHCITrigger
 add_application(EHCILauncher probe/ehci_launcher.c CONSOLE)
 target_include_directories(EHCILauncher PRIVATE src)
 target_link_libraries(EHCILauncher
+    NameRegistryLib PCILib DriverServicesLib DriverLoaderLib InterfaceLib
+    ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBServicesLibFull.a
+    ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBFamilyExpertFull.a)
+
+# ---- EHCIActivate: THE SHIPPING HELPER. Faceless: it activates the ROM driver with
+#      LoadUIMForEntry, hands the front back to the Finder (so the Finder, not us, receives the
+#      disk-inserted event), hides its window and then just pumps the polled service slot that
+#      device discovery runs on. Mounting is done by the driver's own block driver plus the OS.
+#      ⚠ The .r supplies a SIZE resource with canBackground set. Without it the Process Manager
+#      stops scheduling this app once it hands the front to the Finder, which silently kills the
+#      discovery pump — and the symptom is misleading, because selecting the app from the
+#      Application menu resumes it and it then looks perfectly responsive. ----
+add_application(EHCIActivate probe/ehci_activate.c probe/ehci_activate.r CONSOLE)
+target_include_directories(EHCIActivate PRIVATE src)
+target_link_libraries(EHCIActivate
     NameRegistryLib PCILib DriverServicesLib DriverLoaderLib InterfaceLib
     ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBServicesLibFull.a
     ${CMAKE_CURRENT_SOURCE_DIR}/usl_import/libUSBFamilyExpertFull.a)

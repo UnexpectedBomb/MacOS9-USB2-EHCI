@@ -443,7 +443,7 @@ static void write_test_big(short vref)
         (bad > 0) ? " (data mismatch)" : "");
 }
 
-/* r44: TIMED multi-MB write+read to the mounted volume = a QUANTITATIVE throughput number (the user asked)
+/* r44: TIMED multi-MB write+read to the mounted volume = a QUANTITATIVE throughput number
  * AND a crash probe. A large FRONTMOST sequential write is the proven-safe pattern (r28: in-app writes
  * always worked, Finder copies froze), so if 4MB survives here the copy crash is Finder-specific
  * (re-entrancy/interleaving); if it dies ~1MB in (where the Finder copy died) it's a sustained-write
@@ -686,7 +686,7 @@ int main(void)
     LOG("     is likely many-files catalog churn. [manyfiles] creates ~800 files itself (same FM calls) and on the\n");
     LOG("     FIRST failure logs the EXACT File Mgr error code (never captured before). NO Finder copy needed — just\n");
     LOG("     run r59 and read the [manyfiles] result in 'USB Health.log'. (64MB verify skipped this run to save time.)\n");
-    LOG("==== (r80) REMOVABLE/EJECTABLE (block-driver change, usb_disk.c). The USB volume now registers as EJECTABLE removable media: DrvSts.diskInPlace 8->1 in AddDrive + kStatus(8), and a new Eject control (csCode 7) handler sets diskInPlace=0 so the eject STICKS (FM already unmounted+flushed, so no in-flight I/O to drain). Was a fixed NON-ejectable disk (inherited from the eSATA driver). Device type kept 'disk'/writable (kdgDiskType) to preserve the r37 anti-Audio-CD-misID fix. EXPECT: still mounts WRITABLE + copies CLEAN + the Finder now offers EJECT (menu or drag-to-Trash) + ejecting removes the icon (safe removal, like USB 1.1). WATCH FOR REGRESSIONS: (a) volume read-only or 'Audio CD' => removability reopened the CD-misID => revert; (b) won't mount => diskInPlace value wrong. Post-eject remount = reboot (v2). Throughput (20x R / ~13x W device ceiling) + residue-check reliability UNCHANGED. r79 write sweep also present.\n");
+    LOG("==== (r80) REMOVABLE/EJECTABLE (block-driver change, usb_disk.c). The USB volume now registers as EJECTABLE removable media: DrvSts.diskInPlace 8->1 in AddDrive + kStatus(8), and a new Eject control (csCode 7) handler sets diskInPlace=0 so the eject STICKS (FM already unmounted+flushed, so no in-flight I/O to drain). Was a fixed NON-ejectable disk. Device type kept 'disk'/writable (kdgDiskType) to preserve the r37 anti-Audio-CD-misID fix. EXPECT: still mounts WRITABLE + copies CLEAN + the Finder now offers EJECT (menu or drag-to-Trash) + ejecting removes the icon (safe removal, like USB 1.1). WATCH FOR REGRESSIONS: (a) volume read-only or 'Audio CD' => removability reopened the CD-misID => revert; (b) won't mount => diskInPlace value wrong. Post-eject remount = reboot (v2). Throughput (20x R / ~13x W device ceiling) + residue-check reliability UNCHANGED. r79 write sweep also present.\n");
     LOG("     and got to 52MB: the fix DIRECTION is right, the device just GC-stalls >33s sometimes. r54:\n");
     LOG("     (1) watchdog now on the RELIABLE 60Hz Ticks clock @ 60s (was a variable service-counter);\n");
     LOG("     (2) [health] now reports maxStall = the device's worst-case stall in seconds. EXPECT: 64MB\n");

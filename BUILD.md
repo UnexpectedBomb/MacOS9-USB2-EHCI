@@ -48,22 +48,30 @@ python3 scripts/pef-to-blob.py build/EHCIUIM.pef src/ehci_pef_blob.h gEHCIPef
 cmake --build build --target blockdrv
 python3 scripts/pef-to-blob.py build/USBDisk.pef src/usb_disk_blob.h gUsbDiskPef
 
-# 3. build + package the universal launcher app (MacBinary + disk image)
-cmake --build build --target EHCILauncher_APPL
-# (the EHCITrigger / EHCITrigger_APPL targets build the diagnostic harness the same way)
+# 3. build + package the faceless helper app (MacBinary + disk image)
+cmake --build build --target EHCIActivate_APPL
+# (EHCILauncher_APPL builds the older interactive launcher; EHCITrigger_APPL the diagnostic harness)
 ```
 
-The result is `build/EHCILauncher.bin` (MacBinary — copy to the OS 9 machine and decode so the
-resource fork survives) plus `.APPL`/`.dsk` variants. A prebuilt copy is in `dist/USB2-Launcher.bin`
-(the one universal launcher, for both PCI-card and on-board machines).
+The result is `build/EHCIActivate.bin` (MacBinary — copy to the OS 9 machine and decode so the
+resource fork survives) plus `.APPL`/`.dsk` variants. A prebuilt copy is in `dist/USB2_Activate.bin`
+(one universal helper, for both PCI-card and on-board machines).
 
 If you edit a driver source, re-run its build + `pef-to-blob` step and then rebuild the app —
 otherwise the app keeps embedding the old driver.
 
-> **ROM-integration note.** The shipping helper (`EHCILauncher` built with `PATHA_ROM_DRIVER`) uses
-> the driver **from the ROM**, not the embedded blob, so it no longer installs the byte array at
-> runtime. The blob is still built and embedded (it is the fallback used by the older in-app
-> injection path and the diagnostic harness), so the two-phase order above still applies.
+> **ROM-integration note.** The shipping helper uses the driver **from the ROM**, not the embedded
+> blob, so it no longer installs the byte array at runtime. The blob is still built and embedded (it
+> is the fallback used by the older in-app injection path and the diagnostic harness), so the
+> two-phase order above still applies.
+
+> **Pairing.** The helper reaches into the driver's `'Eusb'` Gestalt service struct, so the ROM and
+> the helper are versioned as a pair and must be updated together. If you rebuild one, rebuild both.
+
+> **Version-stamp your ROMs.** `python3 rom/wrap_macbinary.py <raw-rom> <version> <out.bin>` wraps a
+> built ROM as MacBinary with a `vers` resource, so Get Info on the installed `Mac OS ROM` shows
+> which build it is. Worth doing: it is the one-second check that you are running the ROM you think
+> you are.
 
 ## Injecting the driver into the Mac OS ROM
 

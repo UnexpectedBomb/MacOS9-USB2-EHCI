@@ -5,15 +5,20 @@
 # that Apple never published (so the stock toolchain libUSBServicesLib.a only has
 # the public USBGetVersion).
 #
-# Source of truth = the real USBServicesLib.pef carved from the Mac OS ROM in the
-# feasibility workspace (all 77 exports). We wrap it with a 'cfrg' resource naming
-# the fragment "USBServicesLib" (so our imports bind to the live USL at runtime),
-# then MakeImport turns the exports into linkable import stubs.
+# Source of truth = the real USBServicesLib.pef carved out of your machine's Mac OS ROM
+# (all 77 exports). We wrap it with a 'cfrg' resource naming the fragment
+# "USBServicesLib" (so the imports bind to the live USL at runtime), then MakeImport
+# turns the exports into linkable import stubs.
+#
+# NOTE: only the exported SYMBOL NAMES end up in the .a — MakeImport emits linkage stubs,
+# not Apple's code. Carve the PEF yourself with Elliot Nunn's tbxi tools; it is not
+# redistributed here.
 #
 # Prereq: Retro68 toolchain on PATH. Run from this directory.
+# Set $USBSERVICESLIB_PEF to your carved USBServicesLib.pef.
 set -e
-TC="$HOME/Retro68-build/toolchain"
-PEF="$HOME/Developer/claude-os9/usb2-feasibility/sources/USBServicesLib.pef"
+TC="${RETRO68:-$HOME/Retro68-build/toolchain}"
+PEF="${USBSERVICESLIB_PEF:?set USBSERVICESLIB_PEF to your carved USBServicesLib.pef}"
 export PATH="$TC/bin:$PATH"
 
 cp "$PEF" USBServicesLib

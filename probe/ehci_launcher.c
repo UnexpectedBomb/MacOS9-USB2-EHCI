@@ -171,8 +171,8 @@ static void handle_menu_event(EventRecord *evt)
 /* ---- Path A node-probe: dump the EHCI node's OF identity so we can (1) lock the
  * ROM-parcel match string and (2) tell whether the boot USB Expert (device_type
  * == "usb") or the Device Manager loads our driver — which decides the parcel
- * flags + TheDriverDescription.driverRuntime. Same discipline as the eSATA v61
- * node-probe that locked "SunrichSATA3512" before the burn. ---- */
+ * flags + TheDriverDescription.driverRuntime. Always node-probe the target and lock
+ * the match string before burning a ROM. ---- */
 #define PATHA_NODEPROBE 0
 /* PATH A mount vehicle: 1 = skip the driver-property injection and use the driver the ROM PARCEL already
  * bound to the node (driver,AAPL,MacOS,PowerPC + driver-ptr, prepared by the boot loader). We only call
@@ -219,7 +219,7 @@ static void probe_node(RegEntryID *n)
     probe_prop(n, "AAPL,driver-name");            /* driver name the DM registered us under */
     printf("=============================================================\n");
     printf("Decides: device_type==\"usb\" -> USB Expert loads us (plugin path);\n");
-    printf("         else -> Device Manager loads us via DoDriverIO (eSATA-style).\n");
+    printf("         else -> Device Manager loads us via DoDriverIO.\n");
     printf("Match the parcel on the 'compatible' entry containing pciclass,0c0320\n");
     printf("(or the exact 'name' if compatible lacks it).\n\n");
 }

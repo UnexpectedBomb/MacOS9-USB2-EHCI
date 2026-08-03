@@ -6,7 +6,11 @@
 
 Earlier releases shipped the driver *inside an app* that installed it at runtime. This release takes the step the project was built toward: the EHCI UIM is injected into the **Mac OS ROM** itself, as a `driver,AAPL,MacOS,PowerPC` parcel bound to the USB 2.0 controller's Name Registry node (built with Elliot Nunn's Mac OS ROM toolchain). Mac OS 9 now **loads and binds our driver at boot, as a genuine OS-owned host-controller driver**, the same way it loads a native Apple one. That is the architectural milestone: on a machine with the patched ROM, USB 2.0 support is part of the operating system, not bolted on by a helper app.
 
-**Honest scope: a small headless helper is still needed to mount.** OS 9's built-in mass-storage mounter will not advance a Hi-Speed device (it stops after the first `TEST UNIT READY` / `REQUEST SENSE` and never issues `INQUIRY`), so it cannot bring a 2.0 drive to the desktop on its own. A tiny helper app, which can sit **silently in your Startup Items folder**, activates the ROM driver and runs the mount (the same self-probe the driver has always performed). Fully seamless, no-helper plug-and-play is **not** solved, and this README does not claim it is. What the ROM integration buys is the foundation: the driver is now a first-class OS component, which is what any future seamless mount has to build on.
+**The operating system now performs the mount itself.** The driver enumerates the device, runs the SCSI Bulk-Only probe, and **installs its own native block driver**, which calls `AddDrive` and posts a disk-inserted event — so Mac OS 9 mounts the volume through its ordinary path, exactly as it would for a built-in controller. Nothing in user space calls `PBMountVol` any more. Apple's mass-storage mounter is not involved at all (it cannot be: it stops after the first `TEST UNIT READY` / `REQUEST SENSE` and never issues `INQUIRY` to a Hi-Speed device), and neither is Apple's USB stack, whose view of our ports we suppress.
+
+**Hot-plug works.** Insert, eject, unplug, re-insert, or swap in a completely different drive — every arrival is re-scanned and re-mounted, on the same drive number, with no leak. Pulling a drive without ejecting unmounts it cleanly instead of leaving a "damaged disk" behind, and both ejection and improper removal produce the same alerts, word for word, that Apple's own USB stack shows.
+
+**Honest scope: a small faceless helper is still required.** It sits silently in Startup Items and does two things: activates the ROM driver (`LoadUIMForEntry`) and pumps the polled service slot that device *discovery* runs on. That slot is only ever driven by Apple's USB Services Library from an application context, which is why the last helper process cannot be removed yet. It is **not** in the data path — once a volume is mounted, all I/O runs at interrupt level. In practice you never interact with it: it starts at boot, shows nothing, and drives are plug-and-play from then on.
 
 The driver serves two kinds of machine, at two different maturity levels:
 
@@ -52,7 +56,7 @@ back and claims only a free one on an on-board controller). You do not pick a bu
 
 ## Install & use
 
-There are two parts: a **one-time setup** (patch the driver into your Mac OS ROM and place the helper), and then a short **per-session** insertion sequence. The insertion timing is the whole trick.
+A **one-time setup**: patch the driver into your Mac OS ROM, and drop the faceless helper into Startup Items. After that, drives are plug-and-play.
 
 ### One-time setup
 
@@ -62,45 +66,33 @@ There are two parts: a **one-time setup** (patch the driver into your Mac OS ROM
    ```
    Put the patched copy in place of the `Mac OS ROM` in your System Folder, and **keep the original** so you can revert. See [BUILD.md](BUILD.md) for the toolchain this step needs. This is the only step that touches the ROM; everything else is an ordinary file.
 
-2. **Place the helper.** Decode the helper app (`dist/USB2-Launcher.bin`) on the Mac. To have the Hi-Speed mount happen automatically at each boot, drop it (or an alias to it) into **System Folder ▸ Startup Items**, where it runs headless at startup. You can also just double-click it when you want it.
+2. **Place the helper.** Decode the helper app (`dist/USB2_Activate.bin`) on the Mac and drop it into **System Folder ▸ Startup Items**. It runs faceless at every boot: it brings the ROM driver up and then hands the front back to the Finder, showing no window. (You can also double-click it when you want it, but Startup Items is the intended home.)
 
-Setup is done. From here the driver loads at every boot straight from the ROM; the helper is only what performs the mount.
+Setup is done. From here the driver loads at every boot straight from the ROM, the helper activates it, and the OS mounts drives as you plug them in.
 
 ### Each session
 
-1. **Boot with your USB drive UNPLUGGED.**
-   This is the important one. If a drive is attached at startup, Mac OS 9's built-in USB **1.1** driver grabs it first, and it will not hand over to USB 2.0 cleanly (you may get a "device was unexpectedly disconnected" message, or a hang). Start clean, with no target drive attached. *(Your keyboard and mouse can stay plugged in.)*
+1. **Boot with your USB drive unplugged.** Your keyboard and mouse can stay connected. This is the one piece of sequencing that still matters: a drive attached at *bring-up* gets handed to the built-in 1.1 controller (see "The open problems"), so it would mount at 1.1 speed rather than 2.0.
 
-2. **Let the helper run.** If it is in Startup Items it starts at boot; otherwise double-click it. It activates the ROM driver ("claiming the ports"), then settles the input devices for a few seconds. On an on-board machine your keyboard and mouse may briefly pause here, which is expected. Do **not** plug the drive in yet.
+2. **Plug the drive into any free port on the EHCI card** and it mounts, at Hi-Speed, showing the custom **"2.0" drive icon**. There is no prompt to wait for and no window to watch. *(If the icon looks like a generic disk the first time, hold **Cmd-Option at startup** once to rebuild the desktop; the Finder caches volume icons.)*
 
-3. **Wait for the beep and this on-screen banner** (the helper shows a small console window while it waits):
-   ```
-   ****************************************************
-   *   >>>  INSERT USB DRIVE NOW  <<<
-   ****************************************************
-   ```
+3. **Use it normally.** Eject in the Finder (drag to Trash, or Special ▸ Eject) before unplugging, as with any removable disk. You can then unplug, re-insert, or plug in a different drive, as many times as you like.
 
-4. **Now plug your drive into any free port** (one that is empty right now: on a card machine, a port on the card; on the Mac Mini, a free built-in port such as the one next to the FireWire jack; **not** the port your keyboard or mouse uses). On a PCI card it mounts within a few seconds. On an on-board machine the drive may re-try a few times before it appears, and mounts as soon as it stabilizes. *(On-board: if it has not mounted within about 30 seconds it has probably hit the shared-interrupt lockup, so reboot and retry.)*
+That is the whole flow. You do not need to quit anything, and a **Special ▸ Restart** with the driver active is safe — the driver quiesces the controller through a Shutdown Manager hook before the machine goes down.
 
-5. The drive **mounts on the desktop** at USB 2.0 speed (you will hear a second beep), showing the custom **"2.0" drive icon**. The helper's window then hides to reveal the Finder. *(If the icon looks like a generic disk the first time, hold **Cmd-Option at startup** once to rebuild the desktop; the Finder caches volume icons.)*
+If you do quit the helper (Cmd-Q) with a volume still mounted, it unmounts cleanly first and hands the ports back to the built-in 1.1 controller, so ordinary USB 1.1 works again immediately with no reboot.
 
-6. **Use the drive normally, and leave the helper running.** It hosts the USB stack for the whole session.
-
-7. **Eject in the Finder** (drag to Trash, or Special ▸ Eject) **before unplugging.**
-
-8. **When you are finished, quit the helper** with **File ▸ Quit** (Cmd-Q also works). On quit it hands the ports back to the built-in 1.1 controller, so ordinary USB 1.1 works again right away, with no reboot.
-
-**To mount another drive in the same session:** this build mounts one drive per run of the helper. Quit it, **reboot with the drive unplugged**, and let it run again. (See "The open problems" for why re-insertion is not yet supported.)
-
-If a drive does not appear, two logs are written next to the helper for troubleshooting and bug reports: **`USB2 Launcher Log`** (the helper's own step-by-step) and **`EHCIUIM_init.log`** (the driver's detailed trace).
+If a drive does not appear, two logs are written for troubleshooting and bug reports: the helper's own step-by-step log next to the application, and **`EHCIUIM_init.log`** on the boot volume (the driver's detailed trace). The driver *appends* to that log across loads, so delete it first and read from the last banner.
 
 ## Known limitations (please read)
 
-This is a beta, and the flow above is deliberate — these are the things it does **not** do yet:
+This is a beta. These are the things it does **not** do yet:
 
 - **On-board USB 2.0 is experimental and can freeze.** On a PCI card mounting is reliable. On an on-board controller (Mac Mini G4) the EHCI shares its interrupt line with the keyboard/mouse; mid-mount, under the wrong timing, the shared-line interrupt handling can lock the whole machine (keyboard/mouse go dead). It has mounted and copied real files there, but not dependably. If it doesn't mount within a few seconds, reboot and retry — and don't put data you care about on it from an on-board machine yet.
-- **Not plug-and-play.** You must boot with the drive unplugged and insert it only when prompted (steps above). A drive attached at boot, or hot-plugged without the launcher, will not mount at 2.0 (and may throw a disconnect error).
-- **One mount per launch.** After ejecting, reboot (unplugged) and relaunch to mount again. Hot re-insertion isn't supported yet.
+- **A drive attached at boot mounts at 1.1, not 2.0.** Ports that are already occupied when the controller is brought up are handed to the 1.1 companion. Boot with the drive unplugged, then insert it.
+- **External hubs are not driven by this stack.** A USB 2.0 hub (including the hub built into an Apple Cinema Display) is handed to Apple's 1.1 companion controller, so devices behind it work at 1.1 speeds. Driving a hub at Hi-Speed needs downstream port control and, for any keyboard or mouse behind it, EHCI **split transactions** — neither is implemented. See "The open problems".
+- **A port handed to the 1.1 companion stays there until reboot.** Once ownership is released, EHCI can no longer tell "empty" from "companion-owned" on that port, so the driver deliberately never takes it back — reclaiming it would risk stuttering a keyboard that is working. Use a different port for a Hi-Speed drive, or reboot.
+- **Writes are slower than reads.** Reads reach the device's ceiling (~20 MB/s); Finder writes land around 2 to 3 MB/s because the Finder issues small synchronous writes above the driver.
 - **Mid-write yank is unsafe** (as on any OS) — always eject first.
 - **A few tested hardware combinations** (see Supported machines). Other EHCI cards/controllers are untested.
 - The driver writes a verbose `EHCIUIM_init.log` each run. That's intentional for a beta (it's what to attach to a bug report) and does not slow down file transfers.
@@ -115,14 +107,20 @@ On a **dedicated PCI card** the manual flow above is rock-solid. Two hard proble
 
 On a machine like the Mac Mini G4 the EHCI shares **one PCI interrupt line** with the OHCI companion controllers that drive the keyboard and mouse. Our interrupt handler chains to the companion's handler so input keeps working — and it does, *most of the time*. But intermittently, during the initial bulk-transfer probe of a freshly inserted drive, a completion interrupt on that shared line wedges the processor and the whole machine locks up (keyboard/mouse dead), before the drive mounts. On other boots the very same drive mounts in a couple of seconds and copies gigabytes cleanly. We've narrowed it to the shared-line interrupt path (a dedicated-card line never does this), but a robust fix for chaining into Apple's OHCI handler under load is still open. **If you understand classic Mac OS PCI interrupt sharing / the OHCI UIM's interrupt handler, this is the one to crack.**
 
-### 2. Moving a device between the 1.1 companion and EHCI
+### 2. A drive attached when the controller is brought up
 
-The driver mounts perfectly when a drive is inserted onto a port that **already belongs to EHCI** — the manual flow. What does *not* yet work is any scenario where a drive has to **move between Apple's USB 1.1 companion controller and EHCI:**
+**Hot re-insertion is solved** — this was previously listed here as blocked on Apple's `ExpertIdleTask` monopolizing the USB Expert's task-level idle loop. The fix was to stop depending on Apple's stack at all: the driver now does its own port reset, speed detection, `SET_ADDRESS`, descriptor reads, `SET_CONFIGURATION`, endpoint registration and Bulk-Only transport, then installs its own block driver and lets the OS mount the result. Apple's idle-loop monopoly became irrelevant rather than worked around, and eject / unplug / re-insert / drive-swap all work.
 
-- **Auto-mount at boot** (drive attached at startup): the 1.1 companion claims it before our driver loads, and handing it over to EHCI stalls or hangs.
-- **Hot re-insertion** (eject → unplug → replug mid-session): the re-enumeration makes Apple's USB Mass Storage class driver monopolize the USB Expert's task-level idle loop (`ExpertIdleTask`) and never yield it back, so the task-level re-mount never runs.
+What remains is narrower: **a drive already attached when the EHCI controller is brought up** is handed to the 1.1 companion by the bring-up path, so it mounts at 1.1. The port-ownership handoff is one-way by design (see the next problem), so it stays there. Boot with the drive unplugged and insert it afterwards.
 
-Both trace to the same root: **Mac OS 9's USB stack does not gracefully hand a mass-storage device between the 1.1 companion and the EHCI controller.** We tried preventing the companion from grabbing it and forcing the hand-off (stalls or hangs), from several angles, same wall. The ROM integration in this release changes one part of the picture: the driver is now present and bound at boot (an INIT could never map the card's registers that early, and the ROM parcel sidesteps that entirely), so early-load is no longer the obstacle. What keeps auto-mount and hot re-insertion open is the hand-off itself, plus the fact that OS 9's own mounter will not advance a Hi-Speed device at all. The headless helper sidesteps both by keeping the companion out of the picture for the *target drive* and performing the mount itself.
+### 3. Driving an external hub at Hi-Speed
+
+A USB 2.0 hub currently gets handed to Apple's 1.1 companion, so anything behind it runs at 1.1. Doing better needs two things this stack does not have:
+
+- **Downstream hub port control** — enumerating the hub itself, then resetting and assigning addresses to devices on its ports. Tractable, and enough on its own for a Hi-Speed *drive* behind a hub.
+- **EHCI split transactions** (`siTD` / split `qTD`) — required for any full- or low-speed device (keyboard, mouse) behind a high-speed hub. Not implemented at all.
+
+There is also a wrinkle worth knowing if you touch this area. Releasing a port to the companion (`PORTSC` Port Owner = 1) only works from the state the EHCI spec intends: a port that is **not enabled**, i.e. one where a reset did not bring up a high-speed device. Handing over a port that *is* enabled at Hi-Speed does not take effect. The driver now clears Port Enable first, and records the handoff in software rather than re-reading the ownership bit back out of the hardware — trusting that register as the record of a decision it had already made produced a livelock, with the port bouncing between the two controllers so fast that neither could enumerate anything.
 
 Issues, pointers, and patches are all welcome.
 
@@ -152,7 +150,8 @@ cmake --build build
 The shippable pieces are the **driver** (injected into the Mac OS ROM) and the **universal helper** that performs the mount:
 
 - **`EHCIUIM`** target → `EHCIUIM.pef`, the driver. `rom/usb_rom_inject.py` injects it into a Mac OS ROM as a `driver,AAPL,MacOS,PowerPC` parcel. A prebuilt copy is in `dist/EHCIUIM.pef`.
-- **`EHCILauncher`** target → `EHCILauncher.bin`, the helper. One binary for every machine (PCI card *and* on-board): the driver's per-port claim and its `sharedCompanion` interrupt discriminator adapt to the hardware at runtime, so there is no per-machine build variant. It can run headless from Startup Items. A prebuilt copy is in `dist/USB2-Launcher.bin`.
+- **`EHCIActivate`** target → `EHCIActivate.bin`, **the shipping helper**. Faceless: it activates the ROM driver, hands the front back to the Finder and hides, then pumps the polled slot that discovery runs on. One binary for every machine (PCI card *and* on-board): the driver's per-port claim and its `sharedCompanion` interrupt discriminator adapt to the hardware at runtime, so there is no per-machine build variant. A prebuilt copy is in `dist/USB2_Activate.bin`.
+- **`EHCILauncher`** target → `EHCILauncher.bin`, the older interactive launcher, kept for reference. Superseded by `EHCIActivate`.
 
 `EHCITrigger` is the developer harness (verbose on-screen and on-disk logging) used during development. Retro68 emits MacBinary, so decode the `.bin` on the Mac. See **[BUILD.md](BUILD.md)** for the full build (the drivers are built and embedded as byte arrays before the app, and the ROM parcel is injected with `rom/usb_rom_inject.py`).
 

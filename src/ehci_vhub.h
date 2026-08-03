@@ -50,6 +50,12 @@ long ehci_vhub_bulk_xfer(void *pipe, void *complUPP, volatile UInt8 *buf,
                          UInt32 addr, UInt32 endpt, UInt32 len, UInt32 dirIn);
 UInt32 ehci_vhub_bulk_stats(long *lastStat, UInt32 *doneN, UInt32 *errN, UInt8 *d16);
 void   ehci_vhub_irq_stats(unsigned long *isrHits, int *a2live);   /* r35: real-IRQ install/fire state */
+void   ehci_vhub_spoof_stats(UInt32 *bcd, UInt32 *mp);             /* p0i3: descriptor-spoof patch counts */
+/* p0i3b: config-descriptor diagnostic — GET_DESCRIPTOR-by-type counts, largest config fetch's actual +
+ * SETUP wLength + raw bytes (snap48[48], pre-spoof), and its endpoint walk (epN + ep4[4], each packed
+ * (off<<24)|(bmAttr<<16)|(maxpkt&0xFFFF)). Read at TASK level from uim23. */
+void   ehci_vhub_cfgcap(UInt32 *gdDev, UInt32 *gdCfg, UInt32 *gdStr, UInt32 *gdOther, UInt32 *cfgFull,
+                        UInt32 *maxActual, UInt32 *setupLen, UInt32 *epN, UInt32 *ep4, UInt8 *snap48);
 /* r36 reliability diagnostics (all read at TASK level from uim23; interrupt-safe producers). */
 int    ehci_vhub_portevt_pop(UInt32 *ms, UInt8 *port, UInt8 *ev, UInt32 *portsc);   /* 1=popped, 0=empty */
 /* r83 OBSERVE: frame_ms/ring-independent probe. Returns #ports; *svcCalls=gVhubTick (advancing => the
@@ -99,5 +105,6 @@ UInt32 ehci_vhub_simulate_replug(UInt32 n);
  * timer, both driving ehci_vhub_service. Call from slot 0 (Initialize) after the controller
  * is up. This is how a resident UIM services its own controller (as Apple's OHCI UIM does). */
 void ehci_vhub_start_service(EHCIRegEntryIDPtr node);
+void ehci_vhub_stop_service(void);   /* clean teardown: stop timer/ISR/interrupts/schedules (kFinalize/kClose) */
 
 #endif /* EHCI_VHUB_H */

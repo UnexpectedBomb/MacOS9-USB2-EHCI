@@ -1,4 +1,4 @@
-/* USB 2.0 volume icon — 'icns' IconFamily. Extracted by scripts/icns-to-blob.py from the user's
+/* USB 2.0 volume icon — 'icns' IconFamily. Extracted by scripts/icns-to-blob.py from a
  * "USB 2.0 ICON" resource. The USB block driver (usb_disk.c) returns a pointer to this blob via
  * DriverGestalt kdgMediaIconSuite/kdgPhysDriveIconSuite so a 2.0-mounted volume shows this icon
  * (USB 1.1 volumes go through Apple's driver and show the stock icon). DO NOT EDIT BY HAND. */

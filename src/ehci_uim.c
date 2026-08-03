@@ -26,15 +26,17 @@ typedef unsigned long  OSType;
 
 typedef struct { UInt8 len; char s[31]; } Str31;
 typedef struct { UInt8 majorRev, minorAndBugRev, stage, nonRelRev; } NumVersion;
+typedef struct { OSType serviceCategory; OSType serviceType; NumVersion serviceVersion; } EHCIServiceInfo;
 typedef struct {
     OSType     sig;             /* 'mtej' */
     UInt32     descVersion;     /* 0 */
     Str31      nameInfoStr;     /* "pciclass,0c0320" <- EHCI class match */
     NumVersion typeVersion;
-    UInt32     driverRuntime;   /* 0x04 = kDriverIsUnderExpertControl (loaded via LoadUIMForEntry) */
+    UInt32     driverRuntime;   /* 0x05 = LoadedUponDiscovery|UnderExpertControl */
     Str31      driverName;      /* "EHCIUIM" */
     UInt32     reserved[8];
-    UInt32     nServices;
+    UInt32     nServices;       /* n1: MUST be >= 1 — see the note on the initializer below */
+    EHCIServiceInfo service0;   /* n1: the one declared service (generic native driver) */
 } EHCIDriverDescription;
 
 EHCIDriverDescription TheDriverDescription = {
@@ -42,17 +44,32 @@ EHCIDriverDescription TheDriverDescription = {
     0,
     { 15, "pciclass,0c0320" },
     { 1, 0, 0x80 /*final*/, 0 },
-    0x00000005UL,   /* Path A boot-load: 0x05 = kDriverIsLoadedUponDiscovery(0x01) |
-                     * kDriverIsUnderExpertControl(0x04), NOT OpenedUponLoad — the eSATA v65-proven
-                     * value. The ROM parcel binds driver,AAPL,MacOS,PowerPC to our EHCI node; since
-                     * that node has NO device_type=usb (2026-07-24 probe), the USB Expert ignores it
-                     * and the PCI expert / Device Manager loads us via DoDriverIO at boot. kInitialize
-                     * is stash-only (boot-safe); the mount app's Open triggers bring-up. (Old 0x04 =
-                     * the USL/LoadUIMForEntry path used by the manual app; 0x03 self-load never engaged
-                     * the node in HW tests #2/#3 — the ROM parcel is what makes discovery-load fire.) */
+    0x00000005UL,   /* 0x05 = kDriverIsLoadedUponDiscovery(0x01) | kDriverIsUnderExpertControl(0x04).
+                     * Same value as the working ROM ATA controller (cmd646-ata).
+                     * ★ DELIBERATELY *NOT* kDriverIsOpenedUponLoad(0x02): proved on HARDWARE
+                     * that auto-opening at boot crashes near the desktop (the OS brings a not-yet-
+                     * functional driver fully online into the SystemTask machinery, then calls a garbage
+                     * UPP) — and our own kOpen does the FULL bring-up (HCReset/DMA/IRQ), which
+                     * FREEZES during the early PCI-claim phase. So we accept
+                     * load-without-open here; a later, task-context trigger performs the Open (see
+                     * docs/NATIVE_INTEGRATION_DESIGN.md — likely a tiny boot INIT calling OpenDriver,
+                     * which is how Apple itself shipped USB support on PCI-card machines). */
     { 7, "EHCIUIM" },
     { 0,0,0,0,0,0,0,0 },
-    0
+    /* ★★ n1 ROOT-CAUSE FIX (2026-07-31). This was `0` — NO declared service — and the n0 hardware test
+     * proved DoDriverIO was NEVER CALLED (trace: 0 commands; "DoDriverIO" absent from the whole log;
+     * EHCIUIM_init.log did not even exist before an app ran). Reason:
+     * a native driver's description MUST declare at least one service (DriverFamilyMatching.h, "The List
+     * of Services (at least one)") — **omitting it makes VerifyFragmentAsDriver REJECT the fragment**, so
+     * the Device Manager never loads it as a driver at all. The USL could still call our exported dispatch
+     * table directly (LoadUIMForEntry), which is exactly the behaviour we had been relying on unknowingly.
+     * NB this also means lc1's "boot quiesce at kInitialize" has never actually run.
+     * Category/type = 'ndrv'/'genr' = a GENERIC native driver: honest for a host controller and neutral —
+     * deliberately NOT 'usb ' (kServiceCategoryUSB), which could invite Apple's USB Expert to adopt us and
+     * undo the Apple-independence we built. (If 'genr' turns out not to satisfy the loader, 'blok' is a
+     * known-good alternative for a storage-backed native driver.) */
+    1,
+    { FOURCC('n','d','r','v'), FOURCC('g','e','n','r'), { 1, 0, 0x80 /*final*/, 0 } }
 };
 
 #include "ehci.h"
@@ -62,6 +79,7 @@ EHCIDriverDescription TheDriverDescription = {
 
 /* Shared controller soft state (DoDriverIO in ehci_os.c + the vhub also reference it). */
 ehci_softc gSoftc;
+extern int gBroughtUp;   /* ehci_os.c: shared one-time-bring-up guard (see uimInitialize below) */
 
 /* slot 0 — Initialize: the USL/Expert hands us the controller's Name Registry node. Bring the
  * controller up (ehci_os.c: PCI enable, register map, reset, schedules, run) then initialize the
@@ -71,8 +89,19 @@ static OSStatus uimInitialize(UInt32 a0, UInt32 a1, UInt32 a2, UInt32 a3,
 {
     long e;
     (void)a4; (void)a5; (void)a6; (void)a7;
-    ehci_os_log("=== EHCIUIM r23: self-probe + block R/W service ('Eusb', read+WRITE) for our disk driver ===");
+    ehci_os_log("=== EHCIUIM n11 (PORT-CEDE FIX for the hub thrash loop. n9 gave a non-storage high-speed device to the 1.1 companion by setting Port Owner = 1, then re-derived have-we-ceded-this-port from that same bit every pass. The bit did not read back as 1, so the driver saw the companion-owned CCS=0 as device-pulled, fired a spurious media-gone, reset the probe, re-hid the port and re-enumerated - 148 rounds in one session, and Apple never got a stable window to enumerate the Cinema Display hub, so its keyboard and mouse were dead too. Two changes: gPortCeded records the DECISION in software and no port-event can un-cede it; and the cede now clears Port Enable BEFORE setting Owner, because both cede paths that always worked surrender a NOT-ENABLED port, which is the EHCI 2.3.9 handoff point. WATCH: exactly ONE handoff per insert, n11 PORTSC after cede should show bit13 0x2000, and no RECONNECT storm.) ===");
     ehci_os_log("uimInitialize: entered (dispatch slot 0)");
+    /* n0: dump the DoDriverIO trace HERE — deliberately BEFORE the gBroughtUp early-return below, because if
+     * the Device Manager already opened + brought us up at boot then gBroughtUp is 1 and that return would
+     * fire, hiding the very evidence we came for. */
+    { extern void ehci_os_n0_dump(void); ehci_os_n0_dump(); }
+    /* IDEMPOTENT: a SECOND app launch (LoadUIMForEntry) re-enters here while the driver is already up.
+     * Re-running the bring-up armed a 2nd self-re-arming heartbeat timer, corrupted gSavedHandler (it
+     * saved OUR vhub_isr instead of the companion's), re-HCReset the live controller, and leaked the DMA
+     * pool -- and that duplicate interrupt state is what crashed at interrupt level during the next warm
+     * reboot's teardown. So if we are already up, do NOTHING and return; the relaunch uses the running
+     * driver (its reconnect self-probe handles a fresh insert). */
+    if (gBroughtUp) { ehci_os_log("uimInitialize: driver already up -> SKIP re-init (idempotent)"); return noErr; }
     ehci_os_logx("  arg0", a0); ehci_os_logx("  arg1", a1);   /* learn the slot-0 ABI */
     ehci_os_logx("  arg2", a2); ehci_os_logx("  arg3", a3);
     /* r42 MacsBug prep: log the UIM CODE BASE so a crash PC maps to a function via the nm map
@@ -94,7 +123,13 @@ static OSStatus uimInitialize(UInt32 a0, UInt32 a1, UInt32 a2, UInt32 a3,
         (void)ehci_vhub_xfer_init();      /* DMA page + downstream control QH */
         ehci_os_log("  vhub_xfer_init done; vhub_start_service...");
         ehci_vhub_start_service(&gSoftc.node);   /* install the EHCI ISR + periodic timer */
+        gBroughtUp = 1;                          /* mark up so a 2nd launch skips the re-init (see above) */
         ehci_os_log("  vhub_start_service done — INIT COMPLETE");
+        /* n10: hook the Shutdown Manager NOW, at task level, while the File Manager is up. Without this a
+         * warm reboot inherits a running controller with live DMA and interrupts — the frozen-cursor
+         * desktop the user hit, which a cold boot cures. ehci_os_boot_quiesce() was meant to cover this but
+         * lives on the kInitialize path, which n0 proved is never called. */
+        { extern void ehci_vhub_install_shutdown_hook(void); ehci_vhub_install_shutdown_hook(); }
     } else {
         ehci_os_logx("  ehci_os_init FAILED e=", (unsigned long)e);
     }
@@ -102,10 +137,12 @@ static OSStatus uimInitialize(UInt32 a0, UInt32 a1, UInt32 a2, UInt32 a3,
 }
 static OSStatus uimFinalize(void)
 {
-    /* On a clean UIM unload, hand the root ports back to the companion 1.1 controllers
-     * (+ clear CONFIGFLAG) so a drive plugged in afterward is seen by the OS's own OHCI
-     * driver rather than stranded on our idle EHCI ports. */
+    /* On a clean UIM unload: FIRST stop the driver cold (heartbeat timer, ISR, interrupts, schedules) so
+     * nothing keeps running / dangles after us, THEN hand the root ports back to the companion 1.1
+     * controllers so a drive plugged in afterward is seen by the OS's own OHCI driver. */
+    ehci_vhub_stop_service();
     ehci_hc_release_ports(&gSoftc);
+    gBroughtUp = 0;   /* allow a fresh bring-up after a clean finalize */
     return noErr;
 }
 
@@ -276,6 +313,33 @@ static OSStatus uim23(UInt32 a,UInt32 b,UInt32 c,UInt32 d,UInt32 e,UInt32 f,UInt
             }
         }
         if (gSlotCount[27] - last27 >= 8192) { last27 = gSlotCount[27]; ehci_os_logx("slot27 ticks(total)", gSlotCount[27]); }   /* v47: throttled 512->8192 (16x less FSWrite/FlushVol) = truly lean timing + a coarse liveness heartbeat; the v47 STALL dump carries the fine-grained state during a freeze */
+        { static int p0logged = 0; UInt32 sb = 0, sm = 0; ehci_vhub_spoof_stats(&sb, &sm);   /* p0i3: confirm the descriptor spoof engaged (log once, task level) */
+          if (!p0logged && (sb | sm)) { p0logged = 1; ehci_os_log("p0i3 DESCRIPTOR SPOOF fired:"); ehci_os_logx("  bcdUSB patches", sb); ehci_os_logx("  bulk-maxpkt patches", sm); } }
+        /* p0i3b: one-shot config-descriptor diagnostic (why did the maxpkt spoof never fire?). Fire as soon
+         * as a FULL config fetch (actual>9) is captured — the snapshot is complete by then; else after 2 cfg
+         * fetches; else a ~5s (300-tick) settle after the first cfg fetch (so a header-only/no-full run still
+         * reports). down_reap captures pre-spoof, so the raw bytes are what the DRIVE sent, not our lie. */
+        { static int cfgDone = 0; static UInt32 cfgT0 = 0;
+          UInt32 gdDev=0,gdCfg=0,gdStr=0,gdOther=0,cfgFull=0,maxAct=0,slen=0,epN=0,ep4[4]; UInt8 snap[48];
+          UInt32 nowT = *(volatile UInt32 *)0x016AUL;
+          ehci_vhub_cfgcap(&gdDev,&gdCfg,&gdStr,&gdOther,&cfgFull,&maxAct,&slen,&epN,ep4,snap);
+          if (!cfgDone && gdCfg > 0 && cfgT0 == 0) cfgT0 = nowT;
+          if (!cfgDone && (cfgFull > 0 || gdCfg >= 2 || (cfgT0 && (nowT - cfgT0) >= 300u))) {
+              int q, w; cfgDone = 1;
+              ehci_os_log("p0i3b CONFIG-DESC DIAGNOSTIC (why maxpkt spoof didn't fire):");
+              ehci_os_logx("  GET_DESC dev   count", gdDev);
+              ehci_os_logx("  GET_DESC cfg   count", gdCfg);
+              ehci_os_logx("  GET_DESC str   count", gdStr);
+              ehci_os_logx("  GET_DESC other count", gdOther);
+              ehci_os_logx("  cfg FULL(actual>9) count", cfgFull);
+              ehci_os_logx("  cfg max actual", maxAct);
+              ehci_os_logx("  cfg max setup.wLength", slen);
+              ehci_os_logx("  cfg endpoints found", epN);
+              for (q = 0; q < 4; q++) ehci_os_logx("  ep (off<<24|attr<<16|maxpkt)", ep4[q]);
+              for (w = 0; w < 12; w++)   /* 48 raw bytes, 4/word: b0_3, b4_7, ... b44_47 */
+                  ehci_os_logx("  cfg snap b",
+                      ((UInt32)snap[w*4]<<24)|((UInt32)snap[w*4+1]<<16)|((UInt32)snap[w*4+2]<<8)|snap[w*4+3]);
+          } }
     }
     /* r36 RELIABILITY: drain the port-event ring + report downstream-engine health. With the un-starved
      * downstream control trace above, these DECIDE the intermittent -6999 handoff death in ONE losing
