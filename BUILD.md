@@ -28,30 +28,41 @@ the loader app are all PEF/CFM).
 - `rom/usb_rom_inject.py`: injects the built `EHCIUIM.pef` into a Mac OS ROM as a
   `driver,AAPL,MacOS,PowerPC` parcel (see "Injecting the driver into the Mac OS ROM" below).
 
-## The two-phase build (important)
+## The staged build (important — the order is not optional)
 
-The loader app **embeds** the two drivers (the UIM ndrv and the block driver) as byte arrays
-so it can install them at runtime — no Extensions-folder install needed. Those byte arrays
-(`src/ehci_pef_blob.h`, `src/usb_disk_blob.h`) are **generated** from the built PEFs, so you
-must build the drivers and regenerate the blobs *before* building the app.
+Two byte-array headers are **generated** from built PEFs rather than checked in, so the targets
+have to be built in dependency order:
+
+- `src/usb_disk_blob.h` — the **block driver**, embedded *into the UIM*. The UIM installs it
+  itself with `InstallDriverFromMemory`, which is how the OS ends up mounting the volume with no
+  application involved. `src/ehci_vhub.c` `#include`s this header, so **the block driver must be
+  built and embedded before the UIM will compile at all.**
+- `src/ehci_pef_blob.h` — the UIM, embedded into the helper app. Only the older in-app injection
+  path and the diagnostic harness use it; the shipping helper takes the driver from the ROM.
 
 ```sh
 # configure (once)
 cmake -S . -B build \
   -DCMAKE_TOOLCHAIN_FILE="$HOME/Retro68-build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake"
 
-# 1. build the EHCI UIM ndrv, then embed it
-cmake --build build --target ndrv
-python3 scripts/pef-to-blob.py build/EHCIUIM.pef src/ehci_pef_blob.h gEHCIPef
-
-# 2. build the block driver, then embed it
+# 1. block driver FIRST, then embed it — the UIM includes this header
 cmake --build build --target blockdrv
 python3 scripts/pef-to-blob.py build/USBDisk.pef src/usb_disk_blob.h gUsbDiskPef
+
+# 2. now the EHCI UIM ndrv (this is the driver you inject into the ROM), then embed it
+cmake --build build --target ndrv
+python3 scripts/pef-to-blob.py build/EHCIUIM.pef src/ehci_pef_blob.h gEHCIPef
 
 # 3. build + package the faceless helper app (MacBinary + disk image)
 cmake --build build --target EHCIActivate_APPL
 # (EHCILauncher_APPL builds the older interactive launcher; EHCITrigger_APPL the diagnostic harness)
 ```
+
+Building `ndrv` before step 1 fails with `fatal error: usb_disk_blob.h: No such file or directory`.
+That is the expected symptom of running these out of order, not a broken checkout.
+
+Verified: a clean clone built with the sequence above produces an `EHCIUIM.pef` byte-identical to
+the driver in the shipping ROM.
 
 The result is `build/EHCIActivate.bin` (MacBinary — copy to the OS 9 machine and decode so the
 resource fork survives) plus `.APPL`/`.dsk` variants. A prebuilt copy is in `dist/USB2_Activate.bin`
