@@ -64,7 +64,9 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
    ```sh
    python3 rom/usb_rom_inject.py "Mac OS ROM" -o "Mac OS ROM (USB2)"
    ```
-   Put the patched copy in place of the `Mac OS ROM` in your System Folder, and **keep the original** so you can revert. See [BUILD.md](BUILD.md) for the toolchain this step needs. This is the only step that touches the ROM; everything else is an ordinary file.
+   Then **boot from a CD or another volume** and put the patched copy into the System Folder in place of the `Mac OS ROM`. You cannot swap it while booted from that same System Folder. **Keep the original** so you can revert, and make sure you can boot from something else before you start. See [BUILD.md](BUILD.md) for the toolchain this step needs. This is the only step that touches the ROM; everything else is an ordinary file.
+
+   > Note: every build tested so far was produced by this injector, but only ever against two particular ROMs, and never against one from a different machine. If it will not patch yours, or the result will not boot, please open an issue saying which Mac and OS 9 version you are on.
 
 2. **Place the helper.** Decode the helper app (`dist/USB2_Activate.bin`) on the Mac and drop it into **System Folder ▸ Startup Items**. It runs faceless at every boot: it brings the ROM driver up and then hands the front back to the Finder, showing no window. (You can also double-click it when you want it, but Startup Items is the intended home.)
 
