@@ -15,8 +15,9 @@
  *   kStatus     -> kDriveStatus fills a DrvSts; everything else declines (statusErr)
  *                  so the mounter uses safe defaults (DriverGestalt crash fix).
  *
- * Follows the standard OS 9 native block-driver shape: AddDrive plus a DrvSts prefix,
- * the IOCommandIsComplete completion contract, and DriverGestalt->statusErr.
+ * Adapted DIRECTLY from the user's proven eSATA sil3512 driver (AddDrive + DrvSts
+ * prefix + the IOCommandIsComplete completion contract + DriverGestalt->statusErr).
+ * The volume is FAT/PC-Exchange, which sidesteps the HFS-mounter hang eSATA hit.
  */
 #include <MacTypes.h>
 #include <MacMemory.h>
@@ -102,19 +103,34 @@ static void dputx(const char *label, unsigned long v)
 }
 
 /* ---- USB block-read service published by the UIM via Gestalt('Eusb') ---- */
-typedef long (*usb_rw_fn)(UInt32 lba, UInt32 count, void *buf);     /* >=0 = blocks done; <0 = error */
-typedef long (*usb_submit_fn)(IOCommandID cmdID, UInt32 lba, UInt32 count, void *buf, int isWrite, long *actCount);
-/* ★★ n9: extended to the FULL layout of the UIM's gSvc (ehci_vhub.c ~L1428) so we can reach drainFn at the
- * end. It used to stop at submitFn, which was safe because a prefix always matches — that is no longer true
- * now that we index past it, so THESE TWO DECLARATIONS MUST STAY IN SYNC. `magic2` is an end-marker the UIM
- * writes last: we verify it before ever touching drainFn, so a future layout drift fails safe instead of
- * calling a garbage pointer. The middle fields are opaque here and exist only to get the offsets right. */
+/* ★★★★ n19 STEP 4 ABI, MIRRORED FROM ehci_vhub.c. These two declarations MUST STAY IN SYNC.
+ * magic2 catches a layout drift, but it CANNOT catch a changed function signature: that is a silent
+ * break where the call goes through with the wrong argument list. So `magic` moved to 'EUS2' at the same
+ * time, and fetch_svc below refuses to bind on a mismatch. In practice this means the ROM and this block
+ * driver (which the ROM embeds) and the activator are one release, installed together.
+ *
+ * EUSB_MAX_DEV is pinned at 4 and is INDEPENDENT of the driver's USB_MAX_DEV, so raising that later does
+ * not move these offsets and costs no further ABI break. */
+#define EUSB_MAX_DEV 4
+#define EUSB_MAGIC   0x45555332UL      /* 'EUS2' */
+typedef long (*usb_rw_fn)(int dev, UInt32 lba, UInt32 count, void *buf);   /* >=0 = blocks done; <0 = error */
+typedef long (*usb_submit_fn)(int dev, IOCommandID cmdID, UInt32 lba, UInt32 count, void *buf,
+                              int isWrite, long *actCount);
 typedef struct {
-    UInt32 magic; usb_rw_fn readFn; usb_rw_fn writeFn; UInt32 blkSize, blkCnt; usb_submit_fn submitFn;
+    UInt32 magic; usb_rw_fn readFn; usb_rw_fn writeFn;
+    UInt32 blkSize[EUSB_MAX_DEV], blkCnt[EUSB_MAX_DEV];   /* per-device geometry; blkCnt 0 = no device */
+    UInt8  present[EUSB_MAX_DEV];
+    UInt32 devCount;
+    usb_submit_fn submitFn;
     void *healthFn, *toStateFn, *simReplugFn, *obsArmFn, *tickFn, *loopFn, *quitFn;
     void (*drainFn)(void);          /* n9: flush the UIM's interrupt-level log ring, from TASK level */
-    void (*ejectFn)(void);          /* n10: post Apple's "You may now remove the cartridge" alert */
-    UInt32 magic2;                  /* 'EUSB' again — layout guard */
+    void (*ejectFn)(int dev);       /* n24: post Apple's "You may now remove the cartridge" alert, naming
+                                     * the drive at THIS slot. Signature-only change; the field stays at
+                                     * offset 88 so no offsets move and the n4g activator (whose view of
+                                     * gSvc ends at quitFn, offset 80) is unaffected and never calls it.
+                                     * This block driver is embedded in the same ROM as the UIM, so the two
+                                     * ends of this call can never come from different builds. */
+    UInt32 magic2;                  /* 'EUS2' again — layout guard */
 } UsbSvc;
 static UsbSvc *gSvc = 0;
 
@@ -124,18 +140,25 @@ static int fetch_svc(void)
     if (gSvc) return 1;
     if (Gestalt('Eusb', &v) != noErr || v == 0) return 0;
     gSvc = (UsbSvc *)v;
-    if (gSvc->magic != 0x45555342UL) { gSvc = 0; return 0; }   /* 'EUSB' */
+    /* ★ n19: verify BOTH ends of the struct. magic alone would accept a driver whose layout changed
+     * beneath us; magic2 sits after the last field, so matching both means the block driver and the
+     * UIM agree on the whole shape. A mismatch means a ROM and block driver from different builds:
+     * refuse to bind rather than call through with the wrong argument list. */
+    if (gSvc->magic != EUSB_MAGIC || gSvc->magic2 != EUSB_MAGIC) {
+        dput("!! n19: 'Eusb' ABI mismatch - ROM and block driver are from different builds; not binding");
+        gSvc = 0; return 0;
+    }
     return 1;
 }
 /* Read `count` 512-byte blocks at absolute LBA `lba` into buf; loops the service's
  * per-call cap. Returns 1 on success, 0 on failure. */
-static int svc_read(UInt32 lba, UInt32 count, void *buf)
+static int svc_read(int dv, UInt32 lba, UInt32 count, void *buf)
 {
     UInt8 *p = (UInt8 *)buf;
     if (!fetch_svc()) return 0;
     while (count > 0) {
         UInt32 n = (count > 7) ? 7 : count;
-        long r = gSvc->readFn(lba, n, p);
+        long r = gSvc->readFn(dv, lba, n, p);     /* n19 step 3: the caller's device */
         if (r <= 0) return 0;
         lba += (UInt32)r; p += (UInt32)r * 512UL; count -= (UInt32)r;
     }
@@ -145,13 +168,28 @@ static int svc_read(UInt32 lba, UInt32 count, void *buf)
  * stays: kInitialize's MBR scan reads synchronously at install time (task-level, one-shot, safe). */
 
 /* ---- drive state ---- */
-static short  gRefNum = 0, gDriveNum = 0;
-static UInt32 gPartStart = 0, gPartCount = 0;
+/* ★★★ n19 STEP 2: PER-SLOT DRIVE STATE. One driver instance serves N drives, which is the native OS 9
+ * idiom for a multi-drive controller: AddDrive once per device, then route each call by the drive number
+ * the Device Manager already puts in ioVRefNum. gRefNum stays single, there is one driver.
+ *
+ * ⚠ gPartStart is the dangerous one. It is the base of EVERY LBA this driver computes, so using the wrong
+ * slot's base reads or writes the wrong region of the wrong disk, silently. Same class of harm as the n17
+ * address collision. Every use must be reached through the slot the call is FOR. */
+static short  gRefNum = 0;
+static short  gDriveNumS[EUSB_MAX_DEV];
+#define gDriveNum gDriveNumS[0]
+static UInt32 gPartStartS[EUSB_MAX_DEV], gPartCountS[EUSB_MAX_DEV];
+/* n19: gPartStart/gPartCount are now slot-indexed above. These macros keep slot 0's meaning for the
+ * paths that are still single-device, and every one of them is a marker for what step 3 revisits. */
+#define gPartStart gPartStartS[0]
+#define gPartCount gPartCountS[0]
 /* n4c HOT RE-INSERT: keep the drive-queue element and its DrvSts status prefix so a re-insert can update
  * the geometry and the media-present flag IN PLACE. The queue entry must survive a pull — AddDrive is a
  * once-per-driver act, exactly as for a floppy or Zip drive. */
-static DrvQElPtr gDrvQEl = 0;
-static DrvSts   *gDrvSts = 0;
+static DrvQElPtr gDrvQElS[EUSB_MAX_DEV];
+#define gDrvQEl gDrvQElS[0]
+static DrvSts   *gDrvStsS[EUSB_MAX_DEV];
+#define gDrvSts gDrvStsS[0]
 /* n4c: private Control csCode our EHCI driver uses to report media state. Far outside Apple's range (the
  * CD-ROM codes this driver already sees top out at 125), and guarded by a magic in csParam so a stray
  * control can never fake a disk-inserted event. csParam[2] != 0 = arrived, 0 = gone. */
@@ -160,8 +198,37 @@ static DrvSts   *gDrvSts = 0;
 /* r80: media-present / ejectability state. 1 = ejectable disk in drive (removable, like USB 1.1); 0 = ejected
  * (no media). Reported via DrvSts.diskInPlace in AddDrive + kStatus(8). The Eject control (csCode 7) sets it 0
  * so the eject STICKS (else kStatus still says "disk present" and the Finder immediately remounts). Was a
- * hardwired 8 (= NONEJECTABLE fixed disk) — wrong for a removable USB stick. */
-static char   gDiskInPlace = 1;
+ * hardwired 8 (= NONEJECTABLE fixed disk, inherited from the eSATA driver) — wrong for a removable USB stick. */
+static char   gDiskInPlaceS[EUSB_MAX_DEV];
+#define gDiskInPlace gDiskInPlaceS[0]
+
+/* ★ n19 STEP 2: map a Device Manager call to a device slot.
+ * Every Read/Write/Status/Control arrives with the drive it targets in ioVRefNum (this driver already
+ * logged it as 'which drive/vol the call targets'), so one driver instance can serve N drives. Returns
+ * the slot, or -1 if the drive number is not ours.
+ *
+ * Step 3 routes through this. It exists now, unused on the data path, so the mapping is in place and
+ * reviewable before anything depends on it, rather than being written in the same change that starts
+ * computing LBAs from it. */
+static int slot_for_drive(short dnum)
+{
+    int i;
+    if (dnum == 0) return -1;
+    for (i = 0; i < EUSB_MAX_DEV; i++) if (gDriveNumS[i] == dnum) return i;
+    return -1;
+}
+/* n19: slot 0 keeps the historical default of 'media present' so a single-drive session behaves exactly
+ * as before; slots 1.. start empty and are filled by AddDrive when step 3 exposes them. */
+static void slots_init_once(void)
+{
+    static int done = 0; int i;
+    if (done) return; done = 1;
+    for (i = 0; i < EUSB_MAX_DEV; i++) {
+        gDriveNumS[i] = 0; gDrvQElS[i] = 0; gDrvStsS[i] = 0;
+        gPartStartS[i] = 0; gPartCountS[i] = 0;
+        gDiskInPlaceS[i] = (char)(i == 0 ? 1 : 0);
+    }
+}
 
 /* ---- r24 INSTRUMENTATION: wrap-around ring of every Status/Control call the OS issues to this
  * drive. Pure memory writes only — safe at File-Mgr / interrupt time (unlike the dput() file I/O,
@@ -242,35 +309,35 @@ static short pick_drive_num(void)
 
 /* kInitialize: scan the Apple Partition Map, find the Apple_HFS partition, AddDrive it. r38: PIVOTED
  * from MBR/FAT to APM/HFS. HFS uses OS 9's BUILT-IN mounter (NOT Foreign File Access), which sidesteps
- * the intermittent audio-CD misID entirely — native HFS proved to be clean, stable R/W where
- * FAT/PC-Exchange was a dead end. Tradeoff: the stick is Mac-only (format via Drive
+ * the intermittent audio-CD misID entirely — the sibling eSATA project proved native HFS = clean stable
+ * R/W (v50) where FAT/PC-Exchange was a dead end. Tradeoff: the stick is Mac-only (format via Drive
  * Setup: Mac OS Extended + Apple Partition Map). Reads go through the SAME 'Eusb' BOT service. APM layout:
  * blk0='ER' Driver Descriptor Record; blk1..N='PM' partition entries (pmMapBlkCnt @+4, pmPyPartStart @+8,
  * pmPartBlkCnt @+12, type string @+48). All fields big-endian. */
 /* n4c: the volume scan, factored out of scan_and_add so a HOT RE-INSERT can re-run it. Sets
  * gPartStart/gPartCount from whatever is in the drive NOW — so swapping in a different stick with
  * different geometry mounts correctly, which is most of the point of hot-plug. */
-static OSErr scan_volume(void)
+static OSErr scan_volume(int dv)
 {
     static UInt8 blk[512];
     UInt32 e, mapCnt, bs = 0, bc = 0;
     int isAPM;
 
     if (!fetch_svc())         { dput("  service 'Eusb' NOT present"); return ioErr; }
-    if (!svc_read(0, 1, blk)) { dput("  block0 read FAILED"); return ioErr; }
+    if (!svc_read(dv, 0, 1, blk)) { dput("  block0 read FAILED"); return ioErr; }
     dputx("  blk0[0..3]", ((UInt32)blk[0]<<24)|((UInt32)blk[1]<<16)|((UInt32)blk[2]<<8)|blk[3]);   /* r40: see the layout */
     isAPM = (blk[0] == 0x45 && blk[1] == 0x52);                      /* 'ER' Driver Descriptor Record */
 
     if (isAPM) {
         /* --- Apple Partition Map: block1 'PM' pmMapBlkCnt; scan entries for the Apple_HFS partition --- */
-        if (!svc_read(1, 1, blk) || !(blk[0] == 0x50 && blk[1] == 0x4D)) {   /* 'PM' first map entry */
+        if (!svc_read(dv, 1, 1, blk) || !(blk[0] == 0x50 && blk[1] == 0x4D)) {   /* 'PM' first map entry */
             dput("  APM: no 'PM' partition map at block 1"); return ioErr;
         }
         mapCnt = ((UInt32)blk[4] << 24) | ((UInt32)blk[5] << 16) | ((UInt32)blk[6] << 8) | blk[7];  /* pmMapBlkCnt */
         if (mapCnt > 63) mapCnt = 63;
         dputx("  APM map entries", mapCnt);
         for (e = 1; e <= mapCnt; e++) {
-            if (!svc_read(e, 1, blk) || blk[0] != 0x50 || blk[1] != 0x4D) break;
+            if (!svc_read(dv, e, 1, blk) || blk[0] != 0x50 || blk[1] != 0x4D) break;
             /* partition type string @ +48; match "Apple_HFS" (covers HFS + HFS+) */
             if (!(blk[48]=='A'&&blk[49]=='p'&&blk[50]=='p'&&blk[51]=='l'&&blk[52]=='e'&&
                   blk[53]=='_'&&blk[54]=='H'&&blk[55]=='F'&&blk[56]=='S')) continue;
@@ -285,10 +352,10 @@ static OSErr scan_volume(void)
          * (block 0 = zeroed boot blocks, which is why the APM 'ER' check missed). Confirm via the volume
          * header at block 2 ('BD'=0x4244 HFS, 'H+'=0x482B HFS+) and mount the whole device (partStart=0).
          * This is what a USB stick formatted as a single HFS volume (no APM) looks like — the r39 case. --- */
-        if (!svc_read(2, 1, blk)) { dput("  non-APM + block2 read FAILED"); return ioErr; }
+        if (!svc_read(dv, 2, 1, blk)) { dput("  non-APM + block2 read FAILED"); return ioErr; }
         dputx("  blk2[0..1] (4244=HFS 482B=HFS+)", ((UInt32)blk[0]<<8)|blk[1]);
         if ((blk[0]==0x42 && blk[1]==0x44) || (blk[0]==0x48 && blk[1]==0x2B)) {
-            bs = 0; bc = gSvc->blkCnt;                                /* whole device is the volume */
+            bs = 0; bc = gSvc->blkCnt[dv];                            /* whole device is the volume */
             dput("  -> partitionless HFS (volume header @ block 2): whole-device volume");
             dputx("    count(blkCnt)", bc);
         } else {
@@ -297,12 +364,15 @@ static OSErr scan_volume(void)
         }
     }
     if (bc == 0) { dput("  volume block count is 0 - cannot AddDrive"); return ioErr; }
-    gPartStart = bs; gPartCount = bc;
+    /* ★ n19 step 3: THE dangerous assignment. gPartStart is the base of every LBA this driver computes,
+     * so it must land on the slot this scan was FOR. A wrong index here writes to the wrong region of
+     * the wrong disk, silently, which is the failure mode the audit called out. */
+    gPartStartS[dv] = bs; gPartCountS[dv] = bc;
 
     /* r38 diagnostic (crash-free, pre-mount): dump the HFS Master Directory Block (partition block 2)
      * to confirm a real HFS/HFS+ volume reads clean through 'Eusb' before the built-in mounter runs.
      * 'BD'(0x4244)=HFS, 'H+'(0x482B)=HFS+. */
-    if (svc_read(gPartStart + 2, 1, blk))
+    if (svc_read(dv, gPartStartS[dv] + 2, 1, blk))   /* n19: THIS slot's partition base */
         dputx("  MDB sig @part+2 (4244=HFS 482B=HFS+)", ((UInt32)blk[0] << 8) | blk[1]);
     return noErr;
 }
@@ -311,10 +381,13 @@ static OSErr scan_volume(void)
  * from MBR/FAT to APM/HFS. HFS uses OS 9's BUILT-IN mounter (NOT Foreign File Access), which sidesteps
  * the intermittent audio-CD misID entirely. n4c: the AddDrive here happens exactly once — every LATER
  * insertion goes through media_arrived() below, which re-scans and re-announces the SAME drive number. */
-static OSErr scan_and_add(short refNum)
+/* ★ n19 step 3: add ONE drive, for device slot dv. Called once per device. The driver itself is
+ * installed only once (gRefNum), which is the native OS 9 shape for a multi-drive controller. */
+static OSErr scan_and_add(short refNum, int dv)
 {
     OSErr e;
 
+    slots_init_once();          /* n19: per-slot drive state, before anything touches it */
     gRefNum = refNum;
     /* r24: arm + publish the Status/Control ring before we AddDrive (probes captured live). */
     gCsLog.magic = 0x5563736cUL;   /* 'Ucsl' */
@@ -327,7 +400,7 @@ static OSErr scan_and_add(short refNum)
     gDioLog.count = 0;
     (void)NewGestaltValue('Ucs2', (long)&gDioLog);
     dput("=== USB disk driver v48 (n10: posts Apple's eject alert via the UIM; n9: drains the UIM log ring from DoDriverIO so we can still see logs after the activator quits; n6e: reads/writes now fail with offLinErr once the media is gone, so an un-ejected pull reports REMOVED not DAMAGED; n4c hot re-insert — AddDrive once, then re-scan + re-announce per insertion; v41 2GB + v42 >4GB wide fixes): scanning for a mountable HFS volume (APM or partitionless) via 'Eusb' ===");
-    e = scan_volume();
+    e = scan_volume(dv);
     if (e != noErr) return e;
 
     /* AddDrive with the DrvSts STATUS PREFIX valid — the anti-hang fix: the mounter reads
@@ -339,19 +412,21 @@ static OSErr scan_and_add(short refNum)
         ds = (DrvSts *)raw;
         ds->track       = 0;
         ds->writeProt   = 0;             /* write-enabled */
-        ds->diskInPlace = gDiskInPlace;  /* r80: 1 = EJECTABLE disk present (was 8 = nonejectable/fixed) */
+        ds->diskInPlace = gDiskInPlaceS[dv];  /* r80: 1 = EJECTABLE disk present (was 8 = nonejectable/fixed) */
         ds->installed   = 1;             /* drive installed */
         ds->sides       = 0;
         dq = (DrvQElPtr)&ds->qLink;
         dq->qType    = 1;                /* dQDrvSz/dQDrvSz2 valid */
-        dq->dQDrvSz  = (unsigned short)(gPartCount & 0xFFFF);
-        dq->dQDrvSz2 = (unsigned short)(gPartCount >> 16);
+        dq->dQDrvSz  = (unsigned short)(gPartCountS[dv] & 0xFFFF);
+        dq->dQDrvSz2 = (unsigned short)(gPartCountS[dv] >> 16);
         dnum = pick_drive_num();
         AddDrive(refNum, dnum, dq);
-        gDriveNum = dnum;
-        gDrvQEl = dq; gDrvSts = ds;      /* n4c: keep them — a re-insert updates these IN PLACE */
+        gDriveNumS[dv] = dnum;                      /* n19 step 3: this device's own drive number */
+        gDrvQElS[dv] = dq; gDrvStsS[dv] = ds;       /* n4c: keep them — a re-insert updates these IN PLACE */
+        gDiskInPlaceS[dv] = 1;
         dputx("  AddDrive Apple_HFS drive#", (unsigned long)dnum);
-        dputx("    partStart", gPartStart); dputx("    partCount", gPartCount);
+        dputx("    slot", (unsigned long)dv);
+        dputx("    partStart", gPartStartS[dv]); dputx("    partCount", gPartCountS[dv]);
         /* ★ n3 NATIVE MOUNT: tell the OS a disk arrived and let IT mount the volume, exactly as a floppy or
          * Zip driver does — instead of an application calling PBMountVol for us (which is why a launcher was
          * needed at all). diskEvt's message is: high word = result code (0 = no error), low word = drive
@@ -371,34 +446,40 @@ static OSErr scan_and_add(short refNum)
  * diskEvt — the mirror image of the Eject control (csCode 7) that already clears diskInPlace.
  * Called at TASK level only (the EHCI driver issues it from selfprobe_tick/uim23), which is what makes the
  * dput() file I/O and the synchronous svc_read here safe — the same context kInitialize itself runs in. */
-static OSErr media_arrived(void)
+/* ★ n19 step 3: media arrival for ONE device slot. If that slot has no drive yet this is its FIRST
+ * arrival, so add one; otherwise re-scan and re-announce the same drive number, which is the removable
+ * contract (AddDrive once, announce per insertion, never leak a drive number). */
+static OSErr media_arrived(int dv)
 {
     OSErr e;
-    if (gRefNum == 0 || gDriveNum == 0 || gDrvQEl == 0) {
-        dput("!! n4c media-arrived before the drive was ever added — ignoring");
-        return notOpenErr;
+    if (dv < 0 || dv >= EUSB_MAX_DEV) return paramErr;
+    if (gRefNum == 0) { dput("!! n19 media-arrived before the driver was installed - ignoring"); return notOpenErr; }
+    if (gDriveNumS[dv] == 0 || gDrvQElS[dv] == 0) {
+        dputx("=== n19: FIRST arrival for slot - adding a drive for it; slot", (unsigned long)dv);
+        return scan_and_add(gRefNum, dv);
     }
-    dput("=== n4c: media re-arrived — re-scanning and re-announcing (no AddDrive, no re-install) ===");
-    e = scan_volume();                       /* re-read: the stick may have been SWAPPED for a different one */
-    if (e != noErr) { dput("  re-scan FAILED — not announcing (drive left empty)"); gDiskInPlace = 0;
-                      if (gDrvSts) gDrvSts->diskInPlace = 0; return e; }
-    gDrvQEl->dQDrvSz  = (unsigned short)(gPartCount & 0xFFFF);   /* refresh geometry in place */
-    gDrvQEl->dQDrvSz2 = (unsigned short)(gPartCount >> 16);
-    gDiskInPlace = 1;
-    if (gDrvSts) gDrvSts->diskInPlace = 1;   /* the mounter reads this prefix, not just kStatus */
-    PostEvent(diskEvt, (long)(unsigned short)gDriveNum);
-    dputx("  posted diskEvt for drive#", (unsigned long)gDriveNum);
-    dputx("    partStart", gPartStart); dputx("    partCount", gPartCount);
+    dputx("=== n4c: media re-arrived - re-scan and re-announce, no AddDrive; slot", (unsigned long)dv);
+    e = scan_volume(dv);                     /* re-read: the stick may have been SWAPPED for a different one */
+    if (e != noErr) { dput("  re-scan FAILED - not announcing (drive left empty)"); gDiskInPlaceS[dv] = 0;
+                      if (gDrvStsS[dv]) gDrvStsS[dv]->diskInPlace = 0; return e; }
+    gDrvQElS[dv]->dQDrvSz  = (unsigned short)(gPartCountS[dv] & 0xFFFF);   /* refresh geometry in place */
+    gDrvQElS[dv]->dQDrvSz2 = (unsigned short)(gPartCountS[dv] >> 16);
+    gDiskInPlaceS[dv] = 1;
+    if (gDrvStsS[dv]) gDrvStsS[dv]->diskInPlace = 1;   /* the mounter reads this prefix, not just kStatus */
+    PostEvent(diskEvt, (long)(unsigned short)gDriveNumS[dv]);
+    dputx("  posted diskEvt for drive#", (unsigned long)gDriveNumS[dv]);
+    dputx("    partStart", gPartStartS[dv]); dputx("    partCount", gPartCountS[dv]);
     return noErr;
 }
 /* n4c: the device was physically pulled. Mark the media gone so kStatus reports diskInPlace = 0 instead of
  * leaving a stale "disk present" answer behind a volume that is no longer there. Pure flag writes — safe to
  * reach from anywhere the Control can be issued. */
-static void media_gone(void)
+static void media_gone(int dv)
 {
-    gDiskInPlace = 0;
-    if (gDrvSts) gDrvSts->diskInPlace = 0;
-    dput("=== n4c: media gone (device pulled) — drive marked empty ===");
+    if (dv < 0 || dv >= EUSB_MAX_DEV) return;
+    gDiskInPlaceS[dv] = 0;
+    if (gDrvStsS[dv]) gDrvStsS[dv]->diskInPlace = 0;
+    dputx("=== n4c: media gone (device pulled) - drive marked empty; slot", (unsigned long)dv);
 }
 
 /* r34: kRead/kWrite are now ASYNC. disk_submit hands the request to the UIM's 'Eusb' submitFn (which
@@ -414,10 +495,19 @@ static long disk_submit(IOCommandID cmdID, ParmBlkPtr pb, int isWrite)
      * v42 removes the 4GB ceiling: pb_block() reads the 64-bit XIOParam.ioWPosOffset when the FM sets
      * kUseWidePositioning (which it now does because disk_status answers kdgWide=true). Correct across the
      * whole volume for USB sticks up to 2TB. */
-    lba  = gPartStart + pb_block(pb);
-    nblk = (UInt32)(pb->ioParam.ioReqCount / 512);
-    pb->ioParam.ioActCount = 0;                    /* UIM sets the real count on completion */
-    return gSvc->submitFn(cmdID, lba, nblk, pb->ioParam.ioBuffer, isWrite, &pb->ioParam.ioActCount);
+    /* ★★★ n19 step 3: ROUTE BY DRIVE. This is the assignment the audit flagged as the one that can
+     * silently read or write the wrong region of the wrong disk, so it is deliberate and explicit:
+     * the LBA base comes from the slot the Device Manager named in ioVRefNum, and if that drive is
+     * not ours we refuse rather than defaulting to slot 0 and corrupting somebody. */
+    {
+        int dv = slot_for_drive(pb->ioParam.ioVRefNum);
+        if (dv < 0) { dput("!! n19 submit for a drive that is not ours - refusing"); return -1; }
+        if (!gDiskInPlaceS[dv]) return -1;         /* media gone: fail fast rather than read absent media */
+        lba  = gPartStartS[dv] + pb_block(pb);
+        nblk = (UInt32)(pb->ioParam.ioReqCount / 512);
+        pb->ioParam.ioActCount = 0;                /* UIM sets the real count on completion */
+        return gSvc->submitFn(dv, cmdID, lba, nblk, pb->ioParam.ioBuffer, isWrite, &pb->ioParam.ioActCount);
+    }
 }
 
 /* kStatus: answer kDriveStatus(8) with a valid DrvSts and DriverGestalt device-type/interface;
@@ -430,7 +520,10 @@ static OSErr disk_status(ParmBlkPtr pb)
         int k; for (k = 0; k < 11; k++) pb->cntrlParam.csParam[k] = 0;
         ds->track       = 0;
         ds->writeProt   = 0;             /* r23: write-enabled */
-        ds->diskInPlace = gDiskInPlace;  /* r80: reflect ejectable/media-present state (1 present, 0 after Eject) */
+        /* ★ n19 step 3: answer for the drive the caller named. Getting this wrong tells the File
+         * Manager that a device with no media is present, or the reverse. */
+        { int dv = slot_for_drive(pb->cntrlParam.ioVRefNum); if (dv < 0) dv = 0;
+          ds->diskInPlace = gDiskInPlaceS[dv]; }  /* r80: ejectable/media-present (1 present, 0 after Eject) */
         ds->installed   = 1;
         ds->sides       = 0;
         return noErr;
@@ -489,8 +582,15 @@ static OSErr disk_control(ParmBlkPtr pb)
          * cartridge from the USB device X because your Macintosh is finished with it." The user
          * confirmed OHCI shows it and we showed nothing at all, so ask the UIM to post it (it owns
          * the NM record and the INQUIRY-derived device name). Task level: the Finder's eject. */
-        gDiskInPlace = 0; if (gDrvSts) gDrvSts->diskInPlace = 0;
-        if (fetch_svc() && gSvc->magic2 == 0x45555342UL && gSvc->ejectFn) gSvc->ejectFn();
+        {   /* ★ n19 step 3: eject the drive this call names, not always slot 0. */
+            int dv = slot_for_drive(pb->cntrlParam.ioVRefNum);
+            if (dv < 0) dv = 0;
+            gDiskInPlaceS[dv] = 0; if (gDrvStsS[dv]) gDrvStsS[dv]->diskInPlace = 0;
+            /* ★ n24: tell the UIM WHICH slot, so Apple's alert names the drive the user actually ejected.
+             * The UIM's device name used to be one global holding the most-recently-enumerated device, so
+             * with two drives mounted this alert named the wrong one. */
+            if (fetch_svc() && gSvc->magic2 == EUSB_MAGIC && gSvc->ejectFn) gSvc->ejectFn(dv);
+        }
         return noErr;
     }
     /* ★ n4c: private media-state control from our EHCI driver (see kCsUsbDiskMedia). Magic-guarded so a
@@ -499,8 +599,13 @@ static OSErr disk_control(ParmBlkPtr pb)
         UInt32 magic = ((UInt32)(unsigned short)pb->cntrlParam.csParam[0] << 16)
                      |  (UInt32)(unsigned short)pb->cntrlParam.csParam[1];
         if (magic != kUsbDiskMagic) return controlErr;
-        if (pb->cntrlParam.csParam[2]) return media_arrived();
-        media_gone();
+        {   /* ★ n19 step 3: csParam[3] carries the device slot. Older senders leave it 0, which is
+             * slot 0, so the meaning is unchanged for a single-device build. */
+            int dv = (int)(unsigned short)pb->cntrlParam.csParam[3];
+            if (dv < 0 || dv >= EUSB_MAX_DEV) dv = 0;
+            if (pb->cntrlParam.csParam[2]) return media_arrived(dv);
+            media_gone(dv);
+        }
         return noErr;
     }
     if (pb->cntrlParam.csCode == 104 || pb->cntrlParam.csCode == 125) return controlErr;
@@ -525,9 +630,9 @@ OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
      * file's own dput() comment warns against. Status/Control/Open/Close are direct Device Manager calls,
      * and the Finder polls status often enough to flush the ring promptly. */
     if (code != kReadCommand && code != kWriteCommand &&
-        fetch_svc() && gSvc->magic2 == 0x45555342UL && gSvc->drainFn) gSvc->drainFn();
+        fetch_svc() && gSvc->magic2 == EUSB_MAGIC && gSvc->drainFn) gSvc->drainFn();
     switch (code) {
-        case kInitializeCommand: err = scan_and_add(contents.initialInfo->refNum); break;
+        case kInitializeCommand: err = scan_and_add(contents.initialInfo->refNum, 0); break;
         case kOpenCommand:
         case kCloseCommand:      err = noErr; break;
         case kReadCommand:
@@ -545,7 +650,10 @@ OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
              * File Manager the medium is ABSENT rather than bad, so the volume goes offline the way a yanked
              * floppy or Zip disk does. media_gone() already sets gDiskInPlace = 0 on the pull; this is what
              * makes that flag actually mean something on the I/O path. */
-            if (!gDiskInPlace) { diolog((short)code, (short)offLinErr, 0); err = offLinErr; break; }
+            /* ★ n19 step 3: the media gate is per drive. Checking slot 0 here would take a second
+             * device offline whenever the first one was pulled, and vice versa. */
+            { int dv = slot_for_drive(contents.pb->ioParam.ioVRefNum); if (dv < 0) dv = 0;
+              if (!gDiskInPlaceS[dv]) { diolog((short)code, (short)offLinErr, 0); err = offLinErr; break; } }
             iolog((short)(code == kReadCommand ? 3 : 4), (unsigned long)kind, contents.pb);
             /* v36: the v35 DebugStr breaks are REMOVED. On a USB-keyboard-only Mac (MDD) MacsBug cannot take
              * keyboard input when it is entered from our driver's (sub-task-level) calling context, so the break

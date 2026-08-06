@@ -34,6 +34,25 @@ if not path.isdir(TBXI_PATCHES):
 sys.path.insert(0, TBXI_PATCHES)
 import patch_common
 
+# ---- resource-fork helper -----------------------------------------------------
+# A real "Mac OS ROM" keeps content in its RESOURCE FORK: on an MDD ROM that is SysEnabler,
+# about 185 KB of it. If the fork is lost getting the file off the Mac, tbxi emits a data-fork-only
+# ROM that is SMALLER than the original and will not boot, and it only prints a warning you are
+# likely to miss in a long log. The checks at the end of this script refuse that output rather than
+# letting you discover it at boot time.
+#
+# NOTE tbxi takes the fork from EITHER a real fork on the file OR a `<name>.rdump` sidecar written
+# beside it. So a fork-less file is not automatically wrong -- it is wrong when there is no sidecar
+# either. If you copy a ROM around, take its .rdump/.idump with it.
+def rsrc_size(p):
+    """Resource-fork size in bytes; None if this platform cannot tell us."""
+    if not sys.platform.startswith('darwin'):
+        return None
+    try:
+        return path.getsize(path.join(p, '..namedfork', 'rsrc'))
+    except OSError:
+        return 0
+
 # ---- our EHCI driver core (the exact NDRV the ROM boot-loads) ----------------
 # The PEF must be built for the ROM path: self-probe ON, a boot-safe DoDriverIO
 # (kInitialize stash-only, bring-up deferred to kOpen), runtime flags 0x05, and
@@ -75,6 +94,30 @@ def parcel_lines():
     return out
 
 
+# ---- INPUT CHECK: measure the base ROM before tbxi consumes it ------------------
+# Done before get_src, because that dumps the ROM immediately and the evidence is clearest while the
+# original file is still in hand.
+_argsrc = next((a for a in sys.argv[1:] if not a.startswith('-')), None)
+if _argsrc and path.isfile(_argsrc):
+    _din = path.getsize(_argsrc)
+    _rin = rsrc_size(_argsrc)
+    _sidecar = _argsrc + '.rdump'
+    _has_sidecar = path.isfile(_sidecar)
+    print('input: %s -- %d bytes data, %s bytes rsrc%s'
+          % (_argsrc, _din, _rin if _rin is not None else '?',
+             ', .rdump sidecar %d bytes' % path.getsize(_sidecar) if _has_sidecar else ''))
+    if not _rin and not _has_sidecar:
+        print('')
+        print('WARNING: this ROM has NO resource fork and NO .rdump sidecar beside it.')
+        print('         A real Mac OS ROM keeps content there (SysEnabler, ~185 KB on an MDD ROM). If this')
+        print('         copy should have had one, the patched ROM will come out SMALLER and will not boot.')
+        print('         Fork-less is normal for a tbxi-BUILT image; it is a red flag for a ROM copied off a Mac.')
+        print('         Ways to keep the fork: StuffIt/BinHex on the Mac and expand with `unar` (most modern')
+        print('         unarchivers silently drop it), or copy over AFP rather than FAT or plain HTTP.')
+        print('')
+else:
+    _din = _rin = None
+
 src, cleanup = patch_common.get_src(
     desc='Inject the EHCI UIM NDRV into the OS 9 Mac OS ROM as a claimed USB 2.0 controller.')
 
@@ -86,8 +129,20 @@ for (parent, folders, files) in os.walk(src):
     folders.sort(); files.sort()
     if 'Parcelfile' not in files:
         continue
-    if any(fnmatch.fnmatch(fn, 'EHCIUIM*.pef') for fn in os.listdir(parent)):
-        print('EHCIUIM PEF already present in %s — skipping (idempotent)' % parent)
+    # RE-INJECTION MUST UPDATE, NOT DUPLICATE.
+    # This check used to look only for `EHCIUIM*.pef`, which is the name we WRITE -- but once tbxi has
+    # built the ROM and it is dumped again, the parcel comes back named after itself,
+    # `pciclass,0c0320-1.0.pef`. So on an already-patched ROM the check missed, a SECOND parcel entry
+    # was appended, and tbxi deduplicated the pair into hash-suffixed names: a ROM carrying two EHCI
+    # parcel entries. That is exactly what happens if you re-run this script to update to a newer
+    # driver, which is the obvious thing to do.
+    existing = [fn for fn in os.listdir(parent)
+                if fnmatch.fnmatch(fn, 'EHCIUIM*.pef') or fnmatch.fnmatch(fn, 'pciclass,0c0320*.pef')]
+    if existing:
+        for fn in existing:
+            shutil.copy(OUR_PEF, path.join(parent, fn))
+        print('USB2 parcel already present in %s -- UPDATED the driver in place (%s); Parcelfile untouched'
+              % (parent, ', '.join(existing)))
         injected = True
         continue
     shutil.copy(OUR_PEF, path.join(parent, PEF_NAME))
@@ -102,6 +157,35 @@ if not injected:
     raise SystemExit('no Parcelfile found in the dump — is this a NewWorld ROM?')
 
 cleanup()   # rebuilds the ROM if -o was a file (no-op if -o was a dump dir)
+
+# ---- OUTPUT CHECK: refuse an implausible ROM before anyone installs it -----------
+# This script only ADDS a driver (~210 KB), so an output SMALLER than its input means content was
+# lost on the way through -- almost always a resource fork that did not survive the trip off the Mac.
+# "Smaller than its own base" is the reliable tell, and it is platform-independent.
+_out = None
+for _i, _a in enumerate(sys.argv[1:]):
+    if _a == '-o' and _i + 2 <= len(sys.argv[1:]):
+        _out = sys.argv[_i + 2]
+if _out and path.isfile(_out) and _din is not None:
+    _dout = path.getsize(_out)
+    if _dout < _din:
+        raise SystemExit(
+            'ERROR: the patched ROM at "%s" is NOT USABLE:\n'
+            '  - it is SMALLER than the input (%d vs %d bytes, %d KB LOST) even though this script only\n'
+            '    ADDS a driver, so content was dropped on the way through.\n'
+            '\n'
+            'Do NOT install it -- OS 9 will reject it at boot, or boot and misbehave. The usual cause is a\n'
+            'resource fork lost getting the ROM off the Mac (see the WARNING this script prints for how to\n'
+            'avoid that). The bad output has been left in place for inspection.'
+            % (_out, _dout, _din, (_din - _dout) // 1024))
+    if (_dout - _din) < 150 * 1024:
+        print('WARNING: the ROM grew by only %d KB, but the driver alone is about 210 KB.'
+              % ((_dout - _din) // 1024))
+        print('         If you were UPDATING an already-patched ROM this is expected. Otherwise, verify')
+        print('         before installing: scripts/verify-injected-rom.py <base> <output>')
+    else:
+        print('output verified: %d bytes (input was %d) -- grew by %d KB'
+              % (_dout, _din, (_dout - _din) // 1024))
 print('done.')
 
 # ============================================================================

@@ -23,7 +23,15 @@ The driver serves two kinds of machine, at two different maturity levels:
 
 ## What it does
 
-- Mounts a USB 2.0 mass-storage device (flash drive / SSD) on the OS 9 desktop at Hi-Speed.
+- Mounts USB 2.0 mass-storage devices (flash drives / SSDs) on the OS 9 desktop at Hi-Speed.
+- **Up to four drives at once, in any combination of ports.** Each gets its own volume, icon and geometry.
+  Files copy directly between them, they can be ejected individually or all together in a single drag to the
+  Trash, and each hot-plugs independently. Validated on hardware with four drives across a PCI card and an
+  external hub at the same time.
+- **Drives behind an external USB 2.0 hub run at Hi-Speed.** The hub is enumerated and driven by this stack
+  (we power, reset and address its downstream ports ourselves), so a drive plugged into a hub, including the
+  hub built into an Apple Cinema Display, mounts at 2.0 instead of falling back to 1.1. Keyboards and mice
+  behind a hub are a separate problem and still do not work: see "Known limitations".
 - Reads and writes at the device's real speed, benchmarked at **20 MB/s read, ~13 MB/s write** (both are the flash device's own ceiling; the driver reaches it). Real Finder copies land lower (~8 read / ~5 write) because the Finder's own I/O sizing is the bottleneck above the driver, not the driver itself.
 - On an **on-board** machine (e.g. Mac Mini G4, *experimental*), the driver hands the keyboard/mouse ports back to the built-in 1.1 controller and claims only a free port for the drive, so input *can* stay live, but see the reliability caveat above and "The open problem": the shared interrupt line can still lock up mid-mount.
 - **Ejects** cleanly (Finder menu or drag-to-Trash), like any removable disk.
@@ -120,8 +128,24 @@ This is a beta. These are the things it does **not** do yet:
 
 - **On-board USB 2.0 is experimental and can freeze.** On a PCI card mounting is reliable. On an on-board controller (Mac Mini G4) the EHCI shares its interrupt line with the keyboard/mouse; mid-mount, under the wrong timing, the shared-line interrupt handling can lock the whole machine (keyboard/mouse go dead). It has mounted and copied real files there, but not dependably. If it doesn't mount within a few seconds, reboot and retry, and don't put data you care about on it from an on-board machine yet.
 - **A drive attached at boot mounts at 1.1, not 2.0.** Ports that are already occupied when the controller is brought up are handed to the 1.1 companion. Boot with the drive unplugged, then insert it.
-- **External hubs are not driven by this stack.** A USB 2.0 hub (including the hub built into an Apple Cinema Display) is handed to Apple's 1.1 companion controller, so devices behind it work at 1.1 speeds. Driving a hub at Hi-Speed needs downstream port control and, for any keyboard or mouse behind it, EHCI **split transactions**, neither is implemented. See "The open problems".
-- **A port handed to the 1.1 companion stays there until reboot.** Once ownership is released, EHCI can no longer tell "empty" from "companion-owned" on that port, so the driver deliberately never takes it back, reclaiming it would risk stuttering a keyboard that is working. Use a different port for a Hi-Speed drive, or reboot.
+- **Four drives is the ceiling.** The per-device DMA structures live in one wired memory page, which holds four
+  devices plus the hub's own bookkeeping. A fifth drive is refused cleanly (it simply does not mount, nothing
+  else is disturbed) and the driver posts a notification saying so. Raising the limit needs a second DMA page.
+- **Keyboards and mice behind a hub do not work.** A drive behind a USB 2.0 hub runs at Hi-Speed, but a
+  full-speed or low-speed device behind that same hub (a keyboard, a mouse, or an Apple Cinema Display's own
+  brightness buttons) is detected, left powered and skipped. It cannot be handed to the 1.1 companion either,
+  because a device behind a Hi-Speed hub is not electrically on the companion's bus at all: it sits behind the
+  hub's transaction translator. Reaching it requires EHCI **split transactions**, which are not implemented.
+  See "The open problems". **If you need a keyboard and mouse on a hub, put that hub on a USB 1.1 port.**
+- **One hub at a time, and no hubs behind hubs.** A second hub, or a hub plugged into our hub, is not driven.
+- **A port handed to the 1.1 companion stays there until reboot.** Once ownership is released, EHCI can no
+  longer tell "empty" from "companion-owned" on that port, so the driver deliberately never takes it back;
+  reclaiming it would risk stuttering a keyboard that is working. Use a different port for a Hi-Speed drive, or
+  reboot. (A port the driver merely *gave up on* is different, and does recover: unplug that device and the
+  port is usable again without rebooting.)
+- **A drive inserted while a large file copy is running will not mount.** Wait for the copy to finish and plug
+  it in again, or plug it in before starting the copy. The cause is understood (the copy's transfers keep the
+  engine busy so the new drive's setup never gets issued) and it is a known, deliberately deferred gap.
 - **Writes are slower than reads.** Reads reach the device's ceiling (~20 MB/s); Finder writes land around 2 to 3 MB/s because the Finder issues small synchronous writes above the driver.
 - **Mid-write yank is unsafe** (as on any OS), always eject first.
 - **A few tested hardware combinations** (see Supported machines). Other EHCI cards/controllers are untested.
@@ -143,12 +167,28 @@ On a machine like the Mac Mini G4 the EHCI shares **one PCI interrupt line** wit
 
 What remains is narrower: **a drive already attached when the EHCI controller is brought up** is handed to the 1.1 companion by the bring-up path, so it mounts at 1.1. The port-ownership handoff is one-way by design (see the next problem), so it stays there. Boot with the drive unplugged and insert it afterwards.
 
-### 3. Driving an external hub at Hi-Speed
+### 3. Full-speed and low-speed devices behind a Hi-Speed hub
 
-A USB 2.0 hub currently gets handed to Apple's 1.1 companion, so anything behind it runs at 1.1. Doing better needs two things this stack does not have:
+**The first half of this is now done.** Hubs are enumerated and driven by this stack, and a USB 2.0 *drive*
+behind a hub mounts at Hi-Speed. What remains is the harder half.
 
-- **Downstream hub port control**, enumerating the hub itself, then resetting and assigning addresses to devices on its ports. Tractable, and enough on its own for a Hi-Speed *drive* behind a hub.
-- **EHCI split transactions** (`siTD` / split `qTD`), required for any full- or low-speed device (keyboard, mouse) behind a high-speed hub. Not implemented at all.
+A full-speed or low-speed device behind a Hi-Speed hub (a keyboard, a mouse, a display's own control buttons)
+cannot be reached by either controller as things stand:
+
+- **Not by Apple's 1.1 companion**, because the device is not electrically on the companion's bus. The hub is
+  on the Hi-Speed bus and the device sits behind the hub's transaction translator. There is no port to hand
+  over, so no amount of ownership juggling reaches it.
+- **Not by us**, because talking through a transaction translator requires **EHCI split transactions**
+  (start-split / complete-split), and for a keyboard or mouse that also means a **periodic schedule** with
+  S-mask / C-mask scheduling. This driver is async-only: the periodic frame list is allocated but nothing has
+  ever been linked into it. That is the single largest piece of unbuilt work in the project.
+
+This is why Apple layered `IOUSBControllerV2` on top of `IOUSBController` in OS X. The first version could not
+do it either.
+
+Note the consequence, because it is a real trap: claiming a hub is **all or nothing**. Everything behind a hub
+we claim becomes ours, so anything we cannot drive is dead while we own it. Until split transactions exist, put
+a hub carrying input devices on a USB 1.1 port.
 
 There is also a wrinkle worth knowing if you touch this area. Releasing a port to the companion (`PORTSC` Port Owner = 1) only works from the state the EHCI spec intends: a port that is **not enabled**, i.e. one where a reset did not bring up a high-speed device. Handing over a port that *is* enabled at Hi-Speed does not take effect. The driver now clears Port Enable first, and records the handoff in software rather than re-reading the ownership bit back out of the hardware, trusting that register as the record of a decision it had already made produced a livelock, with the port bouncing between the two controllers so fast that neither could enumerate anything.
 

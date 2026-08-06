@@ -40,7 +40,7 @@
 #include <Gestalt.h>     /* n4f: reach the driver's 'Eusb' service to unmount before quitting */
 #include <Processes.h>   /* n4d: hand the front back to the Finder so IT receives diskEvt */
 
-#define APP_VER "n4f"
+#define APP_VER "n4g"
 
 typedef OSStatus (*LoadUIMProc)(RegEntryID *node);
 extern void ExpertIdleTask(void);
@@ -93,13 +93,24 @@ static void front_to_finder(void)
     }
     slog("WARNING: Finder not found — staying frontmost; the diskEvt mask still protects the mount");
 }
-/* n4f: the driver publishes its block service via Gestalt('Eusb'). We only need the LAST field, quitFn,
- * so the struct below must mirror the driver's gSvc EXACTLY up to that point (ehci_vhub.c ~L1428).
- * Everything before quitFn is opaque to us and declared only to get the offset right. */
+/* n4f: the driver publishes its block service via Gestalt('Eusb'). We only need quitFn, so this struct
+ * must mirror the driver's gSvc EXACTLY up to that field.
+ *
+ * ⚠ n19: this is the THIRD hand-maintained copy of that layout (ehci_vhub.c defines it, usb_disk.c mirrors
+ * it, and this mirrors it again). All three must move together. The magic check below is what makes a
+ * mismatch safe rather than silent: an activator built against the old ABI simply reports "nothing to
+ * unmount" and quits without the clean-unmount step, instead of calling quitFn at a wrong offset.
+ *
+ * n19 changed this layout: blkSize/blkCnt became per-device arrays and present[]/devCount were added, so
+ * every offset after them moved, and the magic went to 'EUS2' precisely so an old pairing is detected. */
+#define EUSB_MAX_DEV 4
+#define EUSB_MAGIC   0x45555332UL                   /* 'EUS2' */
 typedef struct {
-    UInt32 magic;                                   /* 'EUSB' */
+    UInt32 magic;                                   /* 'EUS2' */
     void  *readFn, *writeFn;
-    UInt32 blkSize, blkCnt;
+    UInt32 blkSize[EUSB_MAX_DEV], blkCnt[EUSB_MAX_DEV];   /* n19: per-device geometry */
+    unsigned char present[EUSB_MAX_DEV];
+    UInt32 devCount;
     void  *submitFn, *healthFn, *toStateFn, *simReplugFn, *obsArmFn, *tickFn, *loopFn;
     long (*quitFn)(void);                           /* n8: unmount our volumes; returns the BUSY count */
 } UsbSvcView;
@@ -109,7 +120,7 @@ static long ask_driver_to_prepare_quit(void)
     UsbSvcView *s;
     if (Gestalt('Eusb', &v) != noErr || v == 0) return 0;   /* nothing mounted by us -> safe */
     s = (UsbSvcView *)v;
-    if (s->magic != 0x45555342UL || s->quitFn == 0) return 0;
+    if (s->magic != EUSB_MAGIC || s->quitFn == 0) return 0;
     return s->quitFn();
 }
 static LoadUIMProc resolve_loaduim(void)

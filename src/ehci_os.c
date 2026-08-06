@@ -79,6 +79,23 @@ void ehci_os_logx(const char *label, unsigned long v)
 typedef struct { const char *msg; UInt32 val; UInt8 kind; } ILogRec;   /* kind 1 = msg, 2 = msg + value */
 static volatile ILogRec gILog[ILOG_N];
 static volatile UInt32  gILogHead = 0, gILogTail = 0, gILogDropped = 0;
+/* ★★★★ h16: line-rate cap as a TOKEN BUCKET rather than a fixed per-second window.
+ * h15's flat 30 lines/second protected the machine but was too tight for a LEGITIMATE burst: on the validated
+ * four-drive run it fired twice and dropped 43 lines while the four drives were enumerating, losing healthy
+ * diagnostic detail exactly where it is most interesting. A bucket separates the two things that matter — a
+ * burst allowance for real events, and a sustained ceiling that no loop can exceed.
+ * ILOG_BURST is the depth (a whole enumeration burst fits), ILOG_RATE_PER_SEC the refill. A livelock still
+ * drains the bucket in well under a second and is then held to the sustained rate, which is what keeps the
+ * File Manager responsive; a four-drive enumeration now fits entirely inside the burst. */
+/* ★ The BURST is what fixes h15's lost enumeration detail; the SUSTAINED rate is what protects the machine.
+ * They are independent, so keep the sustained rate at h15's already-proven-safe 30/s rather than raising it:
+ * at roughly 1-5 ms per FSWrite + FlushVol that is ~3-15% of task time, against the ~100% saturation that made
+ * the h14 livelock look like a hang. A legitimate four-drive enumeration (~200 lines) fits inside the burst
+ * whole, and a livelock spends the burst in its first second and is then held to 30/s for as long as it runs. */
+#define ILOG_BURST        256u
+#define ILOG_RATE_PER_SEC  30u
+static UInt32 gILogTokens = ILOG_BURST, gILogRefillT = 0;
+static volatile UInt32 gILogThrottled = 0;
 
 void ehci_os_ilog(const char *s)
 {
@@ -108,15 +125,46 @@ void ehci_os_ilog_drain(void)
      * guarantees we return; anything still queued goes out on the next tick.
      * The `!=` is also deliberately paired with the budget: if tail ever overshot head, `!=` alone would
      * spin ~4 billion times. */
-    while (gILogTail != gILogHead && budget--) {
-        volatile ILogRec *r = &gILog[gILogTail % ILOG_N];
-        const char *m = r->msg; UInt32 v = r->val; UInt8 k = r->kind;
-        gILogTail++;                                           /* consume BEFORE writing: a File-Mgr stall must
+    /* ★★★★ h15: A HARD LINE-RATE CAP, because the log is a File-Manager AMPLIFIER.
+     * Every line written here is a synchronous FSWrite + FlushVol. The producer runs from the 8 ms heartbeat,
+     * so a driver bug that loops at heartbeat rate emits a few hundred lines a second, and the drain then
+     * spends most of task time inside the File Manager. On the h14 run that is exactly what the user saw: a
+     * stale-state livelock in the hub path (fixed separately) produced ~3 lines per pass, and the machine
+     * showed a wristwatch cursor the moment the Finder was asked to do anything. The DRIVER bug was the cause,
+     * but the LOG is what escalated it from "a drive did not mount" to "the machine is hung".
+     * Consecutive-line dedup does not help — what repeats is a CYCLE of several different lines, not one line.
+     * So cap the rate instead: at most ILOG_MAX_PER_SEC lines per 60-tick second, the excess counted and
+     * reported exactly like a ring overflow. Diagnostics survive (the cap is an order of magnitude above what
+     * a healthy run produces — h13 logged 1618 lines in a whole session), and no future bug of ANY shape can
+     * take the machine down through this path again. */
+    {   UInt32 now = *(volatile UInt32 *)0x016AUL;              /* lowmem Ticks, 60 Hz */
+        /* h16: refill by elapsed ticks, capped at the burst depth. Integer ticks -> lines at 60 Hz means one
+         * token per tick when ILOG_RATE_PER_SEC is 60; written as a ratio so the rate can change freely. */
+        if (now != gILogRefillT) {
+            UInt32 add = ((now - gILogRefillT) * ILOG_RATE_PER_SEC) / 60UL;
+            if (add) {
+                gILogTokens = (gILogTokens + add > ILOG_BURST) ? ILOG_BURST : gILogTokens + add;
+                gILogRefillT = now;
+            }
+        }
+        while (gILogTail != gILogHead && budget--) {
+            volatile ILogRec *r = &gILog[gILogTail % ILOG_N];
+            const char *m = r->msg; UInt32 v = r->val; UInt8 k = r->kind;
+            gILogTail++;                                       /* consume BEFORE writing: a File-Mgr stall must
                                                                 * not make us re-emit the same line */
-        if (k == 2) ehci_os_logx(m, v); else if (k == 1) ehci_os_log(m);
+            if (!gILogTokens) { gILogThrottled++; continue; }   /* h15: drop, never stall */
+            gILogTokens--;
+            if (k == 2) ehci_os_logx(m, v); else if (k == 1) ehci_os_log(m);
+        }
     }
     d = gILogDropped;
     if (d) { gILogDropped = 0; ehci_os_logx("!! n5 log ring OVERFLOWED — lines dropped", d); }
+    /* h15: report the throttle only when the budget has room again, so saying so cannot itself be throttled. */
+    if (gILogThrottled && gILogTokens) {
+        UInt32 t = gILogThrottled; gILogThrottled = 0; gILogTokens--;
+        ehci_os_logx("!! h15 log RATE-CAPPED — lines dropped to keep the File Manager responsive (something "
+                     "is looping; the cap is not the bug)", t);
+    }
 }
 
 /* PCI config space + Command register bits */
@@ -439,17 +487,18 @@ OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
     switch (code) {
     case kInitializeCommand:
     case kReplaceCommand:
-        /* ROM-PATH BOOT-SAFETY (hardware-proven on a G4 MDD): when the ROM parcel makes
-         * the Device Manager load us at boot, kInitialize runs during the early PCI-claim
+        /* Path A BOOT-SAFETY (eSATA v63/v64 lesson): when the ROM parcel makes the
+         * Device Manager load us at boot, kInitialize runs during the early PCI-claim
          * phase, where full EHCI bring-up (HCReset/DMA/IRQ) FREEZES. So do NOTHING
          * here except acknowledge the claim — the real bring-up is deferred to kOpen,
-         * which the headless mount helper triggers post-boot (task/driver context up).
-         * Stash-only kInit + open-driven bring-up = stable boot-to-desktop with the card
-         * claimed. NB the USL path (LoadUIMForEntry -> uimInitialize) still brings up
-         * inline as before; only the Device-Manager path defers. */
+         * which the headless mount app triggers post-boot (task/driver context up).
+         * (v65 proof: stash-only kInit + open-driven bring-up = stable boot-to-desktop
+         * with the card claimed.) NB the USL path (LoadUIMForEntry -> uimInitialize)
+         * still brings up inline as before; only the Device-Manager path defers. */
         /* NB: NO logging here. ehci_os_log() uses the File Manager, which may not be
          * up during the early PCI-claim phase — a log call here could itself hang the
-         * boot. Pure return; kOpen (post-boot, File Manager up) logs the bring-up. */
+         * boot. Pure return, exactly like eSATA's stash-only kInit (sil_os_init_stash).
+         * kOpen (post-boot, File Manager up) logs the bring-up. */
         /* Lifecycle fix: DO tame a controller left HOT by a previous session (warm reboot), so its
          * unserviced interrupts + stale DMA can't storm this boot (the "unhealthy boot"). This is a
          * handful of guarded MMIO ops only — NOT the bring-up that must stay out of early boot. */

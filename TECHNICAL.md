@@ -294,6 +294,43 @@ trusting a driver on any volume larger than 2 GB.
 
 ## Roadmap / known limitations
 
+- **Multiple devices, solved (four at once).** Every piece of per-device state is now per-device:
+  each slot has its own bulk queue-head pair (critical, because with `DTC=0` the data toggle lives
+  in the queue head's overlay, so a shared pair corrupts both devices), its own endpoint
+  registrations, its own USB address, its own probed port and its own geometry. The device travels
+  *with the work*: a block-I/O request carries its slot and the BOT primitives take it as a
+  parameter, so no mutable "current device" global remains on the I/O path. One block driver
+  instance serves all four drives, routed by volume reference number.
+  The bugs on the way here were all one family, worth stating because it generalises: **per-device
+  state that existed and was correct, but was not consulted, or not reset, at exactly one
+  transition.** After five of those cost five hardware cycles, the remaining candidates were found
+  by classifying every file-scope declaration against two questions ("with several devices live, is
+  this the right device's state?" and "when a slot is reused by a different device, who resets
+  it?"), which turned up three more for free. Four is the ceiling because the per-device DMA
+  structures share one wired page.
+- **Hi-Speed hubs, solved for drives.** A USB 2.0 hub is enumerated and driven by this stack: we
+  configure it, power its downstream ports, then reset, speed-detect and address devices on those
+  ports before joining the normal Hi-Speed transfer path. A drive behind a hub needs no split
+  transactions at all, because a Hi-Speed hub does store-and-forward at Hi-Speed.
+  Two details cost real hardware cycles. **A hub's port change bits latch** (USB 2.0 section
+  11.24.2.7.2): until they are cleared with `CLEAR_PORT_FEATURE` the hub reports that port forever,
+  and under a change-driven design that is a livelock rather than a wasted transfer. And **a port's
+  speed cannot be read before reset**: high speed is only determined by the chirp *during* reset, so
+  demanding it beforehand skips every Hi-Speed drive, while the low-speed bit is equally
+  untrustworthy on a device still powering up (it needs confirming on a second look). Steady state
+  costs nothing: a hub has one interrupt endpoint reporting which port changed, so a single parked
+  qTD sits on it and the hub NAKs it in hardware. Checking that is a memory read, not bus traffic.
+- **Full-speed and low-speed devices behind a hub, open.** The device sits behind the hub's
+  transaction translator, so Apple's 1.1 companion cannot see it and only EHCI split transactions
+  can reach it. Not implemented: the periodic frame list is allocated but nothing is linked into it.
+  See the README for what this means in practice.
+- **A drive inserted during a large copy does not mount, open (deliberately deferred).** The
+  completion path re-arms the next chunk of the copy before the transfer queue is pumped, so the
+  engine is always busy at that moment and the new device's control transfers are never issued; its
+  setup then times out. Four attempts to fix it by separating the in-flight bookkeeping were made
+  and reverted, two of which regressed a working driver into a freeze on the hub connect, for
+  reasons still not understood. Diagnosing that needs evidence that survives a stalled File Manager,
+  because the driver's own logging goes through it. Recorded so nobody re-treads it blind.
 - **Throughput, solved.** Reads ~20 MB/s and writes ~13 MB/s (the flash device's own ceiling),
   by pre-queuing whole commands (one interrupt per command) with multi-qTD 128 KB transfer chains
   and per-endpoint hardware toggles (Bug hunt #3). Real Finder copies land lower (~8 read / ~5
