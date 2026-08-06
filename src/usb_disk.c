@@ -15,9 +15,10 @@
  *   kStatus     -> kDriveStatus fills a DrvSts; everything else declines (statusErr)
  *                  so the mounter uses safe defaults (DriverGestalt crash fix).
  *
- * Adapted DIRECTLY from the user's proven eSATA sil3512 driver (AddDrive + DrvSts
- * prefix + the IOCommandIsComplete completion contract + DriverGestalt->statusErr).
- * The volume is FAT/PC-Exchange, which sidesteps the HFS-mounter hang eSATA hit.
+ * Adapted from a proven SATA block driver for the same OS (AddDrive + DrvSts prefix +
+ * the IOCommandIsComplete completion contract + DriverGestalt->statusErr).
+ * NOTE this header comment is historical: the driver mounts HFS, not FAT/PC-Exchange.
+ * See scan_volume() for what it actually accepts.
  */
 #include <MacTypes.h>
 #include <MacMemory.h>

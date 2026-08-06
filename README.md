@@ -2,7 +2,24 @@
 
 **The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts a USB flash drive and reads and writes it at **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
 
-## What's new: the driver now lives in the Mac OS ROM
+## What's new: USB 2.0 on the Mac mini G4
+
+**A second kind of machine now works.** Until now this stack ran on one machine, a Power Mac G4 MDD with a
+PCI USB 2.0 card. The **Mac mini G4** has now been validated on its **on-board** USB 2.0 controller, which
+Mac OS 9 has only ever driven at 1.1: a drive mounts at Hi-Speed in a rear port, copies files both
+directions, ejects to the Trash, and mounts again **behind an Apple Cinema Display's built-in hub**. The
+keyboard and mouse keep working throughout, on the same controller.
+
+Two things had to be fixed to get there, and both are described in [TECHNICAL.md](TECHNICAL.md): the ROM
+parcel was not binding to the mini's controller at all (its Name Registry node advertises itself
+differently from a PCI card's, so the parcel's match had to be widened), and once it did bind, a step that
+must run at task level was being abandoned on a **wall clock** while task level happened to be starved,
+which threw away a drive that had in fact enumerated perfectly.
+
+**Mac mini owners: there is a prebuilt mini ROM, and it carries an experimental display fix as well as this
+driver. Please read [the note about it](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) before flashing.**
+
+## The driver lives in the Mac OS ROM
 
 Earlier releases shipped the driver *inside an app* that installed it at runtime. This release takes the step the project was built toward: the EHCI UIM is injected into the **Mac OS ROM** itself, as a `driver,AAPL,MacOS,PowerPC` parcel bound to the USB 2.0 controller's Name Registry node (built with Elliot Nunn's Mac OS ROM toolchain). Mac OS 9 now **loads and binds our driver at boot, as a genuine OS-owned host-controller driver**, the same way it loads a native Apple one. That is the architectural milestone: on a machine with the patched ROM, USB 2.0 support is part of the operating system, not bolted on by a helper app.
 
@@ -15,9 +32,9 @@ Earlier releases shipped the driver *inside an app* that installed it at runtime
 The driver serves two kinds of machine, at two different maturity levels:
 
 - **PCI USB 2.0 cards** (a card in a PCI slot, e.g. the **Power Mac G4 "Mirrored Drive Doors"**): **the supported path.** The EHCI card has its own dedicated interrupt line, the driver owns it cleanly, and mounts are reliable.
-- **On-board USB 2.0** (built-in ports that are USB 2.0-capable but which OS 9 only ever drove at 1.1, e.g. the **Mac Mini G4**): **experimental.** It has genuinely worked (mounting a drive and copying a whole folder both directions) but it is **not yet reliable:** on these machines the EHCI shares one interrupt line with the keyboard/mouse, and under the wrong timing the shared-line interrupt handling can lock the machine up mid-mount (see "The open problems"). Treat it as a preview, retry from a fresh boot, and do not trust it with data you care about.
+- **On-board USB 2.0** (built-in ports that are USB 2.0-capable but which OS 9 only ever drove at 1.1, e.g. the **Mac Mini G4**): **now working, newly so.** The **Mac mini G4** has been validated end to end: a drive mounts at Hi-Speed in a rear port *and* behind an Apple Cinema Display's built-in hub, with copies both directions, Trash, and hot-plug on every port. This replaces an earlier, much more pessimistic assessment on this page: the previous "may lock up mid-mount" warning came from the older app-loaded driver, and the ROM-integrated build does not behave that way. It has had **one full validation session**, not months of use, so it is newer and less proven than the PCI card path.
 
-> ⚠️ **This is a beta / technology preview.** On a PCI card it works, it is stable, and it moves real files fast. But mounting a Hi-Speed drive still goes through the headless helper and a specific **insertion sequence** (not plug-and-play), and it has real limitations. On-board machines are experimental and may freeze. It is shared in this state so the community can use it *and* help finish it. **Read the steps below carefully: the timing of when you insert the drive matters.**
+> ⚠️ **This is a beta / technology preview.** On a PCI card it works, it is stable, and it moves real files fast. The Mac mini G4 now works too, on a newer and less-proven footing. But mounting a Hi-Speed drive still goes through the headless helper and a specific **insertion sequence** (not plug-and-play), and it has real limitations. It is shared in this state so the community can use it *and* help finish it. **Read the steps below carefully: the timing of when you insert the drive matters.**
 
 ---
 
@@ -33,7 +50,7 @@ The driver serves two kinds of machine, at two different maturity levels:
   hub built into an Apple Cinema Display, mounts at 2.0 instead of falling back to 1.1. Keyboards and mice
   behind a hub are a separate problem and still do not work: see "Known limitations".
 - Reads and writes at the device's real speed, benchmarked at **20 MB/s read, ~13 MB/s write** (both are the flash device's own ceiling; the driver reaches it). Real Finder copies land lower (~8 read / ~5 write) because the Finder's own I/O sizing is the bottleneck above the driver, not the driver itself.
-- On an **on-board** machine (e.g. Mac Mini G4, *experimental*), the driver hands the keyboard/mouse ports back to the built-in 1.1 controller and claims only a free port for the drive, so input *can* stay live, but see the reliability caveat above and "The open problem": the shared interrupt line can still lock up mid-mount.
+- On an **on-board** machine (e.g. Mac Mini G4), the driver hands the keyboard/mouse ports back to the built-in 1.1 controller and claims only a free port for the drive, so the keyboard and mouse keep working while the drive runs at Hi-Speed. Validated on a Mac mini G4, including a drive behind the Cinema Display's hub.
 - **Ejects** cleanly (Finder menu or drag-to-Trash), like any removable disk.
 - **No Extension to install.** The driver rides *inside the Mac OS ROM* (a one-time ROM patch, see "Install & use"). Nothing goes into your Extensions folder. The driver loads at boot as an OS component; a small headless helper then performs the Hi-Speed mount.
 - **Tells you it's really 2.0**, a volume mounted through this driver appears on the desktop with a distinct **"2.0" drive icon**, so a Hi-Speed mount is obvious at a glance versus a plain USB 1.1 one.
@@ -51,10 +68,13 @@ back and claims only a free one on an on-board controller). You do not pick a bu
 - **Tested: Power Mac G4 "Mirrored Drive Doors" + NEC-chipset IOGEAR card.** Most generic USB 2.0 PCI cards of the era use similar NEC/VIA EHCI silicon.
 - The card has a **dedicated interrupt line**, so the driver owns it cleanly and mounts are reliable. This is the recommended path.
 
-### On-board USB 2.0, *experimental*
+### On-board USB 2.0, *working, newly so*
 
 - A Power Mac whose **built-in** USB is 2.0 (an EHCI controller, PCI class `0x0C0320`) and that runs Mac OS 9, including later models that boot OS 9 via the community's OS 9 patches.
-- **Proven possible on the Mac Mini G4** (on-board NEC µPD720100A EHCI): it has mounted a drive and copied a full folder both directions. But it is **not yet reliable**, on these machines the EHCI shares its interrupt line with the keyboard/mouse, and mid-mount the shared-line interrupt handling can lock the machine up (kbd/mouse dead). If it doesn't mount within a few seconds, reboot and retry. See "The open problem."
+- **Validated on the Mac Mini G4** (on-board NEC EHCI, `1033:00e0`). In one full session: a drive mounted at Hi-Speed in a rear port, copied files both directions, went to the Trash and was emptied, was unplugged, and then mounted again **behind an Apple Cinema Display's built-in hub** with the same set of operations repeated. No lock-ups.
+- ⚠️ **Newer and less proven than the card path.** One validation session, one machine, one drive. The PCI card path has months of use behind it; this does not. Please report what happens on yours.
+- The earlier version of this page said on-board machines "may lock up mid-mount". That warning came from the older **app-loaded** driver. The ROM-integrated build did not do it, so the warning has been withdrawn rather than left standing as a scare.
+- ⚠️ **If your mini is a Mac mini G4, read [the Mac mini ROM note](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) below before you install a ROM.** It concerns a *separate* display bug, not USB.
 
 ### Both
 
@@ -71,19 +91,25 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
 1. **Get a patched Mac OS ROM.** Two ways, depending on your machine. Either way, first copy your
    machine's `Mac OS ROM` (it lives in the System Folder) somewhere safe, you will need it to revert.
 
-   **Power Mac G4 MDD that boots OS 9 on its stock ROM, use the prebuilt ROM.** The release page carries
+   **Power Mac G4 MDD that boots OS 9 on its stock ROM, use the prebuilt MDD ROM.** The release page carries
    the exact ROM that has been hardware-tested, so this needs no toolchain at all. It is built from an MDD's
    own `Mac OS ROM`.
 
-   > ⚠ **Not if your machine only boots OS 9 thanks to a community ROM patch**, an FW800 MDD, a Mac mini G4,
-   > an aluminium PowerBook and similar. Your `Mac OS ROM` has already been modified to make OS 9 boot at
-   > all, and the prebuilt file does not contain that work, so installing it would remove the thing making
-   > your machine boot. Use the injector on your own already-patched ROM instead: it appends a parcel rather
+   > ⚠ **Not if your machine only boots OS 9 thanks to a community ROM patch**, an FW800 MDD, an aluminium
+   > PowerBook and similar. Your `Mac OS ROM` has already been modified to make OS 9 boot at all, and the
+   > prebuilt MDD file does not contain that work, so installing it would remove the thing making your
+   > machine boot. Use the injector on your own already-patched ROM instead: it appends a parcel rather
    > than replacing anything, so it composes. Boot patch first, then this.
 
-   **Any other NewWorld Mac, patch your own.** A complete ROM is machine-specific: the prebuilt one is an
-   MDD's, and it does not contain the drivers a different model needs (it has no `ATY,RockHopper2`, for
-   instance, so it is not suitable for a Mac mini G4). Run the injector against your own copy, which binds
+   **Mac mini G4, use the prebuilt mini ROM.** A separate, mini-specific ROM is on the release page. It is
+   built on the **MacOS9Lives mini ROM**, so it keeps the patches that make a mini boot OS 9 at all, and it
+   is the exact file that was hardware-validated above. **It also contains a display fix that is
+   experimental and needs a companion app: read
+   [A note for Mac mini G4 owners](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) before you install
+   it.**
+
+   **Any other NewWorld Mac, patch your own.** A complete ROM is machine-specific, and neither prebuilt ROM
+   contains the drivers a different model needs. Run the injector against your own copy, which binds
    the driver to the USB 2.0 controller's Name Registry node:
    ```sh
    python3 rom/usb_rom_inject.py "Mac OS ROM" -o "Mac OS ROM (USB2)"
@@ -122,11 +148,43 @@ If you do quit the helper (Cmd-Q) with a volume still mounted, it unmounts clean
 
 If a drive does not appear, two logs are written for troubleshooting and bug reports: the helper's own step-by-step log next to the application, and **`EHCIUIM_init.log`** on the boot volume (the driver's detailed trace). The driver *appends* to that log across loads, so delete it first and read from the last banner.
 
+## A note for Mac mini G4 owners: the VBL display fix
+
+> The prebuilt **mini** ROM is built on a base that already carries a **second, unrelated patch**: a fix
+> for the Mac mini's OS 9 **startup freeze**, where the mouse cursor freezes during boot at a scaled
+> screen resolution. That bug is a display-driver fault (`ATY,RockHopper2` does not re-arm the vertical
+> blank interrupt after a mode switch) and has nothing to do with USB. It is a
+> [separate project](https://github.com/UnexpectedBomb/G4-Mac-Mini-VBL-Fix).
+>
+> **You need to know how well that part works, because it is bundled into the ROM you are about to flash:**
+>
+> - ⚠️ **The ROM-integrated VBL fix is experimental and does NOT reliably fix the freeze.** In continued
+>   testing after it was first published, boots **still froze** with it installed: roughly **2 frozen-cursor
+>   boots in about 25**. Stock, unpatched, the freeze rate is around 5% of boots (higher on warm restarts).
+>   Those numbers are statistically indistinguishable, so **there is currently no evidence that the ROM part
+>   of the VBL fix helps at all.** It is carried here as an experiment, not as a working fix.
+> - ✅ **The fix that does work is the app**, `VBLFix`, from that project's release page. It is proven,
+>   including independent confirmation by other people on other minis.
+> - ➡️ **So: install `VBLFix` in your Startup Items as well. Treat it as required, not optional.** With the
+>   app in place, a boot the ROM misses becomes a brief freeze that clears itself a few seconds later
+>   instead of a frozen machine.
+>
+> **Why the app works better than the ROM:** the leading explanation is timing. The ROM re-arms the
+> interrupt inside the display driver's mode-switch, which happens deep in the fragile early-boot window
+> where the re-enable often does not latch. The app fires **later**, from Startup Items, after everything
+> has settled, which appears to be inherently the more reliable moment. This is a well-supported
+> hypothesis, not a proven mechanism.
+>
+> **None of this affects USB 2.0.** The USB half of this ROM is what was validated above; the VBL half is
+> along for the ride because that is the ROM the mini was tested on. If you would rather not take the
+> experimental display patch at all, run the injector against your own mini ROM instead of using the
+> prebuilt one, and you will get the USB 2.0 driver on your own base.
+
 ## Known limitations (please read)
 
 This is a beta. These are the things it does **not** do yet:
 
-- **On-board USB 2.0 is experimental and can freeze.** On a PCI card mounting is reliable. On an on-board controller (Mac Mini G4) the EHCI shares its interrupt line with the keyboard/mouse; mid-mount, under the wrong timing, the shared-line interrupt handling can lock the whole machine (keyboard/mouse go dead). It has mounted and copied real files there, but not dependably. If it doesn't mount within a few seconds, reboot and retry, and don't put data you care about on it from an on-board machine yet.
+- **On-board USB 2.0 is validated but new.** On a PCI card mounting is reliable and has been for months. On an on-board controller (Mac Mini G4) it now mounts reliably too, on a root port and behind a hub, but that rests on **one validation session on one machine**. One thing seen there and not yet explained: on an earlier build, the machine paused for about ten seconds right around a drive being inserted, and then carried on. The driver now rides that out instead of giving up on the drive, but the pause itself is not understood, and the on-board EHCI's shared interrupt line is the leading suspect. Please report it if you see it.
 - **A drive attached at boot mounts at 1.1, not 2.0.** Ports that are already occupied when the controller is brought up are handed to the 1.1 companion. Boot with the drive unplugged, then insert it.
 - **Four drives is the ceiling.** The per-device DMA structures live in one wired memory page, which holds four
   devices plus the hub's own bookkeeping. A fifth drive is refused cleanly (it simply does not mount, nothing
@@ -155,11 +213,15 @@ If you need rock-solid *removable* USB on OS 9 today, the built-in USB 1.1 suppo
 
 ## The open problems, help wanted
 
-On a **dedicated PCI card** the manual flow above is rock-solid. Two hard problems remain, and both are great targets for anyone who enjoys low-level driver archaeology.
+On a **dedicated PCI card** the manual flow above is rock-solid. These are the problems that remain, and they are good targets for anyone who enjoys low-level driver archaeology.
 
-### 1. On-board shared-interrupt reliability (the on-board blocker)
+### 1. The on-board shared interrupt line: a stall nobody has explained
 
-On a machine like the Mac Mini G4 the EHCI shares **one PCI interrupt line** with the OHCI companion controllers that drive the keyboard and mouse. Our interrupt handler chains to the companion's handler so input keeps working, and it does, *most of the time*. But intermittently, during the initial bulk-transfer probe of a freshly inserted drive, a completion interrupt on that shared line wedges the processor and the whole machine locks up (keyboard/mouse dead), before the drive mounts. On other boots the very same drive mounts in a couple of seconds and copies gigabytes cleanly. We've narrowed it to the shared-line interrupt path (a dedicated-card line never does this), but a robust fix for chaining into Apple's OHCI handler under load is still open. **If you understand classic Mac OS PCI interrupt sharing / the OHCI UIM's interrupt handler, this is the one to crack.**
+**This one has changed, and honestly reporting how it changed is more useful than the old text was.** It used to read: on-board machines intermittently *lock up* mid-mount, and that was the on-board blocker. On the ROM-integrated build the Mac mini G4 mounts reliably, so the lock-up as described is no longer what happens, and the entry has been rewritten rather than left to frighten people off.
+
+What is left is smaller but real, and unexplained. On a machine like the Mac mini G4 the EHCI shares **one PCI interrupt line** with the OHCI companion controllers that drive the keyboard and mouse, and our handler chains to the companion's so input keeps working. On one build, inserting a drive was followed by roughly **ten seconds in which nothing running at task level got a turn** (the machine visibly paused, then recovered). Interrupt-level work carried on normally throughout; only task level was starved. That was enough to make the driver give up on the drive, because a step that has to run at task level was being timed against a wall clock. That step now waits for the task-level pump to actually run instead, so the stall costs a moment of latency rather than the device, and the mini mounts.
+
+But **the stall itself is still not understood**, and a workaround that survives a fault is not a fix for it. The shared interrupt line is the leading suspect, partly because a dedicated card line has never done this, and partly because this machine already needs one shared-line-specific workaround elsewhere in the driver (a completion callback that deadlocks at interrupt level there and has to be deferred). The awkward part is instrumentation: the driver's tracing writes through the File Manager, which is itself task-level, so a task-level stall silences the very log that would explain it. **If you know how to catch a task-level starvation on classic Mac OS without depending on task level to record it, that is the missing tool.**
 
 ### 2. A drive attached when the controller is brought up
 
@@ -227,6 +289,8 @@ The shippable pieces are the **driver** (injected into the Mac OS ROM) and the *
 
 ## Status & disclaimer
 
-Early beta, provided as-is, with no warranty. On a PCI card it now runs reliably, full-speed reads and writes, large folder copies, and volumes well past 4 GB, with correct addressing across the whole disk, but it is new low-level code touching your disks, so **keep backups.**
+Early beta, provided as-is, with no warranty. On a PCI card it now runs reliably, full-speed reads and writes, large folder copies, and volumes well past 4 GB, with correct addressing across the whole disk. On a Mac mini G4's on-board controller it now works too, on the strength of one validation session rather than months of use. Either way it is new low-level code touching your disks, so **keep backups.**
+
+*If you are installing the prebuilt Mac mini ROM,* note again that it bundles an **experimental** fix for the mini's OS 9 startup freeze which has been observed **not** to prevent that freeze reliably, and that the companion `VBLFix` app should be treated as required. The details are [in the install section](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix).
 
 *Fixed in this build:* a data-corruption bug where writes past the 2 GB / 4 GB volume-offset boundary went to the wrong blocks, silently damaging large files, and sometimes the volume's own structures (boot blocks / catalog). If you ran an earlier release against a volume larger than 2 GB, re-verify or reformat that volume. Bug reports and hardware-compatibility reports are very welcome.

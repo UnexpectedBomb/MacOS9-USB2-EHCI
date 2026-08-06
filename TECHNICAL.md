@@ -72,6 +72,75 @@ not advance a Hi-Speed device (it parks at `TEST UNIT READY` / `REQUEST SENSE` a
 `INQUIRY`), which is why the self-probe inside the helper is still what performs the mount. The ROM
 integration is the foundation a future seamless path needs, not that path itself.
 
+## Bug hunt #6, getting the ROM parcel to bind on a Mac mini G4
+
+The mini's on-board EHCI is the same NEC silicon family as the tested PCI card, and the driver had
+already run there when installed by an app. But with the driver in the ROM, **nothing loaded at all**:
+no driver log was produced, so `uimInitialize` had never run. The helper meanwhile reported success,
+because it finds the controller by its numeric `class-code` property and then calls `LoadUIMForEntry`,
+which cheerfully succeeds when there is no driver to load. So this looked like a driver fault and was
+not one: it was a **bind** failure, upstream of any of our code.
+
+The first hypothesis was wrong, and worth recording as a warning. The parcel matches nodes whose
+`compatible` list contains the string `pciclass,0c0320`, and the natural guess was that the mini's node
+simply does not publish that string. A small read-only probe (`probe/ehci_nodeprobe.c`) that dumps the
+node's properties **refuted that outright**: the string is present. Also ruled out by direct byte
+comparison: the ROM's own parcel-processor configuration block is identical between the two ROMs, so
+that was not the difference either.
+
+What *was* different is that the mini's node carries a `device_type` property (`ehci`), and the PCI
+card's node carries no `device_type` at all. Looking at which parcels demonstrably work in the mini's
+ROM, every one of them sets a particular flag bit that ours did not, and they all match on
+`device_type`. Adding a **second** match entry (`flags=0x0000c`, `device_type == ehci` *and*
+`compatible` contains `pciclass,0c0320`) made the parcel bind, confirmed by the probe reporting
+`driver,AAPL,MacOS,PowerPC` present on the node. The original card entry is untouched, so this is
+additive and the card path cannot regress; the injector's match list became a list of entries rather
+than one set of flags to make that expressible.
+
+⚠️ The meaning of those flag bits is our own inference from observed working parcels. The toolchain
+prints them verbatim and documents no semantics.
+
+## Bug hunt #7, a wall clock measuring the wrong thing
+
+With the parcel bound, the mini enumerated a drive **perfectly** and then threw it away. The log showed
+a clean Hi-Speed port reset, device descriptor, `SET_ADDRESS`, configuration descriptor, the
+mass-storage interface, both bulk endpoints, and `SET_CONFIGURATION ok`, three times in a row, each
+followed by:
+
+```
+!! n5: task-level endpoint registration never ran (no pump?)
+!! n12: enumeration failed 3x - parking this port
+```
+
+Registering the bulk endpoints has to happen at **task level**, because it quiesces the async schedule
+and reprograms queue heads, and doing that from an interrupt handler is a documented way to freeze this
+machine. So the enumeration engine parks and waits for the task-level pump to do it. That park gave up
+after 5000 ms of **wall clock**.
+
+But what it is waiting for is not time, it is **one turn of the pump**, and those are only
+interchangeable while the pump is running. On this run task level was starved for about **10.8 seconds**
+around the insertion. The proof needs no timestamp: port events are recorded at interrupt level and
+drained at task level, and all ten appeared as one contiguous block *ahead of* three earlier-written
+buffered traces, which is only possible if no task-level drain happened in between. So the deadline
+expired three times without the registration ever being offered a turn, each failure reset the port
+again, and after three tries the port was parked. The drive was gone before task level came back.
+
+The fix is to fail on **pump turns** rather than elapsed time: a counter is incremented immediately
+before the registration check, so an advance proves the check was actually evaluated, and the park only
+fails once the pump has demonstrably had turns and still not done the work. That is the fault the guard
+was written to catch in the first place, and it is what its own message guessed at. A generous absolute
+cap remains as a backstop against a pump that is genuinely dead. This cannot regress the card path,
+where the flag is cleared on the very next task-level call, verified against the archived card logs.
+
+Two things worth being straight about:
+
+- **A theory that a control run killed.** The mini's pump interval did blow out sharply on the failing
+  run, which looks like the obvious culprit until you measure the working machine, where the same
+  interval gets *worse* and the driver is fine. Aggregate slowness is not the differentiator; a
+  **hole that lands on the park** is. Reading the known-good log first cost nothing and saved a build.
+- **The stall is still unexplained.** This change makes the driver survive it, not understand it. See
+  the open problems in the README.
+
 ## The stack, layer by layer
 
 - **Controller bring-up** (`ehci_os.c`, `ehci_hw.c`): PCI enable, map the operational
@@ -237,13 +306,18 @@ driver's own trace log walked down why:
   (chaining on our own completions there stalled the card's completion path). This is what lets the
   **one** universal driver serve both machine types.
 
-With both in place the Mac Mini G4 *has* mounted a USB 2.0 drive on its **built-in** ports at
-Hi-Speed with the keyboard and mouse still working, and copied a full folder in both directions.
-But it is **not yet reliable** (see Roadmap): intermittently, during the first bulk probe of a
-freshly inserted drive, servicing a completion on that shared line wedges the processor and the
-machine locks up before the mount lands. The conditional chaining above is necessary but not
-*sufficient*, taming that shared-line path under load is the open on-board problem. On a
-dedicated PCI-card line (no chaining) this never happens and mounts are reliable.
+With both in place the Mac mini G4 mounts a USB 2.0 drive on its **built-in** ports at Hi-Speed with
+the keyboard and mouse still working, on a rear port and behind an external hub, and copies files in
+both directions.
+
+This section previously said the mini was "not yet reliable" because servicing a completion on the
+shared line would wedge the processor and lock the machine up before the mount landed. That was
+observed with the **app-loaded** driver. With the driver loaded from the ROM (bug hunts #6 and #7) the
+mini mounts reliably and the lock-up has not recurred, so the claim has been withdrawn rather than left
+standing. What remains from that story is milder and still unexplained: a roughly ten-second window in
+which **task level** got no turns at all while interrupt level ran normally. The driver now rides that
+out instead of abandoning the drive, and the shared line is still the leading suspect. On a dedicated
+PCI-card line (no chaining) nothing of the kind has ever been seen.
 
 Lesson: on shared silicon, claim **surgically**. Read a port's state only once it's powered,
 never orphan a handler you replace, and expect the shared *interrupt* line to be as delicate as
@@ -338,11 +412,13 @@ trusting a driver on any volume larger than 2 GB.
 - **On-board (shared-port) controllers, experimental (intermittent).** Machines like the Mac
   Mini G4, whose EHCI shares its ports *and interrupt line* with the OHCI companions that drive the
   keyboard/mouse, are handled by the per-port claim + the `sharedCompanion` interrupt discriminator
-  (Bug hunt #4). It has genuinely worked, the drive mounts at Hi-Speed on the built-in ports and
-  copies files while input stays live, but not dependably: the shared-line interrupt path
-  intermittently locks the machine up mid-mount (kbd/mouse dead). Same drive, next cold boot, often
-  mounts fine. A robust fix for chaining into Apple's OHCI handler under load is **open**, this is
-  the main on-board blocker. Dedicated PCI-card lines are unaffected and reliable.
+  (Bug hunt #4), and the ROM parcel binds there via a second match entry (Bug hunt #6). **The mini now
+  mounts reliably**, on a rear port and behind an external hub, with input live throughout. The
+  intermittent mid-mount lock-up this entry used to describe was seen with the app-loaded driver and has
+  not recurred on the ROM build. **Still open:** a roughly ten-second window in which task level got no
+  turns while interrupt level ran normally (Bug hunt #7). The driver survives it now, but the cause is
+  unknown and the shared interrupt line is the leading suspect. One validation session, so treat the
+  mini as newer and less proven than a dedicated card, which remains unaffected.
 - **Large Finder copies: fixed.** Previously wedged on the Finder's interleaved access; the
   cause was a software data toggle on a shared queue head, resolved by per-endpoint hardware
   toggle (Bug hunt #3). A ~800 MB / 1000+ file copy now completes cleanly.

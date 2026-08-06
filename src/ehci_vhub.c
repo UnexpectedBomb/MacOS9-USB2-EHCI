@@ -2220,7 +2220,7 @@ void ehci_vhub_loopcrumb(UInt32 tag)
 /* ================================================================================================
  * PHASE 1b: control transfers, the error-checked BOT probe, self-enumeration, and the n5 async engine.
  * RECONSTRUCTED 2026-08-01 from verbatim fragments captured before
- * the file was lost) — see RECONSTRUCTION-PLAN.md. Placed here because it needs recov_setup,
+ * the file was lost. Placed here because it needs recov_setup,
  * bot_reset_host_toggles, ase_quiesce and reconnect_reset, and must precede selfprobe_tick.
  * ================================================================================================ */
 
@@ -3076,6 +3076,7 @@ typedef struct {
      * hub forwards transparently, so there is ONE enumeration path and no divergence to keep in sync. */
     UInt32 hubAddr;
     UInt32 chBits;              /* h11: the port's wPortChange, carried across the acknowledge yields */
+    UInt32 pump0;               /* m3: gTaskPumpN sampled when an AS_TASK park was entered — see AS_TASK */
 } AsState;
 static UInt8 gAsHubDesc[16];   /* h1: the downstream hub's own class descriptor (type 0x29) */
 static UInt8 gAsDevDesc[18];   /* h1: device descriptor re-read to get bDeviceClass (gEnumDesc is reused) */
@@ -3091,6 +3092,11 @@ static volatile int gAsProbeOK = 0;
 /* Set by the engine at interrupt level when it needs TASK level to register the bulk endpoints; cleared by
  * selfprobe_tick once done. create_bulk must not run from the SIH — see the note at its call site. */
 static volatile int gAsNeedBulk = 0;
+/* ★★★★ m3: COUNTS THE TASK-LEVEL PUMP, so the AS_TASK park can tell "the pump is broken" (the fault the
+ * park's deadline was written to catch) from "the pump has not had a turn yet" (which is not a fault at all).
+ * Incremented in selfprobe_tick immediately before the gAsNeedBulk check, so an advance here means the check
+ * was actually EVALUATED — not merely that the function was entered. See the note on AS_TASK. */
+static volatile UInt32 gTaskPumpN = 0;
 
 /* ★★★ n12: PARK a port we cannot drive — and DO NOT TOUCH THE HARDWARE DOING IT.
  *
@@ -3193,12 +3199,37 @@ static void as_fail(const char *why, UInt32 v)
                      if (_r == 0) return; \
                      if (_r < 0) { as_fail("!! n5 SELFENUM: control transfer FAILED at step", (L)); return; } } \
     } while (0)
-/* Park until TASK level has done a piece of work the engine must not do from the SIH. */
+/* Park until TASK level has done a piece of work the engine must not do from the SIH.
+ *
+ * ★★★★★ m3 — THIS DEADLINE WAS MEASURING THE WRONG THING, AND IT IS WHY THE MINI DID NOT MOUNT.
+ * The park was abandoned after 5000 ms of WALL CLOCK. But the thing being waited for is not time, it is one
+ * turn of the task-level pump, and the two are only interchangeable while the pump is running. On the mini's
+ * m2 run task level went dead for ~10.8 s from the instant of the connect (proved by the port-event ring:
+ * all ten events accumulated undrained, and the three ring-buffered SELFENUM traces were emitted AFTER them
+ * even though they were written earlier — an ordering only possible with no task-level drain in between).
+ * So the deadline expired three times over without the registration ever having been offered a turn, each
+ * failure re-reset the port, and after 3 tries n12 parked the port — the drive was gone before the pump came
+ * back. The enumeration itself was flawless: HS reset to PORTSC 0x1005, descriptors, SET_ADDRESS,
+ * SET_CONFIGURATION ok, bulk ep1-IN/ep2-OUT @512 all read correctly, three times.
+ *
+ * ⇒ Fail only when the pump has DEMONSTRABLY had turns and still not cleared the flag (the original fault:
+ * tickFn/slot-23 not wired to us at all — the message's own guess, "no pump?"). A task-level hole now costs
+ * latency instead of the device. The absolute cap stays as a backstop so a permanently dead pump cannot park
+ * the engine forever and block the retry, but it is generous enough that no plausible stall reaches it.
+ * ★ This CANNOT regress the MDD: there the flag is cleared on the very next task-level call — h21's log has
+ * `SET_CONFIGURATION ok` and `n6b bulk endpoints registered` on ADJACENT LINES, 9 times out of 9, with zero
+ * occurrences of this failure — so neither condition below is ever approached. */
+#define AS_TASK_PUMP_TURNS  4UL       /* pump turns with the flag still set that prove the pump is broken */
+#define AS_TASK_CAP_MS      60000UL   /* backstop only: a truly dead pump must not park the engine forever */
 #define AS_TASK(L) \
-    do { gAs.pc = (L); gAs.t0 = frame_ms(); return; \
+    do { gAs.pc = (L); gAs.t0 = frame_ms(); gAs.pump0 = gTaskPumpN; return; \
          case (L): \
             if (gAsNeedBulk) { \
-                if (frame_ms() - gAs.t0 > 5000UL) { as_fail("!! n5: task-level endpoint registration never ran (no pump?)", (L)); } \
+                if (gTaskPumpN - gAs.pump0 >= AS_TASK_PUMP_TURNS) \
+                    as_fail("!! n5: the pump RAN and did not register the endpoints — tickFn/slot-23 wiring; turns", \
+                            gTaskPumpN - gAs.pump0); \
+                else if (frame_ms() - gAs.t0 > AS_TASK_CAP_MS) \
+                    as_fail("!! m3: task level never got a turn at all within the cap; ms", frame_ms() - gAs.t0); \
                 return; \
             } \
     } while (0)
@@ -4135,6 +4166,9 @@ void ehci_vhub_selfprobe_tick(void)
      *     PostEvent, both of which are interrupt-safe. */
     /* n6b: the engine parks and asks US to register the bulk endpoints, because create_bulk does
      * ase_quiesce() + epq_program() and neither may run from the SIH (the hot-re-insert freeze). */
+    /* ★ m3: count the turn BEFORE the check, so an advance in gTaskPumpN proves this check was evaluated
+     * rather than merely that selfprobe_tick was entered. AS_TASK's fail condition reads it. */
+    gTaskPumpN++;
     if (gAsNeedBulk) {
         /* ★★★★ h14: CHECK THE REGISTRATIONS. These two results were discarded with (void), so a failure here
          * became "the drive never appeared" with nothing naming the cause. Both endpoints are required; if

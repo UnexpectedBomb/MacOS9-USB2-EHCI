@@ -78,17 +78,30 @@ PEF_NAME = 'EHCIUIM.pef'          # referenced uncompressed, like the stock cont
 # pciclass,0c0320".
 # FALLBACK, if a boot-claim test shows no bind: flags 0x00001 a=<exact OF node name>, or
 # 0x00005 a=<name> (compatible OR name). b is unused without 0x08.
-MATCHES     = ['pciclass,0c0320']
-DEVICE_TYPE = 'usb'       # b field — UNUSED here (0x08 not set); kept for line format
-PROP_FLAGS  = '0x00004'   # compatible contains a (device_type absent -> no 0x08)
+#
+# ⚠ THE ABOVE IS TRUE OF A PCI CARD AND NOT OF EVERY MACHINE. An on-board controller can advertise
+# itself differently, and a Mac mini G4 does: its node DOES carry device_type = ehci. On that machine
+# the card entry alone was silently ignored, so the ROM appeared to load the driver and nothing
+# happened at all (a bind failure that looks exactly like a broken driver). Matching the way the
+# stock parcels in that ROM match, on device_type, is what binds there.
+#
+# So there is ONE ENTRY PER NODE SHAPE, and one ROM serves both kinds of machine. `deduplicate=1`
+# keeps a single copy of the driver PEF in the ROM even though two entries reference it. Adding an
+# entry cannot affect a machine whose node does not match it, so the proven card path is unchanged.
+MATCH_ENTRIES = [
+    # PCI card: node has no device_type, so 0x08 is clear and `b` is unused. Hardware-proven.
+    ('0x00004', 'pciclass,0c0320', 'usb'),
+    # On-board (e.g. Mac mini G4): device_type == b AND compatible contains a.
+    ('0x0000c', 'pciclass,0c0320', 'ehci'),
+]
 NDRV_FLAGS  = '0x00006'   # mirrors the stock controller ndrv flags
 
 
 def parcel_lines():
     out = []
-    dedup = ' deduplicate=1' if len(MATCHES) > 1 else ''
-    for m in MATCHES:
-        out.append('prop flags=%s a=%s b=%s\n' % (PROP_FLAGS, m, DEVICE_TYPE))
+    dedup = ' deduplicate=1' if len(MATCH_ENTRIES) > 1 else ''
+    for (flags, a, b) in MATCH_ENTRIES:
+        out.append('prop flags=%s a=%s b=%s\n' % (flags, a, b))
         out.append('\tndrv flags=%s name=driver,AAPL,MacOS,PowerPC src=%s%s\n\n'
                    % (NDRV_FLAGS, PEF_NAME, dedup))
     return out
@@ -149,7 +162,8 @@ for (parent, folders, files) in os.walk(src):
     with open(path.join(parent, 'Parcelfile'), 'a') as f:
         f.write('\n')
         f.writelines(parcel_lines())
-    print('Injected USB2 parcel(s): a=%s  b=%s' % (' / a='.join(MATCHES), DEVICE_TYPE))
+    for (flags, a, b) in MATCH_ENTRIES:
+        print('Injected USB2 parcel: flags=%s a=%s b=%s' % (flags, a, b))
     print('  copied %s into %s' % (PEF_NAME, parent))
     injected = True
 
@@ -191,9 +205,11 @@ print('done.')
 # ============================================================================
 # How this stays safe and actually binds (all hardware-proven on a G4 MDD):
 #
-#  MATCH: the node's compatible list contains pciclass,0c0320, and device_type is
-#    absent, so PROP_FLAGS=0x00004 (compatible-contains) binds card-agnostically. If a
-#    target does not bind, re-probe the node and fall back to an exact-name match.
+#  MATCH: one entry per node shape (see MATCH_ENTRIES). On a PCI card the node's compatible
+#    list contains pciclass,0c0320 and device_type is absent, so flags 0x00004
+#    (compatible-contains) binds card-agnostically. On an on-board controller that publishes
+#    device_type = ehci, flags 0x0000c is what binds. If a target does not bind, probe the
+#    node and fall back to an exact-name match.
 #
 #  DRIVER boot-safety: TheDriverDescription.driverRuntime is 0x05
 #    (kDriverIsLoadedUponDiscovery | kDriverIsUnderExpertControl, NOT OpenedUponLoad), and
