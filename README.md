@@ -2,6 +2,23 @@
 
 **The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts a USB flash drive and reads and writes it at **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
 
+> ## ⚠️ If you flashed a ROM from an earlier release, please re-flash
+>
+> **Every Mac OS ROM released here before 2026-08-07 was missing a 185 KB component called `SysEnabler`,
+> and that was our packaging's fault, not yours.** Those ROMs were distributed as MacBinary `.bin`, and the
+> wrapper we used built its own small resource fork that **replaced** the ROM's real one, where `SysEnabler`
+> lives. It affects the `n13` release and the MDD and mini ROMs in the `m3` release.
+>
+> **The symptom, if you saw it:** an intermittent frozen mouse cursor at startup, and the machine responding
+> to input only every few seconds. On our own MDD that happened on roughly half of boots. With `SysEnabler`
+> restored it booted **six times out of six with no freezing and no stutter**.
+>
+> **The fix:** ROMs are now shipped as **BinHex `.hqx`**, which carries both forks intact. Grab the current
+> release and re-flash. Nothing about the driver changed, so this costs you one ROM swap and nothing else.
+>
+> Six clean boots is encouraging, not proof, and we would genuinely like to hear whether it changes anything
+> on your machine.
+
 ## What's new: USB 2.0 on the Mac mini G4
 
 **A second kind of machine now works.** Until now this stack ran on one machine, a Power Mac G4 MDD with a
@@ -93,7 +110,8 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
 
    **Power Mac G4 MDD that boots OS 9 on its stock ROM, use the prebuilt MDD ROM.** The release page carries
    the exact ROM that has been hardware-tested, so this needs no toolchain at all. It is built from an MDD's
-   own `Mac OS ROM`.
+   own `Mac OS ROM`. It arrives as **BinHex (`.hqx`)**: decode it with **StuffIt Expander** on the Mac, which
+   preserves the ROM's resource fork. Do not convert it on a PC or through a tool that drops forks.
 
    > ⚠ **Not if your machine only boots OS 9 thanks to a community ROM patch**, an FW800 MDD, an aluminium
    > PowerBook and similar. Your `Mac OS ROM` has already been modified to make OS 9 boot at all, and the
@@ -103,8 +121,8 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
 
    **Mac mini G4, use the prebuilt mini ROM.** A separate, mini-specific ROM is on the release page. It is
    built on the **MacOS9Lives mini ROM**, so it keeps the patches that make a mini boot OS 9 at all, and it
-   is the exact file that was hardware-validated above. **It also contains a display fix that is
-   experimental and needs a companion app: read
+   is the exact file that was hardware-validated above, also as **BinHex (`.hqx`)**, decoded with StuffIt
+   Expander. **It also contains a display fix that is experimental and needs a companion app: read
    [A note for Mac mini G4 owners](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) before you install
    it.**
 
@@ -112,8 +130,16 @@ A **one-time setup**: patch the driver into your Mac OS ROM, and drop the facele
    contains the drivers a different model needs. Run the injector against your own copy, which binds
    the driver to the USB 2.0 controller's Name Registry node:
    ```sh
-   python3 rom/usb_rom_inject.py "Mac OS ROM" -o "Mac OS ROM (USB2)"
+   python3 scripts/build-rom-hqx.py "Mac OS ROM" mybuild "Mac OS ROM (USB2).hqx"
    ```
+   That injects the driver, stamps the build name so **Get Info shows which ROM you are running**, and emits
+   BinHex, which keeps your ROM's resource fork. It refuses to write a ROM whose `SysEnabler` came out empty,
+   which is the mistake described in the notice at the top of this page.
+
+   ⚠ Your input needs its resource fork intact. Getting a `Mac OS ROM` off an OS 9 machine over anything that
+   does not understand forks will silently strip it; StuffIt/BinHex on the Mac, or `unar` on the desktop, will
+   preserve it. `rom/usb_rom_inject.py` is still there if you want the raw injection step on its own.
+
    See [BUILD.md](BUILD.md) for the toolchain this needs.
 
    > **OldWorld Macs are out of scope.** A beige G3, 8600 or 9600 has no `Mac OS ROM` file for this to patch
