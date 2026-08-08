@@ -2,27 +2,22 @@
 
 **The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts a USB flash drive and reads and writes it at **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
 
-> ## ⚠️ ROM downloads are temporarily withdrawn
+> ## ⚠️ If you flashed a ROM from `n13` or `m3`, please re-flash
 >
-> **The corrected ROMs published on 2026-08-07 did not boot, and have been pulled.** If you flashed one and
-> your machine will not start up, the fix is in the
-> [withdrawn release's notes](https://github.com/UnexpectedBomb/MacOS9-USB2-EHCI/releases/tag/hqx-reissue):
-> boot from a CD or another volume and put your original `Mac OS ROM` back. That was our mistake, not
-> anything you did.
+> **Every Mac OS ROM released here before 2026-08-07 was missing a 185 KB component called `SysEnabler`,
+> and that was our packaging's fault.** Those ROMs shipped as MacBinary, and the wrapper we used built its own
+> small resource fork that **replaced** the ROM's real one, where `SysEnabler` lives. They boot, which is why
+> it went unnoticed for months, but on our own MDD it appears to have caused an intermittent frozen cursor at
+> startup and input responding only every few seconds, on roughly half of boots. With `SysEnabler` restored the
+> same machine booted six times out of six, clean.
 >
-> **The cause:** those ROMs carried a `vers` resource so Get Info would name the build. A Mac OS ROM's
-> resource fork is the System Enabler's, and a `vers` (1) there describes the *enabler*, so the System saw a
-> mis-versioned enabler and left parts of itself uninstalled. Nothing else about the ROM was wrong, and an
-> otherwise identical ROM without that resource boots normally. It was published without being booted first,
-> which is the actual error.
+> **The fix:** ROMs now ship as **BinHex `.hqx`**, which carries both forks. Grab the current release and
+> re-flash. The driver is unchanged, so this costs you one ROM swap and nothing else.
 >
-> **Meanwhile:** the ROM in the [`m3` release](https://github.com/UnexpectedBomb/MacOS9-USB2-EHCI/releases/tag/m3)
-> boots. It has a separate, older packaging defect (a missing `SysEnabler`, described in its notes) that can
-> cause an intermittent frozen cursor at startup, but it starts up reliably and is a safe place to sit.
->
-> Corrected ROMs are built and verified at the desk and will be republished **after** they have started a
-> real machine. You can also build your own now with `scripts/build-rom-hqx.py`, which refuses to produce a
-> ROM containing the resource that caused this.
+> ⚠️ **A first attempt at this on 2026-08-07 did not boot and was withdrawn within the day.** It carried a
+> `vers` resource so Get Info could name the build, and that resource mis-described the System Enabler. Both
+> current ROMs have since been booted on real hardware before publishing, and the build tool now refuses to
+> produce a ROM containing that resource. If you grabbed one during that window, the current release replaces it.
 
 ## What's new: USB 2.0 on the Mac mini G4
 
