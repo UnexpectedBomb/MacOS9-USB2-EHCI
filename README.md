@@ -1,178 +1,105 @@
-# USB 2.0 for Mac OS 9: ROM-Integrated Beta
+# USB 2.0 for Mac OS 9: ROM-Integrated Release
 
-**The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts a USB flash drive and reads and writes it at **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
+**The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts USB drives and reads and writes them at **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
 
-> ## ⚠️ If you flashed a ROM from `n13` or `m3`, please re-flash
->
-> **Every Mac OS ROM released here before 2026-08-07 was missing a 185 KB component called `SysEnabler`,
-> and that was our packaging's fault.** Those ROMs shipped as MacBinary, and the wrapper we used built its own
-> small resource fork that **replaced** the ROM's real one, where `SysEnabler` lives. They boot, which is why
-> it went unnoticed for months, but on our own MDD it appears to have caused an intermittent frozen cursor at
-> startup and input responding only every few seconds, on roughly half of boots. With `SysEnabler` restored the
-> same machine booted six times out of six, clean.
->
-> **The fix:** ROMs now ship as **BinHex `.hqx`**, which carries both forks. Grab the current release and
-> re-flash. The driver is unchanged, so this costs you one ROM swap and nothing else.
->
-> ⚠️ **A first attempt at this on 2026-08-07 did not boot and was withdrawn within the day.** It carried a
-> `vers` resource so Get Info could name the build, and that resource mis-described the System Enabler. Both
-> current ROMs have since been booted on real hardware before publishing, and the build tool now refuses to
-> produce a ROM containing that resource. If you grabbed one during that window, the current release replaces it.
+## What's new in this release (2026-08-13)
 
-## What's new: USB 2.0 on the Mac mini G4
+This is the largest update since the project began, and it retires most of the caveats that used to fill this page:
 
-**A second kind of machine now works.** Until now this stack ran on one machine, a Power Mac G4 MDD with a
-PCI USB 2.0 card. The **Mac mini G4** has now been validated on its **on-board** USB 2.0 controller, which
-Mac OS 9 has only ever driven at 1.1: a drive mounts at Hi-Speed in a rear port, copies files both
-directions, ejects to the Trash, and mounts again **behind an Apple Cinema Display's built-in hub**. The
-keyboard and mouse keep working throughout, on the same controller.
+- **One driver, two machines, fully validated.** The same driver binary now passes the complete hardening suite on both the Power Mac G4 MDD (PCI card) and the Mac mini G4 (on-board USB 2.0): cold boots with drives attached, four drives at once with copies between them, hot-plug, hub support, and clean ejects. The mini is no longer "newer and less proven"; both machines were validated on the same day with the same code.
+- **No more Startup Items helper app.** Activation now lives in a small **system extension** (`Mini G4 EHCI` or `MDD G4 EHCI`). Drop it in the Extensions folder once and forget it. There is nothing to see and nothing that can be quit by accident.
+- **Drives connected at boot now mount at Hi-Speed.** The old "boot with your drive unplugged" ritual is gone: the extension claims the controller's free ports at boot, so a drive that is already plugged in comes up at 2.0. (You may see a harmless prompt at startup; see "Things you may notice" below.)
+- **The intermittent boot slowdowns and freezes are fixed, and the cause was ours.** The beta driver wrote a verbose diagnostic log through the File Manager, synchronously, on the boot volume. Under the right timing that single behavior could hold the Finder's thread for 30 seconds at a stretch, which showed up as slow extension loading, a desktop that took forever, an unresponsive cursor, or a machine that never came back. The release driver writes a two-line log and nothing else. If your earlier install ever felt sluggish or wedged at boot, this was very likely why.
+- **Apple System Profiler no longer crashes.** ASP's "Devices and Volumes" tab had crashed to MacsBug on every machine with this driver installed since the first ROM. The cause was subtle (the OS creates a bookkeeping entry for ROM-loaded drivers but never finishes wiring it, and ASP is the only thing that ever walks through it); the driver now repairs that entry at boot. ASP scans cleanly and lists this stack's drives alongside everything else.
+- **Pulling a drive without ejecting now shows Apple's own warning.** "The device for disk ... was unexpectedly disconnected", word for word, exactly as the built-in USB 1.1 stack would. No crash, and the surviving drives are untouched.
+- **Simple, final file names.** The download names below say what each file is for. Version numbers live in the Finder's Get Info and Apple System Profiler (for the extensions) and in the table at the bottom of this page, not in the filenames.
 
-Two things had to be fixed to get there, and both are described in [TECHNICAL.md](TECHNICAL.md): the ROM
-parcel was not binding to the mini's controller at all (its Name Registry node advertises itself
-differently from a PCI card's, so the parcel's match had to be widened), and once it did bind, a step that
-must run at task level was being abandoned on a **wall clock** while task level happened to be starved,
-which threw away a drive that had in fact enumerated perfectly.
+## Downloads: which two files you need
 
-**Mac mini owners: there is a prebuilt mini ROM, and it carries an experimental display fix as well as this
-driver. Please read [the note about it](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) before flashing.**
+Every machine needs exactly **two files**: a ROM and an extension. Take the pair for your machine.
+
+| Your machine | ROM (BinHex `.hqx`) | Extension (MacBinary `.bin`) |
+|---|---|---|
+| **Mac mini G4** | `USB2_Mini_G4_ROM.hqx` | `Mini_G4_EHCI_Ext.bin` |
+| **Power Mac G4 MDD** with a PCI USB 2.0 card | `USB2_MDD_G4_ROM.hqx` | `MDD_G4_EHCI_Ext.bin` |
+
+Decode both on the Mac with **StuffIt Expander** (both formats preserve the resource forks; converting them on a PC with a fork-blind tool will break them). The ROM decodes to a file named `Mac OS ROM`; the extension decompresses to `Mini G4 EHCI` or `MDD G4 EHCI`, wearing its own USB 2.0 icon.
+
+Checksums and version details are in [Versions](#versions) at the bottom of this page.
 
 ## The driver lives in the Mac OS ROM
 
-Earlier releases shipped the driver *inside an app* that installed it at runtime. This release takes the step the project was built toward: the EHCI UIM is injected into the **Mac OS ROM** itself, as a `driver,AAPL,MacOS,PowerPC` parcel bound to the USB 2.0 controller's Name Registry node (built with Elliot Nunn's Mac OS ROM toolchain). Mac OS 9 now **loads and binds our driver at boot, as a genuine OS-owned host-controller driver**, the same way it loads a native Apple one. That is the architectural milestone: on a machine with the patched ROM, USB 2.0 support is part of the operating system, not bolted on by a helper app.
+The EHCI UIM is injected into the **Mac OS ROM** itself, as a `driver,AAPL,MacOS,PowerPC` parcel bound to the USB 2.0 controller's Name Registry node (built with Elliot Nunn's Mac OS ROM toolchain). Mac OS 9 **loads and binds the driver at boot, as a genuine OS-owned host-controller driver**, the same way it loads a native Apple one. On a machine with the patched ROM, USB 2.0 support is part of the operating system, not bolted on by a helper app.
 
-**The operating system now performs the mount itself.** The driver enumerates the device, runs the SCSI Bulk-Only probe, and **installs its own native block driver**, which calls `AddDrive` and posts a disk-inserted event, so Mac OS 9 mounts the volume through its ordinary path, exactly as it would for a built-in controller. Nothing in user space calls `PBMountVol` any more. Apple's mass-storage mounter is not involved at all (it cannot be: it stops after the first `TEST UNIT READY` / `REQUEST SENSE` and never issues `INQUIRY` to a Hi-Speed device), and neither is Apple's USB stack, whose view of our ports we suppress.
+**The operating system performs the mount itself.** The driver enumerates the device, runs the SCSI Bulk-Only probe, and installs its own native block driver, which calls `AddDrive` and posts a disk-inserted event, so Mac OS 9 mounts the volume through its ordinary path, exactly as it would for a built-in controller. Apple's mass-storage mounter is not involved at all (it cannot be: it stops after the first `TEST UNIT READY` / `REQUEST SENSE` and never issues `INQUIRY` to a Hi-Speed device), and neither is Apple's USB stack, whose view of our ports is suppressed.
 
-**Hot-plug works.** Insert, eject, unplug, re-insert, or swap in a completely different drive, every arrival is re-scanned and re-mounted, on the same drive number, with no leak. Pulling a drive without ejecting unmounts it cleanly instead of leaving a "damaged disk" behind, and both ejection and improper removal produce the same alerts, word for word, that Apple's own USB stack shows.
+**The extension is the only other piece.** It runs once at boot: it claims the controller's free ports (leaving keyboard and mouse ports to the built-in 1.1 controller), activates the ROM driver, and arms the small task-level pump the driver borrows from the system. It has no window, no menu and no process to quit. It is not in the data path; once a volume is mounted, all I/O runs at interrupt level.
 
-**Honest scope: a small faceless helper is still required.** It sits silently in Startup Items and does two things: activates the ROM driver (`LoadUIMForEntry`) and pumps the polled service slot that device *discovery* runs on. That slot is only ever driven by Apple's USB Services Library from an application context, which is why the last helper process cannot be removed yet. It is **not** in the data path, once a volume is mounted, all I/O runs at interrupt level. In practice you never interact with it: it starts at boot, shows nothing, and drives are plug-and-play from then on.
-
-The driver serves two kinds of machine, at two different maturity levels:
-
-- **PCI USB 2.0 cards** (a card in a PCI slot, e.g. the **Power Mac G4 "Mirrored Drive Doors"**): **the supported path.** The EHCI card has its own dedicated interrupt line, the driver owns it cleanly, and mounts are reliable.
-- **On-board USB 2.0** (built-in ports that are USB 2.0-capable but which OS 9 only ever drove at 1.1, e.g. the **Mac Mini G4**): **now working, newly so.** The **Mac mini G4** has been validated end to end: a drive mounts at Hi-Speed in a rear port *and* behind an Apple Cinema Display's built-in hub, with copies both directions, Trash, and hot-plug on every port. This replaces an earlier, much more pessimistic assessment on this page: the previous "may lock up mid-mount" warning came from the older app-loaded driver, and the ROM-integrated build does not behave that way. It has had **one full validation session**, not months of use, so it is newer and less proven than the PCI card path.
-
-> ⚠️ **This is a beta / technology preview.** On a PCI card it works, it is stable, and it moves real files fast. The Mac mini G4 now works too, on a newer and less-proven footing. But mounting a Hi-Speed drive still goes through the headless helper and a specific **insertion sequence** (not plug-and-play), and it has real limitations. It is shared in this state so the community can use it *and* help finish it. **Read the steps below carefully: the timing of when you insert the drive matters.**
-
----
+**Hot-plug works.** Insert, eject, unplug, re-insert, or swap in a completely different drive; every arrival is re-scanned and re-mounted, on the same drive number, with no leak. Ejection and improper removal both produce the same alerts, word for word, that Apple's own USB stack shows.
 
 ## What it does
 
-- Mounts USB 2.0 mass-storage devices (flash drives / SSDs) on the OS 9 desktop at Hi-Speed.
-- **Up to four drives at once, in any combination of ports.** Each gets its own volume, icon and geometry.
-  Files copy directly between them, they can be ejected individually or all together in a single drag to the
-  Trash, and each hot-plugs independently. Validated on hardware with four drives across a PCI card and an
-  external hub at the same time.
-- **Drives behind an external USB 2.0 hub run at Hi-Speed.** The hub is enumerated and driven by this stack
-  (we power, reset and address its downstream ports ourselves), so a drive plugged into a hub, including the
-  hub built into an Apple Cinema Display, mounts at 2.0 instead of falling back to 1.1. Keyboards and mice
-  behind a hub are a separate problem and still do not work: see "Known limitations".
-- Reads and writes at the device's real speed, benchmarked at **20 MB/s read, ~13 MB/s write** (both are the flash device's own ceiling; the driver reaches it). Real Finder copies land lower (~8 read / ~5 write) because the Finder's own I/O sizing is the bottleneck above the driver, not the driver itself.
-- On an **on-board** machine (e.g. Mac Mini G4), the driver hands the keyboard/mouse ports back to the built-in 1.1 controller and claims only a free port for the drive, so the keyboard and mouse keep working while the drive runs at Hi-Speed. Validated on a Mac mini G4, including a drive behind the Cinema Display's hub.
-- **Ejects** cleanly (Finder menu or drag-to-Trash), like any removable disk.
-- **No Extension to install.** The driver rides *inside the Mac OS ROM* (a one-time ROM patch, see "Install & use"). Nothing goes into your Extensions folder. The driver loads at boot as an OS component; a small headless helper then performs the Hi-Speed mount.
-- **Tells you it's really 2.0**, a volume mounted through this driver appears on the desktop with a distinct **"2.0" drive icon**, so a Hi-Speed mount is obvious at a glance versus a plain USB 1.1 one.
+- Mounts USB 2.0 mass-storage devices (flash drives / SSDs) on the OS 9 desktop at Hi-Speed, including **drives that are already connected at boot**.
+- **Up to four drives at once, in any combination of ports.** Each gets its own volume, icon and geometry. Files copy directly between them, they can be ejected individually or all together in a single drag to the Trash, and each hot-plugs independently. Re-validated in this release with four drives across a PCI card and an external hub at the same time.
+- **Drives behind an external USB 2.0 hub run at Hi-Speed.** The hub is enumerated and driven by this stack (we power, reset and address its downstream ports ourselves), so a drive plugged into a hub, including the hub built into an Apple Cinema Display, mounts at 2.0 instead of falling back to 1.1. Keyboards and mice behind a hub are a separate problem and still do not work: see "Known limitations".
+- Reads and writes at the device's real speed, benchmarked at **20 MB/s read, ~13 MB/s write** (both are the flash device's own ceiling; the driver reaches it). Real Finder copies land lower (~4 to 8 MB/s) because the Finder's own I/O sizing is the bottleneck above the driver.
+- On an **on-board** machine (Mac mini G4), the driver hands the keyboard/mouse ports back to the built-in 1.1 controller and claims only free ports for drives, so input keeps working while drives run at Hi-Speed, including with the drives behind the Cinema Display's hub on the same controller.
+- **Ejects** cleanly (Finder menu or drag-to-Trash), like any removable disk, and warns with Apple's own alert if you pull a disk without ejecting.
+- **Tells you it's really 2.0**: a volume mounted through this driver appears on the desktop with a distinct **"2.0" drive icon**, so a Hi-Speed mount is obvious at a glance versus a plain USB 1.1 one.
 - Reliable transfers: byte-verified, with a transfer watchdog and a CSW residue/signature check on every command, and **correct block addressing across the entire volume**, so large files and volumes well past 2 GB / 4 GB read and write without corruption.
+- Plays fair with the rest of the system: Apple System Profiler scans it cleanly, restarts and shutdowns quiesce the controller through a Shutdown Manager hook, and the built-in USB 1.1 stack is untouched.
 
 ## Supported machines
 
-There is now **one universal launcher**, the same app and driver on every machine. It detects your
-hardware and adapts automatically (claims all ports on a dedicated card; hands the keyboard/mouse ports
-back and claims only a free one on an on-board controller). You do not pick a build.
-
-### PCI USB 2.0 card, *supported*
+### Power Mac G4 MDD + PCI USB 2.0 card
 
 - A Power Mac running Mac OS 9 with a free PCI slot and a **USB 2.0 host card** (EHCI, class `0x0C0320`).
 - **Tested: Power Mac G4 "Mirrored Drive Doors" + NEC-chipset IOGEAR card.** Most generic USB 2.0 PCI cards of the era use similar NEC/VIA EHCI silicon.
-- The card has a **dedicated interrupt line**, so the driver owns it cleanly and mounts are reliable. This is the recommended path.
+- The card has a dedicated interrupt line, and this path has months of use plus this release's full hardening suite behind it.
 
-### On-board USB 2.0, *working, newly so*
+### Mac mini G4 (on-board USB 2.0)
 
-- A Power Mac whose **built-in** USB is 2.0 (an EHCI controller, PCI class `0x0C0320`) and that runs Mac OS 9, including later models that boot OS 9 via the community's OS 9 patches.
-- **Validated on the Mac Mini G4** (on-board NEC EHCI, `1033:00e0`). In one full session: a drive mounted at Hi-Speed in a rear port, copied files both directions, went to the Trash and was emptied, was unplugged, and then mounted again **behind an Apple Cinema Display's built-in hub** with the same set of operations repeated. No lock-ups.
-- ⚠️ **Newer and less proven than the card path.** One validation session, one machine, one drive. The PCI card path has months of use behind it; this does not. Please report what happens on yours.
-- The earlier version of this page said on-board machines "may lock up mid-mount". That warning came from the older **app-loaded** driver. The ROM-integrated build did not do it, so the warning has been withdrawn rather than left standing as a scare.
-- ⚠️ **If your mini is a Mac mini G4, read [the Mac mini ROM note](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) below before you install a ROM.** It concerns a *separate* display bug, not USB.
+- The mini's built-in rear ports are USB 2.0-capable, but Mac OS 9 has only ever driven them at 1.1. With this ROM and extension they run at Hi-Speed.
+- **Validated extensively in this release**: repeated cold boots with two drives attached behind the Cinema Display's hub, drive-to-drive copies (byte-verified), hot-plug and rude-removal cycles, and Apple System Profiler scans, all clean, with the keyboard and mouse working throughout on the same controller.
+- ⚠️ **Read [the Mac mini ROM note](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) below before you install the mini ROM.** It concerns a *separate* display bug, not USB.
 
-### Both
+### Other machines
 
-- A USB 2.0 mass-storage device formatted **HFS, Mac OS Standard or Mac OS Extended** (either an Apple Partition Map with an `Apple_HFS` partition, or a single partitionless HFS volume). *Not FAT.* (Tested with a SanDisk Ultra USB flash drive, Mac OS Extended, on volumes up to 62 GB.)
+- **Other NewWorld Macs with an EHCI controller** (a PCI card, or on-board USB 2.0 on late OS 9-capable models): the driver should bind, but you must patch your own ROM; see "Install". On a PCI-card machine, `MDD_G4_EHCI_Ext.bin` is the extension to try; it adapts to the hardware at runtime.
+- **OldWorld Macs are out of scope.** A beige G3, 8600 or 9600 has no `Mac OS ROM` file for this to patch (on those machines OS 9's whole USB stack is disk Extensions instead), so the injector will stop with *"no Parcelfile found in the dump"*.
+- A USB 2.0 mass-storage device formatted **HFS, Mac OS Standard or Mac OS Extended** (either an Apple Partition Map with an `Apple_HFS` partition, or a single partitionless HFS volume). *Not FAT.* (Tested with SanDisk and generic flash drives, on volumes up to 62 GB.)
 
-*Only a couple of hardware combinations have been tested so far. If it works, or doesn't, on your machine / card / drive, please open an issue; that data directly helps.*
+*If it works, or doesn't, on your machine / card / drive, please open an issue; that data directly helps.*
 
-## Install & use
+## Install
 
-A **one-time setup**: patch the driver into your Mac OS ROM, and drop the faceless helper into Startup Items. After that, drives are plug-and-play.
+A **one-time setup**, two files. After that, drives are plug-and-play.
 
-### One-time setup
+1. **Back up your current ROM.** Copy your machine's `Mac OS ROM` (it lives in the System Folder) somewhere safe. You will need it to revert.
 
-1. **Get a patched Mac OS ROM.** Two ways, depending on your machine. Either way, first copy your
-   machine's `Mac OS ROM` (it lives in the System Folder) somewhere safe, you will need it to revert.
+2. **Install the ROM.** Decode the `.hqx` for your machine with StuffIt Expander; it decodes to a file named `Mac OS ROM`. **Boot from a CD or another volume**, put the decoded file into the System Folder in place of the original, and reboot. You cannot swap it while booted from that same System Folder. Make sure you can boot from something else before you start.
 
-   **Power Mac G4 MDD that boots OS 9 on its stock ROM, use the prebuilt MDD ROM.** The release page carries
-   the exact ROM that has been hardware-tested, so this needs no toolchain at all. It is built from an MDD's
-   own `Mac OS ROM`. It arrives as **BinHex (`.hqx`)**: decode it with **StuffIt Expander** on the Mac, which
-   preserves the ROM's resource fork. Do not convert it on a PC or through a tool that drops forks.
-
-   > ⚠ **Not if your machine only boots OS 9 thanks to a community ROM patch**, an FW800 MDD, an aluminium
-   > PowerBook and similar. Your `Mac OS ROM` has already been modified to make OS 9 boot at all, and the
-   > prebuilt MDD file does not contain that work, so installing it would remove the thing making your
-   > machine boot. Use the injector on your own already-patched ROM instead: it appends a parcel rather
-   > than replacing anything, so it composes. Boot patch first, then this.
-
-   **Mac mini G4, use the prebuilt mini ROM.** A separate, mini-specific ROM is on the release page. It is
-   built on the **MacOS9Lives mini ROM**, so it keeps the patches that make a mini boot OS 9 at all, and it
-   is the exact file that was hardware-validated above, also as **BinHex (`.hqx`)**, decoded with StuffIt
-   Expander. **It also contains a display fix that is experimental and needs a companion app: read
-   [A note for Mac mini G4 owners](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) before you install
-   it.**
-
-   **Any other NewWorld Mac, patch your own.** A complete ROM is machine-specific, and neither prebuilt ROM
-   contains the drivers a different model needs. Run the injector against your own copy, which binds
-   the driver to the USB 2.0 controller's Name Registry node:
-   ```sh
-   python3 scripts/build-rom-hqx.py "Mac OS ROM" mybuild "Mac OS ROM (USB2).hqx"
-   ```
-   That injects the driver, stamps the build name so **Get Info shows which ROM you are running**, and emits
-   BinHex, which keeps your ROM's resource fork. It refuses to write a ROM whose `SysEnabler` came out empty,
-   which is the mistake described in the notice at the top of this page.
-
-   ⚠ Your input needs its resource fork intact. Getting a `Mac OS ROM` off an OS 9 machine over anything that
-   does not understand forks will silently strip it; StuffIt/BinHex on the Mac, or `unar` on the desktop, will
-   preserve it. `rom/usb_rom_inject.py` is still there if you want the raw injection step on its own.
-
-   See [BUILD.md](BUILD.md) for the toolchain this needs.
-
-   > **OldWorld Macs are out of scope.** A beige G3, 8600 or 9600 has no `Mac OS ROM` file for this to patch
-   > (on those machines OS 9's whole USB stack is disk Extensions instead), so the injector will stop with
-   > *"no Parcelfile found in the dump"*. This is not the same question as whether the machine has PCI slots:
-   > a beige G3 has slots and is still out of scope, while a Mac mini G4 has none and is in scope.
+   > ⚠ **MDD owners: not if your machine only boots OS 9 thanks to a community ROM patch** (an FW800 MDD and similar). Your `Mac OS ROM` has already been modified to make OS 9 boot at all, and the prebuilt MDD file does not contain that work. Use the injector on your own already-patched ROM instead (see "Patching your own ROM" below); it appends a parcel rather than replacing anything, so it composes.
    >
-   > The injector has only ever been run against two ROMs, both from the same developer's machines. If it
-   > will not patch yours, or the result will not boot, please open an issue saying which Mac and OS 9
-   > version you are on.
+   > The **mini** ROM is built on the MacOS9Lives mini ROM, so it keeps the patches that make a mini boot OS 9 at all.
 
-   Then **boot from a CD or another volume** and put the patched ROM into the System Folder in place of the
-   original. You cannot swap it while booted from that same System Folder. **Keep the original**, and make
-   sure you can boot from something else before you start. This is the only step that touches the ROM;
-   everything else is an ordinary file.
+3. **Install the extension.** Decode the `.bin` with StuffIt Expander and drop the resulting file (`Mini G4 EHCI` or `MDD G4 EHCI`) into **System Folder ▸ Extensions**. It shows its version in Apple System Profiler's Extensions tab and in Get Info.
 
-2. **Place the helper.** Decode the helper app (`dist/USB2_Activate.bin`) on the Mac and drop it into **System Folder ▸ Startup Items**. It runs faceless at every boot: it brings the ROM driver up and then hands the front back to the Finder, showing no window. (You can also double-click it when you want it, but Startup Items is the intended home.)
+That's it. Reboot and drives mount as you plug them in, or come up already mounted if they were connected at boot.
 
-Setup is done. From here the driver loads at every boot straight from the ROM, the helper activates it, and the OS mounts drives as you plug them in.
+### Patching your own ROM (other machines, or already-patched ROMs)
 
-### Each session
+```sh
+python3 scripts/build-rom-hqx.py "Mac OS ROM" mybuild "Mac OS ROM (USB2).hqx"
+```
 
-1. **Boot with your USB drive unplugged.** Your keyboard and mouse can stay connected. This is the one piece of sequencing that still matters: a drive attached at *bring-up* gets handed to the built-in 1.1 controller (see "The open problems"), so it would mount at 1.1 speed rather than 2.0.
+That injects the driver into your own ROM and emits BinHex, which keeps the ROM's resource fork. It refuses to write a ROM whose `SysEnabler` came out empty (see [Why no version in the ROM's Get Info](#why-no-version-in-the-roms-get-info)). Your input needs its resource fork intact: getting a `Mac OS ROM` off an OS 9 machine over anything that does not understand forks will silently strip it; StuffIt/BinHex on the Mac, or `unar` on the desktop, will preserve it. See [BUILD.md](BUILD.md) for the toolchain.
 
-2. **Plug the drive into any free port on the EHCI card** and it mounts, at Hi-Speed, showing the custom **"2.0" drive icon**. There is no prompt to wait for and no window to watch. *(If the icon looks like a generic disk the first time, hold **Cmd-Option at startup** once to rebuild the desktop; the Finder caches volume icons.)*
+## Things you may notice (normal, and what to do)
 
-3. **Use it normally.** Eject in the Finder (drag to Trash, or Special ▸ Eject) before unplugging, as with any removable disk. You can then unplug, re-insert, or plug in a different drive, as many times as you like.
-
-That is the whole flow. You do not need to quit anything, and a **Special ▸ Restart** with the driver active is safe, the driver quiesces the controller through a Shutdown Manager hook before the machine goes down.
-
-If you do quit the helper (Cmd-Q) with a volume still mounted, it unmounts cleanly first and hands the ports back to the built-in 1.1 controller, so ordinary USB 1.1 works again immediately with no reboot.
-
-If a drive does not appear, two logs are written for troubleshooting and bug reports: the helper's own step-by-step log next to the application, and **`EHCIUIM_init.log`** on the boot volume (the driver's detailed trace). The driver *appends* to that log across loads, so delete it first and read from the last banner.
+- **"This disk is unreadable" at startup, sometimes, with a drive attached at boot.** Intermittent and harmless: the drive was offered to the system a moment before its filesystem was readable. **Click Eject** (never Initialize, which would erase it). The drive mounts by itself a few seconds later.
+- **A pause of 15 to 45 seconds during startup, sometimes with the keyboard and mouse briefly dead**, typically right when a Keychain or file-server dialog appears. That is Mac OS 9 itself trying to reach an AppleShare server from your Servers folder at boot; the whole system's input freezes during that window, including on stock machines. Wait it out; it recovers on its own. It is not the USB driver, and pulling cables during it can interrupt a mount in progress.
+- **Always eject (Put Away / drag to the Trash) before unplugging a drive**, as with any removable disk. If you forget, the driver unmounts the volume safely and shows Apple's "unexpectedly disconnected" warning; your other drives are unaffected. Avoid unplugging a **hub** (or the Cinema Display's USB cable) while the drives behind it are still mounting at boot.
 
 ## A note for Mac mini G4 owners: the VBL display fix
 
@@ -208,57 +135,30 @@ If a drive does not appear, two logs are written for troubleshooting and bug rep
 
 ## Known limitations (please read)
 
-This is a beta. These are the things it does **not** do yet:
-
-- **On-board USB 2.0 is validated but new.** On a PCI card mounting is reliable and has been for months. On an on-board controller (Mac Mini G4) it now mounts reliably too, on a root port and behind a hub, but that rests on **one validation session on one machine**. One thing seen there and not yet explained: on an earlier build, the machine paused for about ten seconds right around a drive being inserted, and then carried on. The driver now rides that out instead of giving up on the drive, but the pause itself is not understood, and the on-board EHCI's shared interrupt line is the leading suspect. Please report it if you see it.
-- **A drive attached at boot mounts at 1.1, not 2.0.** Ports that are already occupied when the controller is brought up are handed to the 1.1 companion. Boot with the drive unplugged, then insert it.
 - **Four drives is the ceiling.** The per-device DMA structures live in one wired memory page, which holds four
   devices plus the hub's own bookkeeping. A fifth drive is refused cleanly (it simply does not mount, nothing
   else is disturbed) and the driver posts a notification saying so. Raising the limit needs a second DMA page.
-- **Keyboards and mice behind a hub do not work.** A drive behind a USB 2.0 hub runs at Hi-Speed, but a
+- **Keyboards and mice behind a USB 2.0 hub do not work.** A drive behind a hub runs at Hi-Speed, but a
   full-speed or low-speed device behind that same hub (a keyboard, a mouse, or an Apple Cinema Display's own
   brightness buttons) is detected, left powered and skipped. It cannot be handed to the 1.1 companion either,
   because a device behind a Hi-Speed hub is not electrically on the companion's bus at all: it sits behind the
   hub's transaction translator. Reaching it requires EHCI **split transactions**, which are not implemented.
   See "The open problems". **If you need a keyboard and mouse on a hub, put that hub on a USB 1.1 port.**
 - **One hub at a time, and no hubs behind hubs.** A second hub, or a hub plugged into our hub, is not driven.
-- **A port handed to the 1.1 companion stays there until reboot.** Once ownership is released, EHCI can no
-  longer tell "empty" from "companion-owned" on that port, so the driver deliberately never takes it back;
-  reclaiming it would risk stuttering a keyboard that is working. Use a different port for a Hi-Speed drive, or
-  reboot. (A port the driver merely *gave up on* is different, and does recover: unplug that device and the
-  port is usable again without rebooting.)
-- **A drive inserted while a large file copy is running will not mount.** Wait for the copy to finish and plug
-  it in again, or plug it in before starting the copy. The cause is understood (the copy's transfers keep the
-  engine busy so the new drive's setup never gets issued) and it is a known, deliberately deferred gap.
-- **Writes are slower than reads.** Reads reach the device's ceiling (~20 MB/s); Finder writes land around 2 to 3 MB/s because the Finder issues small synchronous writes above the driver.
-- **Mid-write yank is unsafe** (as on any OS), always eject first.
+- **A drive inserted while a large file copy is running may not mount.** Wait for the copy to finish and plug
+  it in again, or plug it in before starting the copy. (The engine work to lift this is partly in place, but
+  the case has not been validated, so the limitation stands until it is.)
+- **Writes are slower than reads.** Reads reach the device's ceiling (~20 MB/s); Finder writes land around 2 to 5 MB/s because the Finder issues small synchronous writes above the driver.
+- **Mid-write yank is unsafe** (as on any OS): always eject first.
 - **A few tested hardware combinations** (see Supported machines). Other EHCI cards/controllers are untested.
-- The driver writes a verbose `EHCIUIM_init.log` each run. That's intentional for a beta (it's what to attach to a bug report) and does not slow down file transfers.
 
 If you need rock-solid *removable* USB on OS 9 today, the built-in USB 1.1 support is still there and untouched. This driver is about **speed**, and about proving Hi-Speed USB on OS 9 is possible at all.
 
 ## The open problems, help wanted
 
-On a **dedicated PCI card** the manual flow above is rock-solid. These are the problems that remain, and they are good targets for anyone who enjoys low-level driver archaeology.
+These are the problems that remain, and they are good targets for anyone who enjoys low-level driver archaeology.
 
-### 1. The on-board shared interrupt line: a stall nobody has explained
-
-**This one has changed, and honestly reporting how it changed is more useful than the old text was.** It used to read: on-board machines intermittently *lock up* mid-mount, and that was the on-board blocker. On the ROM-integrated build the Mac mini G4 mounts reliably, so the lock-up as described is no longer what happens, and the entry has been rewritten rather than left to frighten people off.
-
-What is left is smaller but real, and unexplained. On a machine like the Mac mini G4 the EHCI shares **one PCI interrupt line** with the OHCI companion controllers that drive the keyboard and mouse, and our handler chains to the companion's so input keeps working. On one build, inserting a drive was followed by roughly **ten seconds in which nothing running at task level got a turn** (the machine visibly paused, then recovered). Interrupt-level work carried on normally throughout; only task level was starved. That was enough to make the driver give up on the drive, because a step that has to run at task level was being timed against a wall clock. That step now waits for the task-level pump to actually run instead, so the stall costs a moment of latency rather than the device, and the mini mounts.
-
-But **the stall itself is still not understood**, and a workaround that survives a fault is not a fix for it. The shared interrupt line is the leading suspect, partly because a dedicated card line has never done this, and partly because this machine already needs one shared-line-specific workaround elsewhere in the driver (a completion callback that deadlocks at interrupt level there and has to be deferred). The awkward part is instrumentation: the driver's tracing writes through the File Manager, which is itself task-level, so a task-level stall silences the very log that would explain it. **If you know how to catch a task-level starvation on classic Mac OS without depending on task level to record it, that is the missing tool.**
-
-### 2. A drive attached when the controller is brought up
-
-**Hot re-insertion is solved**, this was previously listed here as blocked on Apple's `ExpertIdleTask` monopolizing the USB Expert's task-level idle loop. The fix was to stop depending on Apple's stack at all: the driver now does its own port reset, speed detection, `SET_ADDRESS`, descriptor reads, `SET_CONFIGURATION`, endpoint registration and Bulk-Only transport, then installs its own block driver and lets the OS mount the result. Apple's idle-loop monopoly became irrelevant rather than worked around, and eject / unplug / re-insert / drive-swap all work.
-
-What remains is narrower: **a drive already attached when the EHCI controller is brought up** is handed to the 1.1 companion by the bring-up path, so it mounts at 1.1. The port-ownership handoff is one-way by design (see the next problem), so it stays there. Boot with the drive unplugged and insert it afterwards.
-
-### 3. Full-speed and low-speed devices behind a Hi-Speed hub
-
-**The first half of this is now done.** Hubs are enumerated and driven by this stack, and a USB 2.0 *drive*
-behind a hub mounts at Hi-Speed. What remains is the harder half.
+### 1. Full-speed and low-speed devices behind a Hi-Speed hub
 
 A full-speed or low-speed device behind a Hi-Speed hub (a keyboard, a mouse, a display's own control buttons)
 cannot be reached by either controller as things stand:
@@ -278,8 +178,19 @@ Note the consequence, because it is a real trap: claiming a hub is **all or noth
 we claim becomes ours, so anything we cannot drive is dead while we own it. Until split transactions exist, put
 a hub carrying input devices on a USB 1.1 port.
 
-There is also a wrinkle worth knowing if you touch this area. Releasing a port to the companion (`PORTSC` Port Owner = 1) only works from the state the EHCI spec intends: a port that is **not enabled**, i.e. one where a reset did not bring up a high-speed device. Handing over a port that *is* enabled at Hi-Speed does not take effect. The driver now clears Port Enable first, and records the handoff in software rather than re-reading the ownership bit back out of the hardware, trusting that register as the record of a decision it had already made produced a livelock, with the port bouncing between the two controllers so fast that neither could enumerate anything.
+There is also a wrinkle worth knowing if you touch this area. Releasing a port to the companion (`PORTSC` Port Owner = 1) only works from the state the EHCI spec intends: a port that is **not enabled**, i.e. one where a reset did not bring up a high-speed device. Handing over a port that *is* enabled at Hi-Speed does not take effect. The driver clears Port Enable first, and records the handoff in software rather than re-reading the ownership bit back out of the hardware; trusting that register as the record of a decision it had already made produced a livelock, with the port bouncing between the two controllers so fast that neither could enumerate anything.
 
+### 2. Insert-during-copy
+
+A drive inserted in the middle of a sustained copy may not mount (its setup transfers queue behind the copy's).
+The transfer engine now keeps control traffic and block I/O in separate in-flight slots, which was the
+structural half of the fix, but the end-to-end case has not been validated and is deliberately not claimed.
+
+### 3. More machines
+
+The driver adapts to its controller at runtime (dedicated versus shared interrupt line, port-power control,
+companion handoff), and the parcel matches by PCI class code, so late iMacs, eMacs and PowerBooks with
+on-board USB 2.0 that can run OS 9 are plausible targets. Each needs its ROM patched and a validation pass.
 Issues, pointers, and patches are all welcome.
 
 ## How it works (for the curious)
@@ -287,14 +198,17 @@ Issues, pointers, and patches are all welcome.
 There was no USB 2.0 anything for OS 9, so this is built from the ground up:
 
 - A hand-written **EHCI host-controller driver (UIM)**, a native PowerPC `ndrv`, implementing the queue-head / qTD schedule, per-endpoint hardware toggles, and interrupt + heartbeat-timer servicing.
-- A **virtual root hub** synthesized in software, so Apple's USB Expert enumerates the bus the normal way even though an EHCI controller presents its ports differently.
-- A **self-driven SCSI probe** (INQUIRY / READ CAPACITY / READ) over Bulk-Only Transport, the stock mounter won't advance a Hi-Speed device, so the driver reads the disk itself and publishes a block service.
-- A small **block driver** that mounts the volume through that service.
-- The driver is delivered as a **Mac OS ROM parcel**: a `driver,AAPL,MacOS,PowerPC` property (our ndrv's PEF) and its descriptor are injected into the ROM and bound to the controller's Name Registry node, so OS 9 loads and prepares it **at boot**, as an OS-owned driver, without any Extension or declaration ROM. The headless helper then calls `LoadUIMForEntry` to bring it up as the live UIM, runs the self-probe, and mounts the volume. On quit, the helper hands the ports back to the 1.1 companion (clearing the EHCI `CONFIGFLAG`), so USB 1.1 works again without a reboot. *(An earlier release created those same properties from the app at runtime instead of from the ROM; the ROM parcel is the same binding, now applied by the OS at boot.)*
+- A **virtual root hub** synthesized in software, so the bus is presented the way the OS expects even though an EHCI controller presents its ports differently.
+- A **self-driven SCSI probe** (INQUIRY / READ CAPACITY / READ) over Bulk-Only Transport; the stock mounter won't advance a Hi-Speed device, so the driver reads the disk itself and publishes a block service.
+- A small **block driver** that mounts the volume through that service: `AddDrive`, a disk-inserted event, and the OS does the rest.
+- The driver is delivered as a **Mac OS ROM parcel**: a `driver,AAPL,MacOS,PowerPC` property (the ndrv's PEF) and its descriptor are injected into the ROM and bound to the controller's Name Registry node, so OS 9 loads and prepares it **at boot**, as an OS-owned driver. The **extension** then activates it (`LoadUIMForEntry`), claims the free ports, and arms the driver's task-level pump, which rides the Notification Manager exactly the way Apple's own mass-storage stack reaches task level.
+- **Coexisting with the keyboard/mouse on an on-board controller:** the EHCI shares one physical set of ports (and one PCI interrupt line) with the OHCI "companion" controllers that drive the keyboard and mouse. Rather than seize the whole controller, the driver does a **per-port claim**: it powers the ports, waits out the USB connect debounce, then hands every port that already holds a low-speed device back to the 1.1 companion (setting its Port Owner bit) and claims the rest for EHCI, so drives come up at Hi-Speed while input stays on the companion. Because the interrupt line is shared, the driver's interrupt handler **chains** to the companion's handler so the keyboard and mouse keep being serviced.
 
-**Coexisting with the keyboard/mouse on an on-board controller.** On a machine like the Mac Mini G4 the EHCI shares one physical set of ports (and one PCI interrupt line) with the OHCI "companion" controllers that drive the keyboard and mouse. Rather than seize the whole controller, the driver does a **per-port claim**: it powers the ports, waits out the USB connect debounce, then hands every port that already holds a device back to the 1.1 companion (setting its Port Owner bit) and claims only the empty ports for EHCI, so the drive comes up at Hi-Speed while input stays on the companion. Two hardware details made this finicky: the controller has *Port Power Control*, so a port's connect status is invalid until it's powered (you must power first, then read); and because the interrupt line is shared, the driver's interrupt handler **chains** to the companion's handler so the keyboard/mouse keep being serviced.
+Throughput comes from pre-queuing whole commands (one interrupt per command) and multi-qTD 128 KB transfer chains in both directions. The deeper story is in [TECHNICAL.md](TECHNICAL.md).
 
-Throughput comes from pre-queuing whole commands (one interrupt per command) and multi-qTD 128 KB transfer chains in both directions.
+### Why no version in the ROM's Get Info
+
+The extensions show their version in Get Info and Apple System Profiler. The ROMs deliberately do not: Get Info reads a file's `vers` resource, and a `Mac OS ROM` file's resource fork belongs to the **System Enabler**. Stamping a version there mis-describes the enabler, and the machine stops booting ("No File System Access modules could be found"); this was proven the hard way, with an A/B test, and the build tool now refuses to do it. ROM versions live in the table below and in the driver's own log banner.
 
 ## Building from source
 
@@ -305,18 +219,37 @@ cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=<path-to-Retro68 PowerPC toolchain.cm
 cmake --build build
 ```
 
-The shippable pieces are the **driver** (injected into the Mac OS ROM) and the **universal helper** that performs the mount:
+Two build-time switches matter for release versus diagnosis:
 
-- **`EHCIUIM`** target → `EHCIUIM.pef`, the driver. `rom/usb_rom_inject.py` injects it into a Mac OS ROM as a `driver,AAPL,MacOS,PowerPC` parcel. A prebuilt copy is in `dist/EHCIUIM.pef`.
-- **`EHCIActivate`** target → `EHCIActivate.bin`, **the shipping helper**. Faceless: it activates the ROM driver, hands the front back to the Finder and hides, then pumps the polled slot that discovery runs on. One binary for every machine (PCI card *and* on-board): the driver's per-port claim and its `sharedCompanion` interrupt discriminator adapt to the hardware at runtime, so there is no per-machine build variant. A prebuilt copy is in `dist/USB2_Activate.bin`.
-- **`EHCILauncher`** target → `EHCILauncher.bin`, the older interactive launcher, kept for reference. Superseded by `EHCIActivate`.
+- `-DEHCI_LOG_LEVEL=` **0** (release: the driver writes a two-line banner and nothing else), **1** (errors only), **2** (full trace; this is the diagnostic mode, and it is heavy enough to distort timing, so do not benchmark or judge stability on a level-2 build).
+- `-DEHCI_PAINT=` **0** (release) or **1** (a screen-corner diagnostic readout that survives system hangs; development only).
 
-`EHCITrigger` is the developer harness (verbose on-screen and on-disk logging) used during development. Retro68 emits MacBinary, so decode the `.bin` on the Mac. See **[BUILD.md](BUILD.md)** for the full build (the drivers are built and embedded as byte arrays before the app, and the ROM parcel is injected with `rom/usb_rom_inject.py`).
+The shippable pieces are the **driver** (`EHCIUIM` target, injected into a Mac OS ROM with `scripts/build-rom-hqx.py`) and the **activation extension** (built from `resident/`, then dressed for release, name, version resource, icon, with `scripts/package-init.py`). See **[BUILD.md](BUILD.md)** for the full pipeline.
+
+## Versions
+
+| File | Contains | Version shown | MD5 |
+|---|---|---|---|
+| `USB2_Mini_G4_ROM.hqx` | driver **h91** on the MacOS9Lives mini + VBL-fix base (ROM build m42) | in the driver log banner | `0026f093391ab5e09ebf39138cee0757` |
+| `USB2_MDD_G4_ROM.hqx` | driver **h91** on the MDD stock base (ROM build h91) | in the driver log banner | `65000bd706448d40545525b97245f76b` |
+| `Mini_G4_EHCI_Ext.bin` | extension `Mini G4 EHCI` | **11.0** (Get Info / ASP) | `4bfdf2f9e0fa9e40d45051f929541cf0` |
+| `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.0** (Get Info / ASP) | `054df3e34c1b4ea175d9b4c682c6efa8` |
+
+The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h91 ===`) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
+
+## History
+
+> **If you flashed a ROM from `n13` or `m3` (before 2026-08-07), please re-flash.** Those ROMs shipped as
+> MacBinary, and the wrapper used at the time built its own small resource fork that **replaced** the ROM's
+> real one, losing a 185 KB component called `SysEnabler`. They boot, but on the MDD this caused intermittent
+> input stalls at startup. ROMs have shipped as BinHex (`.hqx`), which carries both forks, ever since. A
+> first corrected release on 2026-08-07 carried a `vers` resource that stopped machines booting and was
+> withdrawn within the day (it is also why ROMs no longer carry a Get Info version; see above).
+>
+> **If you used any release before this one against volumes larger than 2 GB**, note that an early
+> data-corruption bug (writes past the 2 GB / 4 GB volume-offset boundary going to the wrong blocks) was
+> found and fixed; re-verify or reformat volumes that old builds wrote to.
 
 ## Status & disclaimer
 
-Early beta, provided as-is, with no warranty. On a PCI card it now runs reliably, full-speed reads and writes, large folder copies, and volumes well past 4 GB, with correct addressing across the whole disk. On a Mac mini G4's on-board controller it now works too, on the strength of one validation session rather than months of use. Either way it is new low-level code touching your disks, so **keep backups.**
-
-*If you are installing the prebuilt Mac mini ROM,* note again that it bundles an **experimental** fix for the mini's OS 9 startup freeze which has been observed **not** to prevent that freeze reliably, and that the companion `VBLFix` app should be treated as required. The details are [in the install section](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix).
-
-*Fixed in this build:* a data-corruption bug where writes past the 2 GB / 4 GB volume-offset boundary went to the wrong blocks, silently damaging large files, and sometimes the volume's own structures (boot blocks / catalog). If you ran an earlier release against a volume larger than 2 GB, re-verify or reformat that volume. Bug reports and hardware-compatibility reports are very welcome.
+Provided as-is, with no warranty. Both supported machines pass the full validation suite as of this release, but this remains new low-level code touching your disks, so **keep backups.** Bug reports and hardware-compatibility reports are very welcome.
