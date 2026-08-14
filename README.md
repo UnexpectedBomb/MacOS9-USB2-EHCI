@@ -2,9 +2,11 @@
 
 **The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts USB drives and reads and writes them at **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
 
-## What's new in this release (2026-08-13)
+## What's new in this release (2026-08-14)
 
 This is the largest update since the project began, and it retires most of the caveats that used to fill this page:
+
+- **A memory-safety fix for surprise removal.** If a drive was unplugged at the rare moment the system was still talking to it (for example, within the first seconds after insertion, or a slow drive pulled before it finished mounting), an orphaned transfer could later write through pointers the OS had already freed, silently corrupting the system heap; the damage typically surfaced minutes later or at the next restart, with nothing pointing back at the cause. The driver now retires every outstanding transfer for a removed device before the OS is told the device is gone, matching the teardown discipline of Apple's own USB stack. This was found and fixed before any ROM containing the vulnerable code was published; it is called out here because surprise-removal robustness is a headline feature of this stack.
 
 - **One driver, two machines, fully validated.** The same driver binary now passes the complete hardening suite on both the Power Mac G4 MDD (PCI card) and the Mac mini G4 (on-board USB 2.0): cold boots with drives attached, four drives at once with copies between them, hot-plug, hub support, and clean ejects. The mini is no longer "newer and less proven"; both machines were validated on the same day with the same code.
 - **No more Startup Items helper app.** Activation now lives in a small **system extension** (`Mini G4 EHCI` or `MDD G4 EHCI`). Drop it in the Extensions folder once and forget it. There is nothing to see and nothing that can be quit by accident.
@@ -230,12 +232,12 @@ The shippable pieces are the **driver** (`EHCIUIM` target, injected into a Mac O
 
 | File | Contains | Version shown | MD5 |
 |---|---|---|---|
-| `USB2_Mini_G4_ROM.hqx` | driver **h91** on the MacOS9Lives mini + VBL-fix base (ROM build m42) | in the driver log banner | `0026f093391ab5e09ebf39138cee0757` |
-| `USB2_MDD_G4_ROM.hqx` | driver **h91** on the MDD stock base (ROM build h91) | in the driver log banner | `65000bd706448d40545525b97245f76b` |
+| `USB2_Mini_G4_ROM.hqx` | driver **h94rel** on the MacOS9Lives mini + VBL-fix base | in the driver log banner | `ba3187249f15491ae265a44a6d7a396c` |
+| `USB2_MDD_G4_ROM.hqx` | driver **h94rel** on the MDD stock base | in the driver log banner | `bf0a85efb4610634b18255d1f9e7a049` |
 | `Mini_G4_EHCI_Ext.bin` | extension `Mini G4 EHCI` | **11.0** (Get Info / ASP) | `4bfdf2f9e0fa9e40d45051f929541cf0` |
 | `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.0** (Get Info / ASP) | `054df3e34c1b4ea175d9b4c682c6efa8` |
 
-The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h91 ===`) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
+The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h94rel ===`) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
 
 ## History
 
