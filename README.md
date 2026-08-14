@@ -14,6 +14,8 @@ This is the largest update since the project began, and it retires most of the c
 - **The intermittent boot slowdowns and freezes are fixed, and the cause was ours.** The beta driver wrote a verbose diagnostic log through the File Manager, synchronously, on the boot volume. Under the right timing that single behavior could hold the Finder's thread for 30 seconds at a stretch, which showed up as slow extension loading, a desktop that took forever, an unresponsive cursor, or a machine that never came back. The release driver writes a two-line log and nothing else. If your earlier install ever felt sluggish or wedged at boot, this was very likely why.
 - **Apple System Profiler no longer crashes.** ASP's "Devices and Volumes" tab had crashed to MacsBug on every machine with this driver installed since the first ROM. The cause was subtle (the OS creates a bookkeeping entry for ROM-loaded drivers but never finishes wiring it, and ASP is the only thing that ever walks through it); the driver now repairs that entry at boot. ASP scans cleanly and lists this stack's drives alongside everything else.
 - **Pulling a drive without ejecting now shows Apple's own warning.** "The device for disk ... was unexpectedly disconnected", word for word, exactly as the built-in USB 1.1 stack would. No crash, and the surviving drives are untouched.
+- **A third machine: the Power Mac G3 Blue & White.** The same driver now runs on the oldest NewWorld Mac, built on the RETAIL Mac OS 9.2.2 ROM (no MacOS9Lives install required), so it plausibly serves other stock-9.2.2 towers with a PCI USB 2.0 card (Sawtooth, Gigabit, Digital Audio, Quicksilver) -- reports welcome. On this era of machine the driver runs in polled mode (the card's interrupt line is not serviceable the same way there); in practice copies remain fast and the full test suite passes.
+- **Troubleshooting: if the ROM will not boot** (blinking "?" folder, or a "checksum error" at an Open Firmware prompt): your StuffIt Expander mangled the decode. Older versions (5.5 confirmed) silently convert line endings inside the file because it begins with readable text. Use StuffIt Expander 6.0 or newer, or disable "convert text files" in its preferences, and expand a fresh copy. The ROM verifies its own checksum at boot, so a bad decode refuses loudly instead of booting corrupted code.
 - **Simple, final file names.** The download names below say what each file is for. Version numbers live in the Finder's Get Info and Apple System Profiler (for the extensions) and in the table at the bottom of this page, not in the filenames.
 
 ## Downloads: which two files you need
@@ -24,6 +26,7 @@ Every machine needs exactly **two files**: a ROM and an extension. Take the pair
 |---|---|---|
 | **Mac mini G4** | `USB2_Mini_G4_ROM.hqx` | `Mini_G4_EHCI_Ext.bin` |
 | **Power Mac G4 MDD** with a PCI USB 2.0 card | `USB2_MDD_G4_ROM.hqx` | `MDD_G4_EHCI_Ext.bin` |
+| **Power Mac G3 Blue & White** with a PCI USB 2.0 card (retail 9.2.2) | `USB2_BW_G3_ROM.hqx` | `BW_G3_EHCI_Ext.bin` |
 
 Decode both on the Mac with **StuffIt Expander** (both formats preserve the resource forks; converting them on a PC with a fork-blind tool will break them). The ROM decodes to a file named `Mac OS ROM`; the extension decompresses to `Mini G4 EHCI` or `MDD G4 EHCI`, wearing its own USB 2.0 icon.
 
@@ -236,6 +239,8 @@ The shippable pieces are the **driver** (`EHCIUIM` target, injected into a Mac O
 | `USB2_MDD_G4_ROM.hqx` | driver **h96rel** on the MDD stock base | in the driver log banner | `904713d2a0e27ed2e488ed99cb006f4a` |
 | `Mini_G4_EHCI_Ext.bin` | extension `Mini G4 EHCI` | **11.1** (Get Info / ASP) | `994d42cab60878856400bad9310cfea1` |
 | `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.2** (Get Info / ASP) | `dfea08761401885d3ad38032ccd3d7b6` |
+| `USB2_BW_G3_ROM.hqx` | driver **b10rel** (polled mode) on the RETAIL 9.2.2 base | in the driver log banner | `ad97f6dd49e5dd89f57c12ec00743081` |
+| `BW_G3_EHCI_Ext.bin` | extension `BW G3 EHCI` | **8.2** (Get Info / ASP) | `f1ba1a1538ece814ee7b629fa42f443c` |
 
 The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h96rel ===`) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
 
