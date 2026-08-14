@@ -15,6 +15,7 @@ This is the largest update since the project began, and it retires most of the c
 - **Apple System Profiler no longer crashes.** ASP's "Devices and Volumes" tab had crashed to MacsBug on every machine with this driver installed since the first ROM. The cause was subtle (the OS creates a bookkeeping entry for ROM-loaded drivers but never finishes wiring it, and ASP is the only thing that ever walks through it); the driver now repairs that entry at boot. ASP scans cleanly and lists this stack's drives alongside everything else.
 - **Pulling a drive without ejecting now shows Apple's own warning.** "The device for disk ... was unexpectedly disconnected", word for word, exactly as the built-in USB 1.1 stack would. No crash, and the surviving drives are untouched.
 - **A third machine: the Power Mac G3 Blue & White.** The same driver now runs on the oldest NewWorld Mac, built on the RETAIL Mac OS 9.2.2 ROM (no MacOS9Lives install required), so it plausibly serves other stock-9.2.2 towers with a PCI USB 2.0 card (Sawtooth, Gigabit, Digital Audio, Quicksilver) -- reports welcome. On this era of machine the driver runs in polled mode (the card's interrupt line is not serviceable the same way there); in practice copies remain fast and the full test suite passes.
+- **The extension is safe to install on its own.** If it finds no USB2 ROM driver on the controller (wrong machine, or the ROM step was missed), it logs one line and does nothing -- the machine boots normally. Earlier builds could freeze the boot in that mismatched configuration.
 - **Troubleshooting: if the ROM will not boot** (blinking "?" folder, or a "checksum error" at an Open Firmware prompt): your StuffIt Expander mangled the decode. Older versions (5.5 confirmed) silently convert line endings inside the file because it begins with readable text. Use StuffIt Expander 6.0 or newer, or disable "convert text files" in its preferences, and expand a fresh copy. The ROM verifies its own checksum at boot, so a bad decode refuses loudly instead of booting corrupted code.
 - **Simple, final file names.** The download names below say what each file is for. Version numbers live in the Finder's Get Info and Apple System Profiler (for the extensions) and in the table at the bottom of this page, not in the filenames.
 
@@ -237,10 +238,10 @@ The shippable pieces are the **driver** (`EHCIUIM` target, injected into a Mac O
 |---|---|---|---|
 | `USB2_Mini_G4_ROM.hqx` | driver **h96rel** on the MacOS9Lives mini + VBL-fix base | in the driver log banner | `2e2a2363dd4ae06fa83491a517cbaf34` |
 | `USB2_MDD_G4_ROM.hqx` | driver **h96rel** on the MDD stock base | in the driver log banner | `904713d2a0e27ed2e488ed99cb006f4a` |
-| `Mini_G4_EHCI_Ext.bin` | extension `Mini G4 EHCI` | **11.1** (Get Info / ASP) | `994d42cab60878856400bad9310cfea1` |
-| `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.2** (Get Info / ASP) | `dfea08761401885d3ad38032ccd3d7b6` |
+| `Mini_G4_EHCI_Ext.bin` | extension `Mini G4 EHCI` | **11.2** (Get Info / ASP) | `ff84d8b7cb629f2ea8a9f0bfb71b6b40` |
+| `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.3** (Get Info / ASP) | `f345db22764507fb3c0e1e607163d2bf` |
 | `USB2_BW_G3_ROM.hqx` | driver **b10rel** (polled mode) on the RETAIL 9.2.2 base | in the driver log banner | `ad97f6dd49e5dd89f57c12ec00743081` |
-| `BW_G3_EHCI_Ext.bin` | extension `BW G3 EHCI` | **8.2** (Get Info / ASP) | `f1ba1a1538ece814ee7b629fa42f443c` |
+| `BW_G3_EHCI_Ext.bin` | extension `BW G3 EHCI` | **8.3** (Get Info / ASP) | `ee4863df8510d444f20804b72171d2e6` |
 
 The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h96rel ===`) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
 
