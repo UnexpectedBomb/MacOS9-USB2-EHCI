@@ -232,12 +232,12 @@ The shippable pieces are the **driver** (`EHCIUIM` target, injected into a Mac O
 
 | File | Contains | Version shown | MD5 |
 |---|---|---|---|
-| `USB2_Mini_G4_ROM.hqx` | driver **h94rel** on the MacOS9Lives mini + VBL-fix base | in the driver log banner | `ba3187249f15491ae265a44a6d7a396c` |
-| `USB2_MDD_G4_ROM.hqx` | driver **h94rel** on the MDD stock base | in the driver log banner | `bf0a85efb4610634b18255d1f9e7a049` |
-| `Mini_G4_EHCI_Ext.bin` | extension `Mini G4 EHCI` | **11.0** (Get Info / ASP) | `4bfdf2f9e0fa9e40d45051f929541cf0` |
-| `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.0** (Get Info / ASP) | `054df3e34c1b4ea175d9b4c682c6efa8` |
+| `USB2_Mini_G4_ROM.hqx` | driver **h96rel** on the MacOS9Lives mini + VBL-fix base | in the driver log banner | `2e2a2363dd4ae06fa83491a517cbaf34` |
+| `USB2_MDD_G4_ROM.hqx` | driver **h96rel** on the MDD stock base | in the driver log banner | `904713d2a0e27ed2e488ed99cb006f4a` |
+| `Mini_G4_EHCI_Ext.bin` | extension `Mini G4 EHCI` | **11.1** (Get Info / ASP) | `994d42cab60878856400bad9310cfea1` |
+| `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.2** (Get Info / ASP) | `dfea08761401885d3ad38032ccd3d7b6` |
 
-The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h94rel ===`) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
+The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h96rel ===`) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
 
 ## History
 
