@@ -15,10 +15,9 @@
  *   kStatus     -> kDriveStatus fills a DrvSts; everything else declines (statusErr)
  *                  so the mounter uses safe defaults (DriverGestalt crash fix).
  *
- * Adapted from a proven SATA block driver for the same OS (AddDrive + DrvSts prefix +
- * the IOCommandIsComplete completion contract + DriverGestalt->statusErr).
- * NOTE this header comment is historical: the driver mounts HFS, not FAT/PC-Exchange.
- * See scan_volume() for what it actually accepts.
+ * Adapted DIRECTLY from a proven earlier PCI disk ndrv by the same author (AddDrive + DrvSts
+ * prefix + the IOCommandIsComplete completion contract + DriverGestalt->statusErr).
+ * The volume is FAT/PC-Exchange, which sidesteps the HFS-mounter hang that driver hit.
  */
 #include <MacTypes.h>
 #include <MacMemory.h>
@@ -83,9 +82,29 @@ static void dopen(void)
     (void)FSpDelete(&sp);
     if (FSpCreate(&sp, 'ttxt', 'TEXT', 0) == noErr) { (void)FSpOpenDF(&sp, fsRdWrPerm, &gLogRef); gLogVol = sp.vRefNum; }
 }
+/* ★★★★ h85 — GATED, and this is the logger that most needed it.
+ * The comment above claims "task-safe: called only from kInitialize". That is STALE: diolog/cslog/iolog
+ * are called from DoDriverIO for Status / Control / Read / Write, i.e. from inside a FILE MANAGER CALL
+ * CHAIN, doing FSWrite + PBFlushFileSync + FlushVol on the BOOT volume while the File Manager is mounting
+ * a DIFFERENT one. That is the h78 hazard in its purest form, and measurement on 2026-08-13 put one such
+ * drain at 30715 ms. The level is set in CMakeLists.txt so this file and ehci_os.c cannot disagree. */
+#ifndef EHCI_LOG_LEVEL
+#define EHCI_LOG_LEVEL 0
+#endif
+static int dwant(const char *s)
+{
+#if EHCI_LOG_LEVEL >= 2
+    (void)s; return 1;
+#elif EHCI_LOG_LEVEL == 1
+    return (s && s[0] == '!' && s[1] == '!');
+#else
+    (void)s; return 0;
+#endif
+}
 static void dput(const char *s)
 {
     long n = 0, z = 1;
+    if (!dwant(s)) return;
     if (!gLogRef) dopen();
     if (gLogRef) { ParamBlockRec pbf; while (s[n]) n++; (void)FSWrite(gLogRef, &n, (Ptr)s);
         (void)FSWrite(gLogRef, &z, (Ptr)"\r");
@@ -97,6 +116,7 @@ static void dput(const char *s)
 static void dputx(const char *label, unsigned long v)
 {
     char b[80]; int i = 0, j; static const char hx[] = "0123456789abcdef";
+    if (!dwant(label)) return;      /* h85: test the label — same verdict, and it skips the formatting */
     while (label[i] && i < 60) { b[i] = label[i]; i++; }
     b[i++] = ' '; b[i++] = '0'; b[i++] = 'x';
     for (j = 28; j >= 0; j -= 4) b[i++] = hx[(v >> j) & 0xF];
@@ -199,9 +219,56 @@ static DrvSts   *gDrvStsS[EUSB_MAX_DEV];
 /* r80: media-present / ejectability state. 1 = ejectable disk in drive (removable, like USB 1.1); 0 = ejected
  * (no media). Reported via DrvSts.diskInPlace in AddDrive + kStatus(8). The Eject control (csCode 7) sets it 0
  * so the eject STICKS (else kStatus still says "disk present" and the Finder immediately remounts). Was a
- * hardwired 8 (= NONEJECTABLE fixed disk, inherited from the eSATA driver) — wrong for a removable USB stick. */
+ * hardwired 8 (= NONEJECTABLE fixed disk, inherited from the earlier disk ndrv) — wrong for a removable USB stick. */
 static char   gDiskInPlaceS[EUSB_MAX_DEV];
 #define gDiskInPlace gDiskInPlaceS[0]
+
+/* ★★★ b15 — the kDriveIcon (Control 21) / kMediaIcon (Control 22) response blob, per slot.
+ * The response is csParam[0..1] = POINTER to a 256-byte 'ICN#' (32x32 1-bit icon + mask) followed
+ * IMMEDIATELY by a Pascal where-string describing the drive's physical location. This is how Apple's
+ * own UMSS produces the "USB (v2.1.1)" line under each volume in Disk First Aid — the string is
+ * COMPOSED BY THE DRIVER, version and all; DFA never asks kdgVersion (b14 ring census: it asks
+ * mics/intf/devt/flus/digt + Control 21/23 only). Our blanket noErr acked Control 21 with csParam
+ * UNTOUCHED, so DFA dereferenced its own leftover stack long and rendered the bytes 256 past it as a
+ * Pascal string — the deterministic garbage seen identically across drives, builds, days and machines.
+ * The where-string is PER-SLOT ("drive 1", "drive 2"...) because identical responses for two of our
+ * drives are the prime suspect for DFA listing only one of them (it groups volumes by physical drive,
+ * and two drives on one refNum with byte-identical location responses look like one drive).
+ * The blob lives in the driver's data section (system heap, resident) so the pointer stays valid after
+ * we return. Filled by byte copies only — no allocation, no File Manager — so it is safe at any
+ * execution level, though in practice only apps (DFA, Drive Setup) ask. */
+static struct { UInt8 icon[256]; UInt8 where[32]; } gDriveIconWhereS[EUSB_MAX_DEV];
+static const UInt8 *icns_member_find(UInt32 want, unsigned long wantDataLen)
+{
+    /* Scan the embedded 'icns' family for a member; layout = 8-byte family header, then members of
+     * {OSType tag; UInt32 len (incl. 8-byte member header)}. Returns the member's data, or 0. */
+    unsigned long off = 8;
+    while (off + 8 <= gUsb2IcnsLen) {
+        UInt32 tag = ((UInt32)gUsb2Icns[off] << 24) | ((UInt32)gUsb2Icns[off+1] << 16)
+                   | ((UInt32)gUsb2Icns[off+2] << 8) |  (UInt32)gUsb2Icns[off+3];
+        unsigned long len = ((unsigned long)gUsb2Icns[off+4] << 24) | ((unsigned long)gUsb2Icns[off+5] << 16)
+                          | ((unsigned long)gUsb2Icns[off+6] << 8) |  (unsigned long)gUsb2Icns[off+7];
+        if (len < 8 || off + len > gUsb2IcnsLen) return 0;      /* malformed: fail closed */
+        if (tag == want && len == wantDataLen + 8) return gUsb2Icns + off + 8;
+        off += len;
+    }
+    return 0;
+}
+static void drive_icon_where_fill(int dv)
+{
+    UInt8 *w; int n, i;
+    static const char base[] = "USB 2.0, drive ";
+    static const char tail[] = " (v1.0)";
+    if (gDriveIconWhereS[dv].where[0]) return;                  /* already built (idempotent) */
+    {   const UInt8 *icn = icns_member_find(0x49434E23UL /* 'ICN#' */, 256);
+        if (icn) for (i = 0; i < 256; i++) gDriveIconWhereS[dv].icon[i] = icn[i];
+        /* no ICN# in the family -> icon stays zeroed (blank but VALID memory; never a wild pointer) */ }
+    w = gDriveIconWhereS[dv].where; n = 0;
+    for (i = 0; base[i]; i++) w[1 + n++] = (UInt8)base[i];
+    w[1 + n++] = (UInt8)('1' + dv);
+    for (i = 0; tail[i]; i++) w[1 + n++] = (UInt8)tail[i];
+    w[0] = (UInt8)n;                                            /* Pascal length byte LAST: gates re-entry */
+}
 
 /* ★ n19 STEP 2: map a Device Manager call to a device slot.
  * Every Read/Write/Status/Control arrives with the drive it targets in ioVRefNum (this driver already
@@ -310,7 +377,7 @@ static short pick_drive_num(void)
 
 /* kInitialize: scan the Apple Partition Map, find the Apple_HFS partition, AddDrive it. r38: PIVOTED
  * from MBR/FAT to APM/HFS. HFS uses OS 9's BUILT-IN mounter (NOT Foreign File Access), which sidesteps
- * the intermittent audio-CD misID entirely — the sibling eSATA project proved native HFS = clean stable
+ * the intermittent audio-CD misID entirely — an earlier sibling disk driver proved native HFS = clean stable
  * R/W (v50) where FAT/PC-Exchange was a dead end. Tradeoff: the stick is Mac-only (format via Drive
  * Setup: Mac OS Extended + Apple Partition Map). Reads go through the SAME 'Eusb' BOT service. APM layout:
  * blk0='ER' Driver Descriptor Record; blk1..N='PM' partition entries (pmMapBlkCnt @+4, pmPyPartStart @+8,
@@ -546,6 +613,18 @@ static OSErr disk_status(ParmBlkPtr pb)
          * (a boolean response, fully filled — safe, no half-filled-pointer trap). Without this the FM uses the
          * 32-bit ioPosOffset, which wraps past 4GB -> writes to wrong blocks -> the silent corruption (-199). */
         if (dg->driverGestaltSelector == kdgWide)       { dg->driverGestaltResponse = 1;           return noErr; }
+        /* ★★★ b14 — kdgFlush ANSWERED. Disk First Aid asks this up to three times per drive per run
+         * before listing a volume (b13b ring: 12x declined per session), and our statusErr is why our
+         * volumes list late or not at all in DFA. Honest answer, fully filled: we keep NO software
+         * write-cache (a write completes only after the device has taken it), so canFlush = false and
+         * needsFlush = false. Both booleans live inside the response field — no pointer, no
+         * half-filled-response trap. */
+        if (dg->driverGestaltSelector == kdgFlush) {
+            DriverGestaltFlushResponse *fr = GetDriverGestaltFlushResponse(dg);
+            fr->canFlush = false; fr->needsFlush = false;
+            dg->driverGestaltResponse2 = 0;          /* belt: zero the second response word too */
+            return noErr;
+        }
         /* r98: our custom USB 2.0 volume icon. Return a pointer to the embedded 'icns' IconFamily for the
          * media icon (kdgMediaIconSuite, formerly csCode 22) AND the physical-drive icon (kdgPhysDriveIconSuite,
          * formerly csCode 21). This response IS fully filled (a valid pointer), so it does NOT hit the r37
@@ -607,6 +686,31 @@ static OSErr disk_control(ParmBlkPtr pb)
             if (pb->cntrlParam.csParam[2]) return media_arrived(dv);
             media_gone(dv);
         }
+        return noErr;
+    }
+    /* ★★★ b14 — kDriveInfo (Control 23) FILLED EXPLICITLY. The blanket noErr below used to accept this
+     * with the caller's csParam left UNTOUCHED, i.e. stack garbage — and Disk First Aid renders its
+     * per-volume bus/location line from this response, which is where the "garbage bus-string" on all
+     * three machines came from (b13b ring: 4x Ctl 23 answered per DFA run). Response = a 32-bit drive
+     * description; low bits = drive type. No Apple-UMSS capture of their exact value exists in our RE,
+     * so this is the minimal-honest constant: type 1 = "unspecified drive", attribute bits 0 —
+     * deterministic and sane where garbage lived. Validated empirically on the b14 DFA run. */
+    if (pb->cntrlParam.csCode == kDriveInfo) {
+        pb->cntrlParam.csParam[0] = 0;              /* high word: no attribute bits asserted */
+        pb->cntrlParam.csParam[1] = 1;              /* low word: drive type 1 = unspecified drive */
+        return noErr;
+    }
+    /* ★★★ b15 — kDriveIcon (21) / kMediaIcon (22) FILLED: csParam[0..1] = pointer to 256-byte ICN#
+     * + Pascal where-string (per-slot; see gDriveIconWhereS above for the full mechanism). This is the
+     * response Disk First Aid actually renders as the per-volume location line — the b14 experiment
+     * proved kDriveInfo/kdgFlush answers alone change nothing, and the blanket noErr below handing DFA
+     * an UNFILLED csParam pointer is where the garbage location string came from. */
+    if (pb->cntrlParam.csCode == kDriveIcon || pb->cntrlParam.csCode == kMediaIcon) {
+        int dv = slot_for_drive(pb->cntrlParam.ioVRefNum); if (dv < 0) dv = 0;
+        drive_icon_where_fill(dv);
+        {   unsigned long a = (unsigned long)&gDriveIconWhereS[dv];
+            pb->cntrlParam.csParam[0] = (short)(a >> 16);
+            pb->cntrlParam.csParam[1] = (short)(a & 0xFFFF); }
         return noErr;
     }
     if (pb->cntrlParam.csCode == 104 || pb->cntrlParam.csCode == 125) return controlErr;
@@ -676,7 +780,16 @@ OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
         case kKillIOCommand:     err = noErr; break;
         default:                 err = paramErr; break;
     }
-    diolog((short)code, (short)err, (code == kControlCommand || code == kStatusCommand) ? (long)contents.pb->cntrlParam.csCode : 0);  /* v25 control-plane trace */
+    /* v25 control-plane trace. b13: for DriverGestalt (csCode 43) record THE SELECTOR as aux instead of
+     * the csCode — the B&W DFA hunt showed 13 declined gestalts per session and the ring couldn't say
+     * WHICH; the selector is an OSType, so it reads as four ASCII chars straight out of the hex dump.
+     * err FFEE (statusErr) vs 0 already distinguishes declined from answered. */
+    diolog((short)code, (short)err,
+           (code == kControlCommand || code == kStatusCommand)
+               ? ((contents.pb->cntrlParam.csCode == kDriverGestaltCode)
+                      ? (long)((DriverGestaltParam *)contents.pb)->driverGestaltSelector
+                      : (long)contents.pb->cntrlParam.csCode)
+               : 0);
     if (kind & kImmediateIOCommandKind) return err;                /* immediate: return completes it */
     return (OSErr)IOCommandIsComplete(cmdID, (short)err);          /* sync/async: signal the File Mgr */
 }

@@ -61,6 +61,13 @@ def rsrc_size(p):
 _HERE    = path.dirname(path.abspath(__file__))
 OUR_PEF  = os.environ.get('EHCI_PEF', path.join(_HERE, '..', 'dist', 'EHCIUIM.pef'))
 PEF_NAME = 'EHCIUIM.pef'          # referenced uncompressed, like the stock controller ndrvs
+# --lzss writes the Parcelfile reference as .pef.lzss so tbxi COMPRESSES the parcel at build time
+# (the file on disk stays raw; the stock parcels use the same convention). The B&W G3 ROM ships
+# this way to keep the image small; the Mini/MDD ROMs reference it raw. Either form boots.
+PEF_LZSS = '--lzss' in sys.argv[1:]
+if PEF_LZSS:
+    sys.argv.remove('--lzss')     # the tbxi-patches arg parser must not see this private flag
+PEF_REF  = PEF_NAME + ('.lzss' if PEF_LZSS else '')
 
 # ---- device-node MATCH --------------------------------------------------------
 # A node-probe of the target EHCI card (a NEC uPD720xx) showed:
@@ -103,7 +110,7 @@ def parcel_lines():
     for (flags, a, b) in MATCH_ENTRIES:
         out.append('prop flags=%s a=%s b=%s\n' % (flags, a, b))
         out.append('\tndrv flags=%s name=driver,AAPL,MacOS,PowerPC src=%s%s\n\n'
-                   % (NDRV_FLAGS, PEF_NAME, dedup))
+                   % (NDRV_FLAGS, PEF_REF, dedup))
     return out
 
 

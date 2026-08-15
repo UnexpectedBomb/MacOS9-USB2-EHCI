@@ -65,11 +65,12 @@ Verified: a clean clone built with the sequence above produces an `EHCIUIM.pef` 
 the driver in the shipping ROM.
 
 The result is `build/EHCIActivate.bin` (MacBinary, copy to the OS 9 machine and decode so the
-resource fork survives) plus `.APPL`/`.dsk` variants. A prebuilt copy is in `dist/USB2_Activate.bin`
-(one universal helper, for both PCI-card and on-board machines).
+resource fork survives) plus `.APPL`/`.dsk` variants. The helper app is retired in the shipping
+release (the activation extension replaced it; see `resident/`), but the target still builds and
+remains useful for bring-up experiments on new machines.
 
-If you edit a driver source, re-run its build + `pef-to-blob` step and then rebuild the app.
-Otherwise the app keeps embedding the old driver.
+The blob header now regenerates inside the `blockdrv` rule itself, so an edit to `usb_disk.c`
+propagates into the UIM automatically on the next build.
 
 > **ROM-integration note.** The shipping helper uses the driver **from the ROM**, not the embedded
 > blob, so it no longer installs the byte array at runtime. The blob is still built and embedded (it
@@ -116,5 +117,11 @@ Put the patched ROM in place of the `Mac OS ROM` in the System Folder, and keep 
   fail to compile. (`usb2_icns_blob.h`, the icon, is committed, it is not generated.)
 - Retro68 headers are Latin-1; `grep` them with `LC_ALL=C grep -a`.
 - Only the `ndrv`, `blockdrv`, `EHCILauncher` (the universal launcher), and `EHCITrigger` targets
-  are included here. The dev tree had additional diagnostic probe apps and a resident-INIT vehicle;
-  those were left out of this repo.
+  are included here. The dev tree had additional diagnostic probe apps; those were left out of
+  this repo.
+- `resident/` holds the source of the **activation extension** that ships with the release
+  (`bootmain.c` builds against `bootmain_dm.exp` as a PowerPC fragment; `ehci_init_dbg.c`/`.r` is
+  the 68K INIT wrapper that loads it at boot, built with the Retro68 m68k toolchain). The shipped
+  extensions are packaged from these with `scripts/package-init.py` (name, version resource, icon).
+  The prebuilt, hardware-validated extensions are attached to the release; building your own
+  requires both Retro68 toolchains and is documented mainly for review.

@@ -45,8 +45,14 @@ target_link_libraries(USBDisk DriverServicesLib NameRegistryLib InterfaceLib)
 add_custom_command(OUTPUT USBDisk.pef
     COMMAND ${MAKE_PEF} libUSBDisk.so -o USBDisk.pef
     COMMAND /usr/bin/env python3 ${CMAKE_CURRENT_SOURCE_DIR}/patch-pef-main.py USBDisk.pef DoDriverIO
-    DEPENDS USBDisk ${CMAKE_CURRENT_SOURCE_DIR}/patch-pef-main.py)
+    # Regenerate the embedded-blob header IN THE SAME RULE, so an edit to usb_disk.c can never ship a
+    # stale blob inside the UIM (the UIM #includes usb_disk_blob.h; a manual regeneration step was
+    # forgotten twice and cost a hardware run each time). usb_disk.c -> USBDisk.pef -> usb_disk_blob.h
+    # -> EHCIUIM now propagates automatically via the add_dependencies below.
+    COMMAND /usr/bin/env python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/pef-to-blob.py USBDisk.pef ${CMAKE_CURRENT_SOURCE_DIR}/src/usb_disk_blob.h gUsbDiskPef
+    DEPENDS USBDisk ${CMAKE_CURRENT_SOURCE_DIR}/patch-pef-main.py ${CMAKE_CURRENT_SOURCE_DIR}/scripts/pef-to-blob.py)
 add_custom_target(blockdrv ALL DEPENDS USBDisk.pef)   # NB: target name must differ from lib 'USBDisk' case-insensitively (macOS FS)
+add_dependencies(EHCIUIM blockdrv)   # the UIM embeds the block driver: build order matters
 
 
 # ---- USL-4.2: resident-driver trigger — call the Expert's LoadUIMForEntry on the EHCI node

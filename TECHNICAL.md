@@ -141,6 +141,52 @@ Two things worth being straight about:
 - **The stall is still unexplained.** This change makes the driver survive it, not understand it. See
   the open problems in the README.
 
+## Bug hunt #8, delayed heap corruption after pulling a drive at the wrong moment
+
+The nastiest class of bug this project has hit: pull a drive within the first seconds after
+insertion (while the system is still talking to it) and the machine's system heap is corrupt
+minutes later, with the crash pointing nowhere near USB. Mechanism: when a device disappears, OS 9's
+USB stack frees that device's pipe and transfer bookkeeping without aborting the transfers first (its
+abort entry points are never called; this was confirmed by tracing every dispatch slot). The
+controller engine still holds the client's completion routine, pipe pointer and destination buffer;
+when the orphaned transfer later times out, the completion path wrote through pointers the OS had
+already freed. Idle-drive pulls have nothing in flight, which is why simple unplug testing never
+caught it. The fix retires every outstanding transfer for a removed device at disconnect time,
+delivers substitute completions (with an "aborted" status) BEFORE the OS is told the device is gone,
+and refuses new I/O addressed to dead devices, matching the teardown order of Apple's own OHCI
+driver. A reap-side gate suppresses any client write that ever slips past the funnel, and its
+counter has stayed zero through every torture run since.
+
+## Bug hunt #9, the boot-window crash family (things that evaporate after startup)
+
+Two related mechanisms, both of the same shape: a pointer created during boot that stops being valid
+once boot finishes. First, Apple System Profiler crashed on every machine with this driver
+installed: the OS creates a unit-table entry for ROM-loaded drivers but never finishes wiring its
+dispatch vector, and ASP's device scan is the only thing that ever calls through it. The driver now
+repairs that entry at boot exactly the way the ROM's own installer would have (and answers unhandled
+commands with honest errors rather than success, so no caller parses an untouched buffer). Second,
+routine descriptors and completion routines allocated during early boot landed in heaps that do not
+survive to the desktop; the freed bytes keep working until the block is reused, so the crash arrives
+minutes later inside whatever innocent code inherited the memory (a font, a display driver). Every
+long-lived descriptor is now allocated explicitly in the system zone, and the activation extension
+installs the driver through the Driver Manager so its code and data live in system memory rather
+than in any application arena.
+
+## Bug hunt #10, Disk First Aid's garbage location string
+
+Disk First Aid showed a line of deterministic garbage under every one of this stack's volumes, on
+three different machines. Two plausible query-based theories (an unanswered cache-flush gestalt, an
+unanswered drive-info control) were implemented, verified live in the logs, and changed nothing:
+a good reminder that a landed fix is not a proven mechanism. The real channel was found by
+comparison against Apple's own stack, which renders "USB (v2.1.1)": that text is a where-string the
+driver itself composes, returned through disk driver Control csCode 21 (kDriveIcon) as a pointer to
+a 256-byte classic icon followed by a Pascal string. This driver's control handler acknowledged
+csCode 21 with noErr but never filled the response, so the utility dereferenced whatever was left in
+its own parameter block and rendered stack bytes as a string, identically on every machine because
+it was always its own stack. The driver now returns a real per-drive response (its icon plus
+"USB 2.0, drive N (v1.0)"), which is also why these volumes now carry the stack's icon inside Disk
+First Aid's list.
+
 ## The stack, layer by layer
 
 - **Controller bring-up** (`ehci_os.c`, `ehci_hw.c`): PCI enable, map the operational

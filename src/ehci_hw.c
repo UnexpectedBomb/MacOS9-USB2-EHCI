@@ -41,8 +41,28 @@ int ehci_hc_reset(ehci_softc *sc)
     /* assert HCReset, wait for it to self-clear */
     ehci_write32(op, EHCI_USBCMD, EHCI_CMD_HCRESET);
     for (spin = 0; spin < EHCI_SPIN_LIMIT; spin++)
-        if (!(ehci_read32(op, EHCI_USBCMD) & EHCI_CMD_HCRESET))
+        if (!(ehci_read32(op, EHCI_USBCMD) & EHCI_CMD_HCRESET)) {
+            /* ★★★★★★ h40 — RE-ROUTE THE PORTS TO EHCI THE INSTANT THE RESET SELF-CLEARS.
+             *
+             * HCReset zeroes CONFIGFLAG, which routes EVERY port to the 1.1 companions. ehci_hc_start sets it
+             * back, but only after the frame list, the register block, USBCMD and a 500-frame power/debounce
+             * wait — hundreds of milliseconds later. Apple's USB stack is fully running by then (it is driving
+             * the keyboard), so in that gap it sees a connect on the drive's port, starts enumerating, and
+             * registers a drive-queue entry. We then take the port back and Apple is left with an entry whose
+             * device is gone: "this disk needs to be initialized" at every cold boot with a drive attached.
+             *
+             * ★ Closing it is one register write in the right place. CONFIGFLAG only selects the routing owner;
+             * it needs no frame list, no schedules and no running controller, so writing it here — while the
+             * controller is still halted, microseconds after the reset — is legal and leaves Apple no window
+             * to act in. hc_start still sets it again (idempotent), so its sequence is unchanged.
+             * ⚠ Deliberately ONLY the routing flag. No PORTSC writes here: ports are unpowered coming out of
+             * reset, CCS reads 0 while unpowered, so any per-port decision taken now would be reading a lie —
+             * that is exactly the trap the hc_start comment warns about. Power, debounce and the K-test all
+             * stay where they are, with valid data. */
+            ehci_write32(op, EHCI_CONFIGFLAG, EHCI_CONFIGFLAG_CF);
+            (void)ehci_read32(op, EHCI_CONFIGFLAG);      /* posted-write flush */
             return 0;
+        }
     return -1;
 }
 
@@ -223,16 +243,51 @@ int ehci_hc_start(ehci_softc *sc)
         ehci_write32(op, EHCI_PORTSC(i), pv);
     }
     ehci_frame_delay(op, 500);                            /* power-good + connect debounce, power applied */
+    /* ★★★★★★ h38 — CEDE ONLY WHAT WE CANNOT DRIVE, NOT EVERYTHING THAT IS OCCUPIED. THIS WAS THE ROOT CAUSE
+     * OF BOTH COLD-BOOT ALERTS.
+     *
+     * ⚠ WHAT THIS LOOP USED TO DO: "occupied -> hand to the companion, empty -> keep for EHCI", on the stated
+     * assumption (the comment above) that "the drive is inserted afterward into an empty (now EHCI-owned)
+     * port". That was true of the pre-app-less world, where a drive was ALWAYS plugged in after boot. It is
+     * false the moment the driver comes up with a drive already attached — which is the entire app-less
+     * cold-boot case. We were GIVING THE DRIVE'S PORT TO APPLE OURSELVES, every boot.
+     *
+     * ★★ THAT explains both hardware alerts, which I spent several builds attributing to a race:
+     *   - v4 (no INIT claim): Apple owned every port all through the parade, fully enumerated the drive, then
+     *     the h31 sweep evicted it -> Apple's complete device vanished -> "the device for disk X was
+     *     unexpectedly disconnected". The sweep was fighting THIS loop, not a reset window.
+     *   - v6 (INIT claim): the drive was ours at INIT time (Boot Log PORTSC 0x1803), then THIS loop ceded it
+     *     again because it was occupied, Apple got far enough to register a drive-queue entry, and the sweep
+     *     evicted it -> "this disk needs to be initialized".
+     * The h31 "our HCReset gave it away" note has the right symptom and the WRONG mechanism: CONFIGFLAG=1 is
+     * set 7 lines above and clears every Owner bit — and then this loop put the Owner bit back.
+     *
+     * ★ THE FIX is the speed test we already trust everywhere else: a device that IDLES AT K is low speed and
+     * genuinely undrivable by an EHCI root port, so cede it (that is the keyboard, and it is the one cede this
+     * controller honours). Anything else — full speed or high speed, indistinguishable while idle because both
+     * idle at J — stays OURS, and the enumeration engine's reset chirp decides: high speed enumerates, full
+     * speed fails the chirp and is ceded then, on the proven path. So Apple only ever receives ports it can
+     * actually serve, and never sees the drive at all.
+     * ⚠ sharedCompanion stays CONSERVATIVE: set it if ANY port is occupied, because an FS device we keep now
+     * will be ceded to the companion moments later, and it only costs ISR chaining, which is always safe. */
     sc->sharedCompanion = 0;
-    for (i = 0; i < sc->nPorts; i++) {                    /* release occupied ports; keep empty ones for EHCI */
+    for (i = 0; i < sc->nPorts; i++) {
         UInt32 pv = ehci_read32(op, EHCI_PORTSC(i)) & ~EHCI_PORTSC_RW1C;
         if (pv & EHCI_PORT_CONNECT) {
-            pv |= EHCI_PORT_OWNER;          /* occupied -> hand to the companion (kbd/mouse) ...        */
-            sc->sharedCompanion = 1;        /* ...and a live device shares this controller's IRQ line   */
+            int k = 0, s, d;
+            sc->sharedCompanion = 1;        /* a live device shares this controller's IRQ line */
+            /* Majority-K over 16 samples: LS idles at K (>=14/16 typical); an idle FS/HS candidate reads J.
+             * Threshold 12, matching the driver's other two sampled filters. Spacer = ~100 register reads. */
+            for (s = 0; s < 16; s++) {
+                if (((ehci_read32(op, EHCI_PORTSC(i)) >> 10) & 3) == 1) k++;
+                for (d = 0; d < 100; d++) (void)ehci_read32(op, EHCI_PORTSC(i));
+            }
+            if (k >= 12) pv |=  EHCI_PORT_OWNER;   /* low speed: genuinely ours-to-cede (the keyboard) */
+            else         pv &= ~EHCI_PORT_OWNER;   /* FS/HS candidate: KEEP — the chirp decides, not this loop */
         } else {
-            pv &= ~EHCI_PORT_OWNER;         /* empty -> EHCI owns it (the drive lands here)             */
+            pv &= ~EHCI_PORT_OWNER;                /* empty -> EHCI owns it */
         }
-        pv |= EHCI_PORT_POWER;                               /* keep power on either way */
+        pv |= EHCI_PORT_POWER;                     /* keep power on either way */
         ehci_write32(op, EHCI_PORTSC(i), pv);
     }
 #else

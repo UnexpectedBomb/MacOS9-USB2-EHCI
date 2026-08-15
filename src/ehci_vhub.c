@@ -18,6 +18,8 @@
 #include <Files.h>                   /* n7: PBUnmountVol + GetVCBQHdr — unmount on unexpected removal */
 #include <Notification.h>            /* n7 */
 #include <Shutdown.h>                /* n10: quiesce the controller before a warm reboot */            /* n7: NMInstall — "please reconnect the device", as Apple's ext does */
+#include <Patches.h>                 /* h48: GetToolTrapAddress — watch _SystemTask (0xA9B4) for the Apple bug */
+#include <CodeFragments.h>           /* h48: GetSharedLibrary/FindSymbol — reach the Expert's status facility */
 #include "ehci_vhub.h"
 #include "usb_disk_blob.h"           /* n3: the block driver's PEF, embedded so we can install it ourselves */
 
@@ -198,7 +200,39 @@ static volatile UInt32 gIsrHits = 0;     /* r35: real-EHCI-ISR invocations where
  * getting a chance to run in between (it clears the counter); gIsrConsecMax = the peak. Declared here,
  * ahead of selfprobe_tick's v47 stall dump which reads them. Diagnostic only — nothing branches on them. */
 static volatile UInt32 gIsrConsec = 0, gIsrConsecMax = 0;
+/* h54: both declared HERE rather than beside the ISR because ctl_step's failure probe reads them and sits
+ * ~3000 lines earlier. gSihRuns counts SIH entries — flat across the control failures means the SIH is
+ * starved, which is the shared-interrupt-line suspicion this ROM exists to settle. */
+static volatile UInt32 gSihQueued = 0;
+static volatile UInt32 gSihRuns = 0;
 static volatile int    gStormPainted = 0;   /* v46: storm_paint is a ONE-SHOT */
+/* ★★★ H76_DIAGNOSTICS — THE BISECT SWITCH. m27 (h76, everything on) does NOT BOOT: blinking question mark,
+ * while m26 (h74) boots fine. Every static check on m27 passes — PEF header valid, all three exports
+ * present, section table sane (code 241664 / data 49752 / loader 9099), ROM 9/9, size within 5 KB of m26 —
+ * so whatever it is, it is not visible from the desk. This flag splits the difference in ONE reboot:
+ *   1 = h75 + h76a (AddDrive dump) + h76b (screen watchdog)   -> that is m27
+ *   0 = h75 ONLY (the BOT-recovery routing fix)               -> that is m28
+ * m28 boots  => the fault is in the h76 diagnostics, and the paint code is the prime suspect.
+ * m28 fails  => the fault is in h75, which is three lines of routing and a struct field.
+ * ⚠ Kept as a compile-time switch rather than two source trees: a second copy that drifts is this
+ * project's oldest trap, and the whole point is that the two builds differ ONLY here. */
+/* ★★ h86: H76_DIAGNOSTICS is now DRIVEN BY EHCI_PAINT, set beside EHCI_LOG_LEVEL in CMakeLists.txt
+ * (user directive 2026-08-13: the release build must not paint the screen). PAINT=1 is byte-for-byte the
+ * m34 behaviour — the watchdog, the exposure proof-of-life paint and rows 1-5. PAINT=0 removes every
+ * paint site and the arming; the counters underneath cost nothing and stay. The bisect note above still
+ * applies: PAINT=0 is the m28 shape. */
+#ifndef EHCI_PAINT
+#define EHCI_PAINT 1
+#endif
+#define H76_DIAGNOSTICS EHCI_PAINT
+/* h76 screen watchdog state. Declared UP HERE because the exposure path arms it (selfprobe_tick, far above
+ * the painter itself) — one definition, not a forward-declared pair that must be kept in step. */
+static volatile UInt32 gPwArmed = 0;        /* set at the exposure — only watch once a mount is in progress */
+static volatile UInt32 gPwPaints = 0;       /* bounded so this can never run for ever */
+static volatile UInt32 gPwPumpLast = 0, gPwPumpAtTick = 0;
+/* The painter itself lives beside storm_paint (it needs the framebuffer knowledge); the exposure path calls
+ * it once as a proof of life, and that call site is ~1000 lines above the definition. */
+static void paint_watchdog_state(void);
 /* lc1: set by ehci_vhub_stop_service — the heartbeat stops re-arming and the SIH stops re-enabling
  * USBINTR, so the driver goes quiet. Declared up here because vhub_heartbeat checks it. */
 static volatile int    gServiceStop = 0;
@@ -512,6 +546,26 @@ static UInt32 gDevBlkSize[USB_MAX_DEV], gDevBlkCnt[USB_MAX_DEV];
  * an explicit parameter.
  * Enumeration is serial (one gAs, one shared ctrl ep0), so exactly one writer and one reader. */
 static volatile int gEnumDev = 0;
+/* ★★★★★★ h59 — LATCH THE SLOT AT THE MOMENT THE PROBE COMPLETES, because gEnumDev is a MOVING INDEX and the
+ * deferred exposure reads it up to 45 SECONDS LATER.
+ *
+ * ⚠ THE DEFECT: the task-level handoff did `int hd = gEnumDev;` at RELEASE time, and gEnumDev is rewritten by
+ * every slot allocation (`gAs.dev = slot; gEnumDev = slot;`). While an exposure sits parked in the h30/h44
+ * defer waiting for a modal dialog, any new enumeration overwrites it — so the exposure would hand the OS the
+ * WRONG SLOT. That is why the scan had to be blocked for the whole defer window (h58), and blocking it for the
+ * whole window is what left the keyboard hostage for 45 s on the m10 run.
+ * ★ Latching turns a moving global into a stable record, which is what lets the guard be narrowed safely.
+ * Same family as the n19->n23 lesson: state that existed and was correct, read at a transition where it no
+ * longer described what the reader assumed. -1 = nothing latched. */
+static volatile int gExposeDev = -1;
+/* h61: ms when the port last reported ENABLED. The cold-boot-vs-hot-plug question is entirely about how
+ * long the device has been alive when we first address it, so the trace prints the gap explicitly. */
+static volatile UInt32 gPortEnabledMs = 0;
+static volatile int    gPortEnabledPort = -1;  /* h61: which port that was (gAs is declared later) */
+/* h30: the boot-time announce is held until the Finder settles. h59 moved this declaration UP from beside its
+ * writers so as_tick's scan guard can read it — the guard needs to tell "task level must finish this now" from
+ * "task level has it and is parked on a modal dialog", which is the whole of the h59 fix. */
+static volatile int gExposureDeferred = 0;
 static volatile int gDpDev = 0;        /* n14 step 3: device slot the in-flight transfer belongs to. One
                                         * transfer is in flight at a time (the CBW/CSW/bounce DMA buffers are
                                         * still shared), so a single owner field is enough; true concurrency
@@ -542,6 +596,69 @@ static EpQ *gDpQ = 0;             /* the endpoint queue the in-flight transfer w
 static ehci_qtd *gDpTd = 0;       /* the in-flight (activated) qTD to reap */
 static volatile UInt8 *gDownBuf = 0;                 /* r46: 20KB (5-page) DMA bounce for big data chunks */
 static UInt32 gDownBufPhys[DOWN_DATA_PAGES];         /* physical addr of each bounce page (may be non-contiguous) */
+
+/* ================================================================================================
+ * ★★★★★★★ THE SPLIT — TWO IN-FLIGHT SLOTS. `gDp*` IS NOW BLOCK I/O ONLY; `gEg*` IS THE ENGINE.
+ *
+ * ⚠ THE DEFECT THIS REMOVES, measured on hardware m25/h73 2026-08-12 (f4 direction B):
+ *     f4 B CLOBBERS = 1, of a CONTROL transfer, while an enumeration was running, at 11900 ms.
+ * `gDp*` was ONE in-flight slot with THREE producers — down_issue (control AND probe/enumeration bulk),
+ * bio_issue_read and bio_issue_write — over ONE shared DMA bounce (gDownBuf). down_pump CHECKS the slot
+ * before using it; bio_issue_* DO NOT, and that asymmetry is deliberate (h18 added the check and FROZE the
+ * machine: block I/O then waits for ever behind a stuck enumeration, and since our logging is File Manager
+ * I/O the log dies with it). So the fix could never be "take turns more politely".
+ *
+ * ★ THERE IS NO HARDWARE REASON FOR THE SHARING. Control runs on gCtrlQ, probe bulk on gDev[d].bulkQ[],
+ * block I/O on the same per-device pair — all separate queue heads, all already spliced into the async
+ * ring, and the controller executes qTDs on all of them concurrently. The single software slot was the
+ * entire constraint. Diagnosed in docs/CTL-BULK-SPLIT.md after h16-h18, designed there, never built.
+ *
+ * ★★ THE CUT IS ENGINE vs BLOCK I/O, not control vs bulk. The doc proposed control-vs-bulk because h16/h17
+ * showed control transfers starving during a copy; but the m25 measurement shows the victim class is
+ * "whatever the ENGINE had in flight", and the probe's BULK transfers are just as exposed as its control
+ * ones. Engine transfers are inherently serial anyway (one gAs, one enumeration at a time, down_pump issues
+ * one at a time), so they share a slot with each other safely. Block I/O gets its own. Two slots is
+ * sufficient and is the smallest change that makes the clobber structurally impossible.
+ *
+ * ★★★ THREE FURTHER DEFECTS FALL OUT WITH IT, all named in the doc:
+ *   1. THE SHARED BOUNCE. Both paths pointed the controller at gDownBuf, so a clobber left two transfers
+ *      live in hardware DMAing the same memory — latent corruption of the MOUNT'S data. The engine now has
+ *      its own bounce (gEgBuf) and never touches gDownBuf.
+ *   2. down_reap COULD NOT TELL WHOSE COMPLETION IT WAS. `if (gBioPhase && !gDpUPP) bio_advance(status)`
+ *      fired for CONTROL completions too (ours pass upp = 0), so a control completion could advance the BOT
+ *      state machine with an unrelated status. bio_advance is now driven ONLY from the block-I/O slot.
+ *   3. ONE WATCHDOG FOR TWO CLASSES. gDpArmTick belonged to whichever transfer armed last, so an orphaned
+ *      transfer was never timed out at all — which is exactly why gDownTimeouts stayed 0 through h16-h18.
+ *      Each slot now carries its own arm tick and is polled independently.
+ *
+ * ⚠ AND A LATENT BUG THE SPLIT EXPOSED: epq_issue maps FIVE page pointers (20 KB) but down_submit capped
+ * len at DOWN_BUF_MAX (128 KB). An engine transfer above 20 KB would have run off the end of its mapping.
+ * Unreachable in practice (control <= 64 B, probe bulk <= 512 B, gPB is 20 KB) but it was one caller away.
+ * ENG_BUF_MAX now bounds both the buffer and the request, with a loud refusal — the doc asked for exactly
+ * this and called it "true by assertion rather than by luck". */
+#define ENG_BUF_PAGES 5                             /* epq_issue maps 5 qTD buffer pointers — match it exactly */
+#define ENG_BUF_MAX   (ENG_BUF_PAGES * 0x1000)      /* 20480; also == DOWN_MAX_BLOCKS*512, the gPB scratch size */
+static volatile UInt8 *gEgBuf = 0;                  /* the ENGINE's own DMA bounce — never gDownBuf */
+static UInt32 gEgBufPhys[ENG_BUF_PAGES];
+static EpQ      *gEgQ = 0;                          /* engine slot: queue head the in-flight transfer is on */
+static ehci_qtd *gEgTd = 0;                         /* engine slot: the activated qTD to reap */
+static volatile int    gEgBusy = 0, gEgIsIn = 0;
+static volatile void  *gEgUPP = 0, *gEgPipe = 0, *gEgDest = 0;
+static volatile UInt32 gEgLen = 0, gEgArmTick = 0, gEgNpkt = 1;
+static volatile int    gEgBulkEp = -1;
+static volatile UInt32 gEgDev = 0, gEgLastAddr = 0, gEgLastPid = 0;
+static volatile UInt32 gEgOversize = 0;             /* requests refused for exceeding ENG_BUF_MAX (must stay 0) */
+static volatile UInt8  gEgForBio = 0;               /* h75: the in-flight engine transfer belongs to BOT recovery */
+static volatile UInt32 gEgRecovCompl = 0;           /* h75: recovery completions routed to bio_advance (diagnostic) */
+/* h75: the BOT recovery's gBioPhase values start here. Defined UP HERE rather than beside the rest of the
+ * REC_* phases (far below) because down_reap must test it to route a tagged recovery completion, and
+ * down_reap is defined long before that block. One definition, not two that must be kept in step. */
+#define REC_BASE 20
+/* ★ THE INSTRUMENT THAT PROVES THE SPLIT WORKS. Counts every time block I/O armed while the ENGINE slot was
+ * busy — i.e. each occasion that WOULD have been a clobber before this change and is now harmless. A run
+ * with this > 0 and f4 clobbers still 0 is the split doing its job, visibly. Keeping the old f4 counters
+ * alongside it means a regression cannot hide: they must stay 0 for the engine case for ever now. */
+static volatile UInt32 gSplitSaved = 0;
 /* r69: SEPARATE small wired DMA buffers for the CBW and CSW, carved from the schedule page's spare space, so
  * a pre-queued [data->CSW] chain doesn't collide with the data bounce (Phase 2b needs the CBW, data, and CSW
  * to have distinct DMA targets). Unused until the r70 pre-queue wiring; allocated here as the foundation. */
@@ -552,6 +669,10 @@ static volatile void  *gDpUPP = 0, *gDpPipe = 0, *gDpDest = 0;
 static volatile UInt32 gDpLen = 0, gDpArmTick = 0;
 static volatile UInt32 gDownDone = 0, gDownErr = 0, gDownTimeouts = 0;
 static volatile UInt32 gDownRecov = 0;   /* r57: BOT reset-recoveries attempted */
+/* h57: QH-overlay halts seen, and overlays re-initialised to clear them. gQhHalted > 0 with gQhUnhalted equal
+ * is the fix working; gQhHalted climbing with the same endpoint failing every time would mean the halt is
+ * being re-created faster than we clear it, which is a different (device-side) problem. */
+static volatile UInt32 gQhHalted = 0, gQhUnhalted = 0;
 static volatile UInt32 gDownRelink = 0;      /* r60: async-ring repairs performed (the QH-unlink freeze fix) */
 static volatile UInt32 gLastAnchorLink = 0;  /* r60 diag: anchor->hlink (masked) at the last ring check; compare to gDownQHP */
 /* r67 THROUGHPUT DIAGNOSTIC: measure the PURE data-phase rate. Two sticks both cap ~1.5-1.9 MB/s read =>
@@ -577,23 +698,232 @@ static struct { UInt32 addr, endpt; UInt8 dirIn, toggle; UInt16 maxpkt; UInt8 us
 static volatile int gDpBulkEp = -1; static volatile UInt32 gDpNpkt = 1;
 /* MINI FIX: Apple's BULK completion UPP deadlocks at interrupt level on the Mini's shared-interrupt
  * controller -> defer it to TASK level (compl_drain from selfprobe_tick). Dedicated line (MDD) = inline. */
-typedef struct { void *upp, *pipe; long status; UInt32 actual; } ComplDef;
+typedef struct { void *upp, *pipe; long status; UInt32 actual;
+                 UInt8 twoArg;    /* h94: 1 = 2-arg control UPP (pipe,status); 0 = 3-arg bulk (pipe,status,actual) */
+               } ComplDef;
 #define NCOMPL 16u
 static volatile ComplDef gComplQ[NCOMPL];
 static volatile UInt32 gComplHead = 0, gComplTail = 0, gComplDrop = 0;
 /* r10 diagnostic: last bulk completion snapshot (interrupt-safe stores in down_reap; task-ctx reads
  * via ehci_vhub_bulk_stats from uim7, since down_reap runs at interrupt level where File Mgr is unsafe). */
 static volatile long gBulkLastStat = 0; static volatile UInt32 gBulkDoneN = 0, gBulkErrN = 0;
+/* ★★★★★★ THE SPLIT MADE THESE NECESSARY, AND MISSING THEM WOULD HAVE BEEN A REGRESSION WORSE THAN THE BUG.
+ *
+ * pb_ready()/pb_failed() ask "has MY transfer finished?" and answered it by watching gBulkDoneN+gBulkErrN
+ * move. Those aggregates are bumped by EVERY bulk completion — the probe's AND block I/O's.
+ * ⚠ Before the split that was survivable only by accident: the single slot meant the probe's transfer and a
+ * block transfer could not both be outstanding (bio simply overwrote the probe's — the clobber). THE SPLIT
+ * MAKES THEM GENUINELY CONCURRENT, which is the entire point, and it therefore turns a latent false-ready
+ * into a LIKELY one: a mounted drive's block completion would tell the probe its own INQUIRY had finished,
+ * and the probe would parse whatever was in gPB. That is the p1b failure shape verbatim ("a halted endpoint
+ * looked like progress ... state 5 parsed the leftover CBW bytes") arriving by a new route.
+ * ⇒ The probe now watches ENGINE completions only. The aggregates stay exactly as they were, because the
+ * liveness diagnostics that read them (uim23's bulkCnt, the r95 SIH watcher) genuinely do want "any bulk
+ * activity at all" and would be wrong if narrowed. Two questions, two counters. */
+static volatile UInt32 gEgBulkDoneN = 0, gEgBulkErrN = 0;
 static volatile UInt8 gLastData[16];
 typedef struct { void *upp; void *pipe; void *dest; UInt32 addr, len; UInt8 pid; UInt8 obuf[64]; UInt32 olen;
-                 void *obig; UInt32 obiglen; int bulkEp; } DownReq;   /* obig = large OUT source (write data > 64B) */
+                 void *obig; UInt32 obiglen; int bulkEp;
+                 UInt32 qms;          /* f4: frame_ms at submit — down_pump measures the wait */
+                 UInt8  forBio;       /* h75: 1 = this ENGINE transfer belongs to the BLOCK-I/O recovery
+                                       * sequence, so its completion must drive bio_advance. See down_reap. */
+                 UInt8  dead;         /* h94: 1 = its device was rude-removed; the funnel already delivered a
+                                       * substitute completion, so down_pump must CONSUME it, never issue it. */
+                 } DownReq;   /* obig = large OUT source (write data > 64B) */
 #define DOWNQ_N 48
 static volatile DownReq gDownQ[DOWNQ_N];
 static volatile UInt32 gDownQHead = 0, gDownQTail = 0, gDownQDrop = 0;
+/* ==================== h94: USL transfer retirement on rude removal ====================
+ * THE h93 RUN'S VERDICT (2026-08-13, MDD): 216 DoDriverIO calls across three sessions, every
+ * IOCommandIsComplete verdict noErr — the repaired unit entry's dispatch path is CLEAN. The heap corruption
+ * instead tracked the one thing both corrupt sessions shared and every clean session lacked: a RUDE REMOVAL
+ * with USL transfers still in flight (a freshly-inserted SanDisk yanked mid-settle; the boot-era leg pull).
+ * MECHANISM: the USL on this hardware NEVER calls AbortPipe/DeletePipe (slots 18/19 — zero calls in every
+ * banked log, all the way back). On removal it simply frees its pipe/transfer structures. Our ENGINE slot
+ * and FIFO still hold that client's completion UPP, pipe pointer and destination buffer; when the orphaned
+ * transfer later times out (-6640), down_reap faithfully copied IN-data into the FREED client buffer and
+ * fired the completion UPP with the FREED pipe — a use-after-free write into the USL's heap. MacsBug showed
+ * it as "Block length is bad" at 01C20350, a 16-byte pointer scribble in a zone ~1MB below our own blocks
+ * (which is why the h92 canaries, correctly, never tripped).
+ * THE FIX, three layers, all flag work (NO QH surgery — a yanked device's qTD errors out on its own):
+ *   1. usl_retire_device(): at SIH, from the disconnect handler, BEFORE the port change is reported to the
+ *      USL: null the client pointers out of the in-flight ENGINE slot and every queued FIFO entry for the
+ *      dead device, and queue SUBSTITUTE completions (status -6640, the long-proven timeout code) through
+ *      gComplQ. gH94Hold then parks the root-hub status-change report until compl_drain has delivered them
+ *      at task level — a real happens-before: clients complete while their memory is still live, THEN the
+ *      USL learns of the removal and frees.
+ *   2. down_pump refuses to issue for a dead device (the h81 lesson, USL-side: only the issue site knows
+ *      the truth at the moment it matters) — bulk keyed off gDev[].inUse, control off the dead-addr ring.
+ *   3. down_reap's orphan gate: the backstop. If the ENGINE transfer's device is gone and the funnel was
+ *      somehow not run, suppress the copy-out and the UPP; count it in gH94Orphaned (MUST stay 0 — nonzero
+ *      means layer 1 has a hole and this gate is what saved the heap).
+ * The dead-addr ring FAILS OPEN (reference_os9_recovery_paths_fail_open): any new CONNECT clears it, and
+ * create_bulk clears it, so a stale entry can never refuse a live device's traffic. Address 0 (enumeration
+ * default) and the root hub are never considered dead. */
+static volatile UInt32 gH94Retired = 0;    /* client transfers retired by the disconnect funnel */
+static volatile UInt32 gH94Orphaned = 0;   /* reap-gate saves; MUST be 0 (nonzero = funnel hole, gate saved us) */
+static volatile UInt32 gH94Refused = 0;    /* dead-device issues refused at the pump (h81 mirror) */
+static volatile UInt32 gH94Hold = 0;       /* 1 = status-change report parked until compl_drain delivers */
+#define H94_DEAD_N 4
+static volatile UInt32 gDeadAddr[H94_DEAD_N];   /* recently rude-removed USB addresses (0 = empty slot) */
+static void dead_ring_clear(void) { int i; for (i = 0; i < H94_DEAD_N; i++) gDeadAddr[i] = 0; }
+static void dead_ring_add(UInt32 a)
+{
+    int i;
+    if (!a) return;
+    for (i = 0; i < H94_DEAD_N; i++) if (gDeadAddr[i] == a) return;
+    for (i = 0; i < H94_DEAD_N; i++) if (!gDeadAddr[i]) { gDeadAddr[i] = a; return; }
+    gDeadAddr[0] = a;                          /* full: overwrite the oldest slot; ring is best-effort */
+}
+static int addr_in_dead(UInt32 a)
+{
+    int i;
+    if (!a) return 0;
+    for (i = 0; i < H94_DEAD_N; i++) if (gDeadAddr[i] == a) return 1;
+    return 0;
+}
+/* 1 = some live owner answers to this USB address today (a mounted/self-enum device, a registered bulk
+ * endpoint, the claimed hub, the root hub, or the enumeration default address 0). Used ONLY to decide
+ * whether an UNNAMED in-flight control transfer may be conservatively retired at disconnect time — never
+ * as a refusal predicate on its own (Apple-era enumeration assigns addresses we cannot see in advance). */
+static int addr_is_live(UInt32 a)
+{
+    int i;
+    if (a == 0 || a == gRootHubAddr) return 1;
+    if (gHub.claimed && a == HUB_ADDR) return 1;
+    for (i = 0; i < USB_MAX_DEV; i++) if (gDev[i].inUse && gDev[i].curAddr == a) return 1;
+    for (i = 0; i < NBULK; i++) if (gBulkEP[i].used && gBulkEP[i].addr == a) return 1;
+    return 0;
+}
+/* Queue a substitute completion for a retired client transfer. SIH-safe (ring stores only); delivered by
+ * compl_drain at task level, exactly like the v20 deferred bulk completions. twoArg picks the UPP shape:
+ * control completions are 2-arg (pipe, status), bulk are 3-arg (pipe, status, actual). */
+static void retire_enqueue(void *upp, void *pipe, int twoArg)
+{
+    UInt32 hh = gComplHead;
+    if (!upp) return;                          /* our own transfers (upp 0) need no substitute */
+    if ((hh - gComplTail) < NCOMPL) {
+        gComplQ[hh & (NCOMPL - 1u)].upp = upp;
+        gComplQ[hh & (NCOMPL - 1u)].pipe = pipe;
+        gComplQ[hh & (NCOMPL - 1u)].status = -6640L;   /* the proven timeout code — clients have handled it for months */
+        gComplQ[hh & (NCOMPL - 1u)].actual = 0;
+        gComplQ[hh & (NCOMPL - 1u)].twoArg = (UInt8)twoArg;
+        gComplHead = hh + 1u;
+        gH94Hold = 1;                          /* park the status-change report until the drain delivers */
+    } else gComplDrop++;
+}
+/* The funnel. Called at SIH from the disconnect handler for device slot d (dAddr = its USB address if
+ * known, else 0), BEFORE the port change is reported. Flag stores + ring stores only — no File Manager,
+ * no allocation, no QH/overlay writes (the epq task-level-only rule holds: a yanked device's in-flight
+ * qTD retires ITSELF via XactErr/watchdog; we only make sure the retirement cannot touch client memory). */
+static void usl_retire_device(int d, UInt32 dAddr)
+{
+    UInt32 t;
+    if (dAddr) dead_ring_add(dAddr);
+    /* Queued FIFO entries whose device is the one that left. Bulk entries name their owner exactly
+     * (gBulkEP[].dev); control entries match by address when we know it. */
+    for (t = gDownQTail; t != gDownQHead; t++) {
+        volatile DownReq *r = &gDownQ[t % DOWNQ_N];
+        int match = 0;
+        if (r->dead) continue;
+        if (r->bulkEp >= 0 && r->bulkEp < NBULK && gBulkEP[r->bulkEp].dev == (UInt8)d) match = 1;
+        else if (r->bulkEp < 0 && dAddr && r->addr == dAddr) match = 1;
+        if (!match) continue;
+        retire_enqueue((void *)r->upp, (void *)r->pipe, r->bulkEp < 0);
+        r->upp = 0; r->pipe = 0; r->dest = 0; r->obig = 0; r->dead = 1;
+        gH94Retired++;
+    }
+    /* The in-flight ENGINE transfer. The slot stays busy — the qTD errors out on its own and down_reap
+     * does the bookkeeping — but the client pointers are nulled NOW, so that retirement cannot write into
+     * memory the USL is about to free. down_reap's existing `if (dd)` / `if (gEgUPP)` guards become the
+     * enforcement. */
+    if (gEgBusy) {
+        int match = 0;
+        if (gEgBulkEp >= 0) match = (gEgDev == (UInt32)d);
+        else if (dAddr && gEgLastAddr == dAddr) match = 1;
+        else if (gEgBulkEp < 0 && !addr_is_live(gEgLastAddr)) match = 1;   /* unnamed Apple-era device: the
+                                                                            * conservative sweep — -6640 is
+                                                                            * what a timeout would say anyway */
+        if (match) {
+            retire_enqueue((void *)gEgUPP, (void *)gEgPipe, gEgBulkEp < 0);
+            gEgUPP = 0; gEgPipe = 0; gEgDest = 0;
+            gH94Retired++;
+        }
+    }
+    if (gH94Retired)
+        ehci_os_ilogx("!! h94: rude removal — client transfers retired before the USL hears (total)",
+                      gH94Retired);
+}
 /* h17's gCtlPromoted and h18's gBioDeferBusy are gone with the changes they measured. Both counters did their
  * job: gCtlPromoted read 0 and refuted h17's theory outright, and gBioDeferBusy's absence from the h18 freeze
  * log is what showed that logging dies with the File Manager, which is why the next attempt needs evidence
  * that survives a stall rather than more counters written through FSWrite. */
+
+/* ================================================================================================
+ * ★★★★★★★ f4 — THE SINGLE IN-FLIGHT SLOT, INSTRUMENTED. PURE OBSERVATION: NOTHING HERE CHANGES BEHAVIOUR.
+ *
+ * ⚠⚠ THE STANDING STRUCTURAL DEFECT, AND IT IS NOT A NEW THEORY. docs/CTL-BULK-SPLIT.md diagnosed it after
+ * h16-h18, designed the fix, and THE FIX WAS NEVER BUILT — there is no control slot in this file; grep for
+ * gCtlBusy and you get nothing. So `gDp*` is still ONE in-flight slot with THREE producers:
+ *     · down_issue()      — every CONTROL transfer and every PROBE/enumeration BULK transfer (queued)
+ *     · bio_issue_read()  — block I/O, arms the hardware DIRECTLY
+ *     · bio_issue_write() — likewise
+ * and `gDownBuf`/`gDownBufPhys[]` is ONE shared DMA bounce that both paths point the controller at.
+ * ⚠ The comment at down_pump saying "the CTL/BULK split makes it moot — control gets its own in-flight slot"
+ * describes a DESIGN, not this code. A comment is a claim, and it expires silently (CLAUDE.md).
+ *
+ * ★ TWO DIRECTIONS OF HARM, AND THEY HAVE OPPOSITE SIGNATURES. That is what makes this measurable:
+ *
+ *   A  STARVATION — the probe is starved by block I/O.
+ *      down_pump()'s first statement is `if (gDpBusy) return;`, and during a multi-chunk mount read every
+ *      completion re-arms the next chunk (down_reap -> bio_advance -> bio_start_chunk -> bio_issue_read,
+ *      gDpBusy = 1) BEFORE down_pump gets its turn. A queued probe transfer is then never issued at all, and
+ *      the probe dies on bot_step's 800 ms per-phase cap. This is EXACTLY the mechanism CTL-BULK-SPLIT.md
+ *      verified for control transfers during a copy; nothing about it is specific to control.
+ *      ⇒ signature: gF4PumpBlocked climbs, gF4PumpMaxWaitMs is large, the probe fails, THE MOUNT IS FINE.
+ *
+ *   B  CLOBBER — block I/O arms over an in-flight probe transfer.
+ *      bio_issue_read/bio_issue_write overwrite gDpBusy/gDpQ/gDpTd/gDpBulkEp/gDpDev/gDpArmTick with NO test
+ *      of gDpBusy (h18 added that test and it FROZE THE MACHINE — see the note in bio_kick — so its absence
+ *      is deliberate). The probe's qTD is orphaned (nothing polls it), the single watchdog now belongs to
+ *      the newcomer, and BOTH transfers are live in hardware on different QHs POINTING AT THE SAME BOUNCE.
+ *      ⇒ signature: gF4Clobber > 0. This one can corrupt the MOUNT'S OWN DATA, which is the only hypothesis
+ *      on the table that explains an exposed volume the Finder then calls unreadable, plus a crash.
+ *
+ * ★ AND THE THIRD POSSIBLE ANSWER IS "NEITHER", which is why this is a discriminator and not a fix: if both
+ * counters read 0 across the m24 topology then the two never contend, F4 is refuted, and the split stays off
+ * the critical path. One boot decides it. Two speculative ROMs on this project were both wrong; the probe
+ * answered it in one run (CLAUDE.md, hardware-test discipline).
+ *
+ * ⚠ DESIGN RULES OBSERVED HERE, each one paid for already:
+ *   · counters at interrupt level, ONE summary at task level. h47 logged 705 dumps in a single 45 s window
+ *     and was "both diagnostic noise and a plausible confound" — this adds ZERO lines to the hot path.
+ *   · gF4Owner is written only where gDpBusy is SET, and read only where gDpBusy is 1, so it can never be
+ *     stale when it is consulted and needs no clearing on any of the several paths that clear gDpBusy.
+ *   · the summary goes out on the CRITICAL (rate-cap-exempt) channel — see docs/ENGINE-STATE-MACHINE.md §0
+ *     and the m24 log, where 458 dropped ring lines destroyed the previous diagnosis.
+ * ================================================================================================ */
+#define F4_OWNER_NONE 0
+#define F4_OWNER_CTL  1        /* down_issue, control (ep0)               */
+#define F4_OWNER_PROBE 2       /* down_issue, bulk = probe/enumeration    */
+#define F4_OWNER_BIO  3        /* bio_issue_read / bio_issue_write        */
+static volatile UInt8  gF4Owner = F4_OWNER_NONE;   /* who armed the slot that is busy NOW */
+/* --- direction B: block I/O armed over a slot that was already busy --- */
+static volatile UInt32 gF4Clobber = 0;             /* total */
+static volatile UInt32 gF4ClobberProbe = 0;        /* ...of a PROBE/enumeration bulk transfer — the dangerous one */
+static volatile UInt32 gF4ClobberCtl = 0;          /* ...of a control transfer */
+static volatile UInt32 gF4ClobberBio = 0;          /* ...of another block transfer (would be a bio-engine bug) */
+static volatile UInt32 gF4ClobberEnum = 0;         /* ...that happened while an enumeration sequence was running */
+static volatile UInt32 gF4ClobberFirstMs = 0;      /* frame_ms of the first one, 0 = never */
+/* --- direction A: a queued transfer could not be issued because the slot was busy --- */
+static volatile UInt32 gF4PumpBlocked = 0;         /* down_pump early-returned with work queued */
+static volatile UInt32 gF4PumpBlockedByBio = 0;    /* ...specifically because block I/O held the slot */
+static volatile UInt32 gF4PumpMaxWaitMs = 0;       /* longest a queued request sat unissued */
+static volatile UInt32 gF4PumpMaxWaitOwner = 0;    /* who held the slot at that worst wait */
+/* --- the overlap window itself --- */
+static volatile UInt32 gF4EnumArmedWhileBio = 0;   /* an enumeration ran while block I/O was in flight */
+static volatile UInt32 gF4Snap = 0;                /* AddDrive snapshot, packed (see the exposure site) */
+static volatile UInt32 gF4SnapDownQ = 0;
 
 /* Program an endpoint QH's characteristics. isCtrl => DTC=1 (control toggle carried per-qTD: SETUP=DATA0,
  * data/status=DATA1); bulk => DTC=0 (the controller maintains this endpoint's data toggle in the QH across
@@ -698,6 +1028,63 @@ static void epq_init(EpQ *q, UInt8 *pg, UInt32 pgP, UInt32 qhOff, UInt32 tdBaseO
     epq_arm_idle(q);                                     /* empty overlay, dt=0, dummy at td[0] */
     ehci_qh_link_async(&gSoftc, q->qh, q->qhP);          /* splice into the async ring (anchor stays ASYNCLISTADDR) */
 }
+/* ★★★★★★★ h92 — CANARIES AROUND EVERY TRANSFER-ENGINE DMA ALLOCATION, because the MDD's system heap
+ * was found CORRUPT (free list bad, block header trashed at 01973390) with attribution UNKNOWN. The
+ * timeline: h53 ran for weeks beside the CPU-temp CSM with no heap events; the corruption arrived with
+ * the h91-era builds. So every h53->h91 system-heap writer is a suspect, and OUR DMA buffers are the
+ * loudest class: the hardware writes into them at bus-master speed, and they sit in the system heap
+ * surrounded by other people's blocks.
+ *
+ * Each of the three wired allocations below already over-allocates by 0x1000 for page alignment. That
+ * slack is now PATTERN-FILLED and CHECKED: leading slack (raw..aligned) and trailing slack
+ * (aligned+used..raw+size). A DMA overrun in either direction must cross a canary before it can reach a
+ * neighbouring heap block, so:
+ *   canary DEAD    -> the corruption is OURS, and the zone name says which buffer overran;
+ *   canaries ALIVE across a corruption event -> our DMA engines did not do it, and the boot-time
+ *                     address map (the '!! h92 MAP' lines) says whether the corpse is even near us.
+ * The check runs from the TASK-LEVEL tick only (a full sweep is ~24 KB of reads every couple of
+ * seconds); a violation latches ONCE per zone onto the critical ring, and the mask paints (PAINT=1). */
+#define H92_PAT(i)  ((UInt8)(0xC5u ^ ((i) * 0x3Bu)))
+#define H92_MAX 8
+static struct { const char *nm; volatile UInt8 *a; UInt32 n; } gH92[H92_MAX];   /* guard spans */
+static int gH92N = 0;
+static volatile UInt32 gH92Mask = 0;         /* bit per span, latched on violation — painted + logged */
+static void h92_guard(const char *nm, Ptr raw, UInt32 rawLen, volatile UInt8 *used, UInt32 usedLen)
+{
+    UInt32 i;
+    volatile UInt8 *lead = (volatile UInt8 *)raw;
+    UInt32 leadN = (UInt32)((UInt8 *)used - (UInt8 *)raw);
+    volatile UInt8 *trail = used + usedLen;
+    UInt32 trailN = ((UInt32)raw + rawLen) - (UInt32)trail;
+    if (leadN && gH92N < H92_MAX) {
+        for (i = 0; i < leadN; i++) lead[i] = H92_PAT(i);
+        gH92[gH92N].nm = nm; gH92[gH92N].a = lead; gH92[gH92N].n = leadN; gH92N++;
+    }
+    if (trailN && gH92N < H92_MAX) {
+        for (i = 0; i < trailN; i++) trail[i] = H92_PAT(i);
+        gH92[gH92N].nm = nm; gH92[gH92N].a = trail; gH92[gH92N].n = trailN; gH92N++;
+    }
+    /* The boot-time MAP: where our block sits, so a MacsBug bad-block address can be compared. '!!' so a
+     * LEVEL 1 build carries it. Task level here (xfer_init logs already). */
+    ehci_os_logx("!! h92 MAP: our system-heap block — see next line for end; START", (UInt32)raw);
+    ehci_os_logx("!!   h92 MAP: block END (name in the order: dmapage, downbuf, egbuf)", (UInt32)raw + rawLen);
+}
+static void h92_check(void)                   /* TASK TICK ONLY — reads + a latched flag + one ring line */
+{
+    int s; UInt32 i;
+    for (s = 0; s < gH92N; s++) {
+        if (gH92Mask & (1UL << s)) continue;                  /* already latched — report once */
+        for (i = 0; i < gH92[s].n; i++)
+            if (gH92[s].a[i] != H92_PAT(i)) {
+                gH92Mask |= (1UL << s);
+                ehci_os_ilogcx("!! h92 CANARY DEAD — a DMA guard zone was OVERWRITTEN; "
+                               "span<<24|firstBadOff", ((UInt32)s << 24) | (i & 0xFFFFFFu));
+                ehci_os_ilogcx("!!   h92 span address (compare with the MacsBug bad-block header)",
+                               (UInt32)gH92[s].a);
+                break;
+            }
+    }
+}
 int ehci_vhub_xfer_init(void)
 {
     Ptr raw; LogicalAddress pg; LogicalToPhysicalTable t; unsigned long cnt = 1; UInt32 pgP; int i;
@@ -710,6 +1097,7 @@ int ehci_vhub_xfer_init(void)
     if (GetPhysical(&t, &cnt) != noErr)  { gDownInitErr = 3; return -1; }
     pgP = (UInt32)t.physical[0].address;
     gDownPg = (volatile UInt8 *)pg; gDownPgP = pgP;
+    h92_guard("dmapage", raw, 0x2000, (volatile UInt8 *)pg, 0x1000);   /* h92: the QH/qTD pool page */
     /* r46: SEPARATE 20KB (5-page) wired DMA bounce so one BOT command moves up to 40 blocks — one qTD
      * spans 5 buffer pointers = 20KB. Record each page's PHYSICAL address; the pages need not be
      * physically contiguous (the 5 qTD buffer pointers handle the scatter). ~6x fewer BOT commands +
@@ -721,12 +1109,33 @@ int ehci_vhub_xfer_init(void)
         b = (LogicalAddress)(((UInt32)raw2 + 0xFFFUL) & ~0xFFFUL);
         if (LockMemory(b, DOWN_BUF_MAX) != noErr) { gDownInitErr = 5; return -1; }
         gDownBuf = (volatile UInt8 *)b;
+        h92_guard("downbuf", raw2, DOWN_BUF_MAX + 0x1000, gDownBuf, DOWN_BUF_MAX);   /* h92 */
         for (i = 0; i < DOWN_DATA_PAGES; i++) {
             LogicalToPhysicalTable t2; unsigned long c2 = 1;
             t2.logical.address = (LogicalAddress)((UInt8 *)b + i * 0x1000);
             t2.logical.count   = 0x1000;
             if (GetPhysical(&t2, &c2) != noErr) { gDownInitErr = 6; return -1; }
             gDownBufPhys[i] = (UInt32)t2.physical[0].address;
+        }
+    }
+    /* ★★★ THE ENGINE'S OWN BOUNCE. Same wire-and-translate pattern as gDownBuf above, 5 pages to match
+     * epq_issue's five qTD buffer pointers exactly. Small and separate is the whole point: while block I/O
+     * DMAs up to 128 KB through gDownBuf, an enumeration's descriptors and the probe's INQUIRY / READ
+     * CAPACITY / block-0 read land HERE, so the two can never be pointed at the same memory again. */
+    {
+        Ptr raw3 = NewPtrSysClear(ENG_BUF_MAX + 0x1000);
+        LogicalAddress e;
+        if (!raw3) { gDownInitErr = 7; return -1; }
+        e = (LogicalAddress)(((UInt32)raw3 + 0xFFFUL) & ~0xFFFUL);
+        if (LockMemory(e, ENG_BUF_MAX) != noErr) { gDownInitErr = 8; return -1; }
+        gEgBuf = (volatile UInt8 *)e;
+        h92_guard("egbuf", raw3, ENG_BUF_MAX + 0x1000, gEgBuf, ENG_BUF_MAX);   /* h92 */
+        for (i = 0; i < ENG_BUF_PAGES; i++) {
+            LogicalToPhysicalTable t3; unsigned long c3 = 1;
+            t3.logical.address = (LogicalAddress)((UInt8 *)e + i * 0x1000);
+            t3.logical.count   = 0x1000;
+            if (GetPhysical(&t3, &c3) != noErr) { gDownInitErr = 9; return -1; }
+            gEgBufPhys[i] = (UInt32)t3.physical[0].address;
         }
     }
     /* r63: three resident per-endpoint QHs, each with 2 alternating qTDs, all spliced into the async ring.
@@ -854,12 +1263,44 @@ static void epq_issue(EpQ *q, UInt32 len, UInt32 pid, int useBounce, UInt32 dt)
     nxt->token = 0;
     cur->next = ehci_cpu_to_le32(q->tdP[nd]);              /* live qTD -> the new dummy */
     cur->altNext = ehci_cpu_to_le32(EHCI_LINK_TERMINATE);
-    for (i = 0; i < 5; i++) cur->buffer[i] = useBounce ? ehci_cpu_to_le32(gDownBufPhys[i]) : 0;   /* r46: 5 pages -> up to 20KB */
+    /* THE SPLIT: epq_issue has exactly one caller (down_issue), so it is ENGINE-ONLY and points at the
+     * engine's own bounce. Block I/O builds its qTD chains by hand in bio_issue_read/bio_issue_write and
+     * points them at gDownBufPhys[] — the two page tables are now disjoint memory. */
+    for (i = 0; i < ENG_BUF_PAGES; i++) cur->buffer[i] = useBounce ? ehci_cpu_to_le32(gEgBufPhys[i]) : 0;
     __asm__ __volatile__("eieio");                          /* body + new dummy visible BEFORE Active */
     cur->token = ehci_cpu_to_le32(tok);                     /* ACTIVATE — the single Active-setting store, LAST */
     __asm__ __volatile__("eieio");
     q->dummy = (UInt8)nd;
-    gDpQ = q; gDpTd = cur;                                  /* the qTD down_reap polls for completion */
+    gEgQ = q; gEgTd = cur;                                  /* the qTD down_reap polls for the ENGINE slot */
+}
+/* ★★★★★★★ h75 — THE BOT RECOVERY'S TRANSFERS ARE ENGINE TRANSFERS THAT MUST DRIVE THE **BIO** MACHINE.
+ *
+ * ⚠ THIS IS THE h74 REGRESSION, AND IT WAS MINE. All six recovery transfers (the Bulk-Only Reset, the two
+ * CLEAR_FEATURE(HALT)s and their status stages) are CONTROL transfers issued through down_submit, so the
+ * split routed them to the ENGINE slot — while bio_advance, which drives bio_recover_advance, is now called
+ * ONLY from the block-I/O slot. The sequence therefore STARTED AND NEVER ADVANCED: gBioPhase stuck at
+ * REC_RESET_SETUP, bio_kick's `if (gBioPhase != 0) return` never let another request start, every File
+ * Manager read queued and never completed, and the Finder sat on a wristwatch cursor for ever.
+ * ★ That is the m26 run-2 photograph exactly — desktop loaded, watch cursor, no recovery after minutes.
+ * ★ And it is why the single-drive control run PASSED: gDownErr and gDownTimeouts were both 0, so the
+ *   recovery path was never entered at all. The control run could not have caught this.
+ * ⇒ SAME SHAPE AS EVERY OTHER BUG IN THIS DRIVER'S HISTORY: I moved WHERE completions are routed without
+ * moving what DEPENDS on that routing. h7's DEV_ADDR(0) and n19's discarded `dev` argument, once more.
+ *
+ * ⚠ AND WHY THE OBVIOUS ONE-LINER IS WRONG. `if (gBioPhase >= REC_BASE) bio_advance(status);` in the engine
+ * branch would let ANY control completion advance the recovery machine — including an enumeration's
+ * GET_DESCRIPTOR. That is defect 2 from CTL-BULK-SPLIT.md reborn, and the split makes it MORE likely, not
+ * less, because engine and block I/O now genuinely overlap. So the REQUEST carries the ownership: only a
+ * transfer we ourselves submitted as part of the recovery may advance the recovery. */
+static void down_submit(void *pipe, void *upp, volatile UInt8 *buf, UInt32 addr, UInt32 len, UInt32 pid, int bulkEp);
+static void down_submit_recov(volatile UInt8 *buf, UInt32 addr, UInt32 len, UInt32 pid)
+{
+    UInt32 h0 = gDownQHead;
+    down_submit(0, 0, buf, addr, len, pid, -1);          /* -1 = control (ep0), as every recovery phase is */
+    /* Tag the entry that was ACTUALLY queued. down_submit can refuse (oversize) or drop (queue full)
+     * without advancing the head, and tagging a stale slot would hand the recovery someone else's
+     * completion — so only tag when something really was enqueued. */
+    if (gDownQHead != h0) gDownQ[h0 % DOWNQ_N].forBio = 1;
 }
 static void down_issue(volatile DownReq *r)
 {
@@ -869,29 +1310,33 @@ static void down_issue(volatile DownReq *r)
         q = &gCtrlQ;
         if (q->addr != r->addr) epq_program(q, r->addr, 0, 64, 1);   /* (re)point ep0 at this device addr (QH idle) */
         dt = (r->pid == 2) ? 0u : 1u;
-        gDpNpkt = 1;
+        gEgNpkt = 1;
     } else {                                                /* BULK: the endpoint's OWN resident QH (HW toggle) */
         UInt32 m = gBulkEP[r->bulkEp].maxpkt ? gBulkEP[r->bulkEp].maxpkt : 512;
         /* n14 step 3: route to the QH pair of the device that OWNS this endpoint, not to gCur's. With one
          * device this is the same queue head as before; with two it is what keeps their hardware toggles
-         * separate. gDpDev records the owner so down_reap credits the completion to the right device. */
+         * separate. gEgDev records the owner so down_reap credits the completion to the right device. */
         { UInt8 od = gBulkEP[r->bulkEp].dev;
           if (od >= USB_MAX_DEV) od = 0;
-          gDpDev = od;
+          gEgDev = od;
           q = &gDev[od].bulkQ[gBulkEP[r->bulkEp].dirIn ? 1 : 0]; }
         dt = 0;                                             /* ignored for bulk (DTC=0 — HW owns the toggle) */
-        gDpNpkt = (r->len + m - 1) / m; if (gDpNpkt == 0) gDpNpkt = 1;
+        gEgNpkt = (r->len + m - 1) / m; if (gEgNpkt == 0) gEgNpkt = 1;
     }
-    if (r->obig) { UInt32 nn = (r->obiglen > DOWN_BUF_MAX) ? DOWN_BUF_MAX : r->obiglen;   /* large OUT: copy write data to the bounce */
-                   for (i = 0; i < nn; i++) gDownBuf[i] = ((volatile UInt8 *)r->obig)[i]; useBounce = 1; }
-    else if (r->pid == 2 || (r->pid == 0 && r->olen)) { for (i = 0; i < r->olen; i++) gDownBuf[i] = r->obuf[i]; useBounce = 1; }
-    else if (r->pid == 1 && r->len) { useBounce = 1; }        /* IN: HC DMAs into the bounce */
-    gDpUPP = r->upp; gDpPipe = r->pipe; gDpDest = r->dest; gDpLen = r->len; gDpIsIn = (r->pid == 1);
-    gDpBulkEp = r->bulkEp;
-    gDpLastAddr = r->addr; gDpLastPid = r->pid;             /* r36 diag: name the in-flight downstream xfer */
-    gDpArmTick = *(volatile UInt32 *)0x016AUL; gDpBusy = 1;   /* r54: arm the stall watchdog with the 60Hz Ticks clock */
-    gDpMeasured = 0;         /* r74: write/single-qTD data-phase measurement OFF — [dataphase] is now the READ pre-queue's on-the-wire per-command time (fed from down_reap for BIO_PH_PREREAD) */
-    if (gDpMeasured) gDataFr0 = ehci_read32(gSoftc.opBase, EHCI_FRINDEX) & 0x3FFFUL;
+    /* THE SPLIT: stage into the ENGINE's bounce. down_submit has already bounded r->len and r->obiglen to
+     * ENG_BUF_MAX, so these copies cannot overrun; the min() is kept as belt-and-braces. */
+    if (r->obig) { UInt32 nn = (r->obiglen > ENG_BUF_MAX) ? (UInt32)ENG_BUF_MAX : r->obiglen;
+                   for (i = 0; i < nn; i++) gEgBuf[i] = ((volatile UInt8 *)r->obig)[i]; useBounce = 1; }
+    else if (r->pid == 2 || (r->pid == 0 && r->olen)) { for (i = 0; i < r->olen; i++) gEgBuf[i] = r->obuf[i]; useBounce = 1; }
+    else if (r->pid == 1 && r->len) { useBounce = 1; }        /* IN: HC DMAs into the engine bounce */
+    gEgUPP = r->upp; gEgPipe = r->pipe; gEgDest = r->dest; gEgLen = r->len; gEgIsIn = (r->pid == 1);
+    gEgBulkEp = r->bulkEp;
+    gEgLastAddr = r->addr; gEgLastPid = r->pid;             /* r36 diag: name the in-flight downstream xfer */
+    gEgForBio = r->forBio;                                  /* h75: whose state machine this completion drives */
+    /* THE SPLIT: arm the ENGINE's own watchdog. Defect 3 in the doc was that gDpArmTick belonged to
+     * whichever transfer armed last, so an orphaned one was never timed out — which is why gDownTimeouts
+     * read 0 through the whole h16-h18 hunt. Each slot now times itself. */
+    gEgArmTick = *(volatile UInt32 *)0x016AUL; gEgBusy = 1;
     epq_issue(q, r->len, r->pid, useBounce, dt);
 }
 /* ★ n12: return the downstream engine to a clean idle. Called when we abandon a device (a failed
@@ -904,12 +1349,44 @@ static void dp_engine_idle(void)
 {
     gDpBusy = 0; gDpIsIn = 0; gDpBulkEp = -1;
     gDpUPP = 0; gDpPipe = 0; gDpDest = 0; gDpLen = 0; gDpMeasured = 0;
+    /* THE SPLIT: this is the ABANDON path (a failed enumeration, or parking a port), so it must clear BOTH
+     * slots. Leaving the engine slot latched here would reproduce the exact bug this function was written
+     * to cure — down_pump bails on a busy slot, so one abandoned engine transfer would stop us talking to
+     * every later device, which is what "USB stops working until a reboot" was. */
+    gEgBusy = 0; gEgIsIn = 0; gEgBulkEp = -1;
+    gEgUPP = 0; gEgPipe = 0; gEgDest = 0; gEgLen = 0;
     gDownQTail = gDownQHead;                  /* drop anything queued for the abandoned device */
 }
 static void down_pump(void)
 {
     volatile DownReq *r;
-    if (gDpBusy) return;
+    /* ★★★ f4 DIRECTION A — THE STARVATION, MEASURED AT THE ONE PLACE IT HAPPENS.
+     * `if (gDpBusy) return;` with work queued IS the h16/h17 mechanism (docs/CTL-BULK-SPLIT.md): during a
+     * multi-chunk mount read, down_reap -> bio_advance -> bio_start_chunk -> bio_issue_read re-arms the slot
+     * on every completion BEFORE we get a turn, so the queued request is never issued and the probe dies on
+     * bot_step's 800 ms cap. Count it, and measure how long the head request has actually been waiting —
+     * a large gF4PumpMaxWaitMs beside a failed probe names this outright, and zero refutes it.
+     * ⚠ Reads only; the early return below is unchanged. */
+    /* ★★★ THE SPLIT CHANGES THIS TEST, AND THAT IS THE WHOLE POINT OF THE CHANGE.
+     * This used to read `if (gDpBusy) return;` — block I/O's slot — so during a multi-chunk mount read,
+     * where every completion re-arms the next chunk before we get a turn, a queued ENGINE transfer was
+     * never issued at all and the probe died on bot_step's 800 ms cap (f4 direction A, and the verified
+     * h16/h17 root cause). We now gate on the ENGINE's own slot: block I/O being busy is no longer any of
+     * this function's business, because it can no longer be in the way.
+     * ⚠ The f4 direction-A counters are KEPT, deliberately. They should now only ever record the engine
+     * waiting on ITSELF (which is correct and expected — engine transfers are serial by design). If
+     * gF4PumpBlockedByBio is ever non-zero again, the split has been undone somewhere. */
+    if (gEgBusy) {
+        if (gDownQHead != gDownQTail) {
+            UInt32 w = frame_ms() - gDownQ[gDownQTail % DOWNQ_N].qms;
+            gF4PumpBlocked++;
+            if (gF4Owner == F4_OWNER_BIO) gF4PumpBlockedByBio++;
+            if (w > gF4PumpMaxWaitMs && w < 0x40000000UL) {   /* guard a wrapped/unstamped sample */
+                gF4PumpMaxWaitMs = w; gF4PumpMaxWaitOwner = gF4Owner;
+            }
+        }
+        return;
+    }
     if (gDownQHead == gDownQTail) return;
     /* ⚠ h17's CONTROL-PROMOTION SCAN LIVED HERE AND IS REVERTED — it was inert and unproven.
      * The theory was that an enumeration's control phases were queued behind the copy's bulk requests and timed
@@ -930,6 +1407,27 @@ static void down_pump(void)
         gDownQTail++;                          /* discard it; do NOT arm an uncompletable transfer */
         return;
     }
+    if (r->dead) {                             /* h94: the funnel already delivered its substitute completion */
+        gDownQTail++;
+        return;
+    }
+    /* h94, the h81 lesson applied to the USL side: only the issue site knows the truth at the moment it
+     * matters. A request enqueued before the yank must not arm hardware for an absent device — and more to
+     * the point, its completion pointers may already be freed. Bulk names its owner exactly; control is
+     * keyed off the dead-addr ring (positive knowledge only — never off "unknown address", which is what
+     * every Apple-era enumeration looks like). */
+    {   int gone = 0;
+        if (r->bulkEp >= 0) { UInt8 od = gBulkEP[r->bulkEp].dev;
+                              if (od < USB_MAX_DEV && !gDev[od].inUse) gone = 1; }
+        else if (addr_in_dead(r->addr)) gone = 1;
+        if (gone) {
+            retire_enqueue((void *)r->upp, (void *)r->pipe, r->bulkEp < 0);
+            gH94Refused++;
+            ehci_os_ilogx("!! h94: refusing an issue for a rude-removed device (addr)", r->addr);
+            gDownQTail++;
+            return;
+        }
+    }
     down_issue(r);
     gDownQTail++;
 }
@@ -942,8 +1440,21 @@ static void down_submit(void *pipe, void *upp, volatile UInt8 *buf, UInt32 addr,
     h = gDownQHead; depth = h - gDownQTail;
     if (depth >= DOWNQ_N) { gDownQDrop++; return; }
     r = &gDownQ[h % DOWNQ_N];
-    if (len > DOWN_BUF_MAX) len = DOWN_BUF_MAX;
+    /* ★★★ THE LOUD REFUSAL THE DOC ASKED FOR ("true by assertion rather than by luck").
+     * ⚠ THIS WAS A LATENT BUG, not merely tidiness: epq_issue maps FIVE page pointers and this line capped
+     * at DOWN_BUF_MAX = 128 KB, so an engine transfer above 20 KB would have DMA'd off the end of its own
+     * mapping. Unreachable today (control <= 64 B, probe bulk <= 512 B, gPB is exactly 20 KB) but it was one
+     * caller away, and ehci_vhub_bulk_xfer will hand us whatever the USL asks for. Refuse it, say so, and
+     * count it — a silent truncation here would corrupt a transfer rather than fail it. */
+    if (len > ENG_BUF_MAX) {
+        gEgOversize++;
+        ehci_os_ilogx("!! SPLIT: engine transfer larger than ENG_BUF_MAX refused (epq_issue maps only "
+                      "ENG_BUF_PAGES pages; a silent truncation here would corrupt it); bytes", len);
+        return;
+    }
     r->upp = upp; r->pipe = pipe; r->dest = (void *)buf; r->addr = addr; r->pid = (UInt8)pid; r->len = len; r->olen = 0; r->obig = 0; r->bulkEp = bulkEp;
+    r->qms = frame_ms();      /* f4: when this request joined the queue — down_pump measures the wait */
+    r->forBio = 0;            /* h75: plain engine traffic; down_submit_recov overrides this */
     if (pid == 2) { int i; for (i = 0; i < 8; i++) r->obuf[i] = buf[i]; r->olen = 8; r->len = 8; }
     /* ★ Restored 2026-08-01 from the disassembly. For CONTROL transfers (bulkEp < 0) the 8-byte SETUP is
      * ALSO staged into a driver-owned static buffer. The caller's buffer may be a File-Manager or
@@ -998,16 +1509,18 @@ static void bio_advance(long status);           /* forward: driven from down_rea
  * and is the QH overlay Active/Halted? All interrupt-safe register/memory reads; drained by uim23. */
 static volatile UInt32 gToSeq = 0, gToCmd = 0, gToSts = 0, gToAsync = 0, gToQhP = 0;
 static volatile UInt32 gToQhEpChar = 0, gToQhCurQtd = 0, gToQhOvlTok = 0, gToQtdTok = 0;
-static void capture_timeout_state(void)
+/* THE SPLIT: takes the timing-out slot's QH/qTD, because there are now two of them and a snapshot of the
+ * wrong one is worse than none — it would describe a healthy transfer while a different one wedged. */
+static void capture_timeout_state(EpQ *q, ehci_qtd *td)
 {
     gToCmd      = ehci_read32(gSoftc.opBase, EHCI_USBCMD);
     gToSts      = ehci_read32(gSoftc.opBase, EHCI_USBSTS);
     gToAsync    = ehci_read32(gSoftc.opBase, EHCI_ASYNCLISTADDR);
-    gToQhP      = gDpQ ? gDpQ->qhP : 0;                                  /* r63: the ACTIVE endpoint QH/qTD */
-    gToQhEpChar = gDpQ ? ehci_le32_to_cpu(gDpQ->qh->epChar) : 0;
-    gToQhCurQtd = gDpQ ? ehci_le32_to_cpu(gDpQ->qh->curQtd) : 0;
-    gToQhOvlTok = gDpQ ? ehci_le32_to_cpu(gDpQ->qh->ovlToken) : 0;
-    gToQtdTok   = gDpTd ? ehci_le32_to_cpu(gDpTd->token) : 0;
+    gToQhP      = q ? q->qhP : 0;                                        /* r63: the ACTIVE endpoint QH/qTD */
+    gToQhEpChar = q ? ehci_le32_to_cpu(q->qh->epChar) : 0;
+    gToQhCurQtd = q ? ehci_le32_to_cpu(q->qh->curQtd) : 0;
+    gToQhOvlTok = q ? ehci_le32_to_cpu(q->qh->ovlToken) : 0;
+    gToQtdTok   = td ? ehci_le32_to_cpu(td->token) : 0;
     __asm__ __volatile__("eieio");                       /* publish payload before the seq bump */
     gToSeq++;
 }
@@ -1036,73 +1549,154 @@ UInt32 ehci_vhub_timeout_state(UInt32 *cmd, UInt32 *sts, UInt32 *async, UInt32 *
 #define TICKS_NOW (*(volatile UInt32 *)0x016AUL)   /* Ticks: 60.15Hz since boot */
 #define DOWN_WATCHDOG_TICKS (10UL * 60UL)          /* r64 (A2): 10s. r63's per-endpoint HW toggle killed the wedge — a healthy run's worst stall was 50ms — so this is now a genuine-fault backstop, not a hot path. 10s is ~200x the observed max (won't false-fire on this device's flash GC, which the research warns against resetting) yet recovers a true wedge far faster than the 30s r62 test value. A timeout now triggers the CORRECT one-shot BOT reset (below), not a false-failure. Tunable if a slower device needs more patience. */
 static volatile UInt32 gMaxStallTicks = 0;         /* longest observed transfer stall, in 60Hz ticks */
-static void down_reap(void)
+/* ★★★★★★ THE SPLIT: ONE poll implementation, used by BOTH slots.
+ *
+ * Returns 1 when the slot's transfer has finished (status/actual filled in), 0 while it is still running.
+ * ⚠ WRITTEN AS A SHARED HELPER ON PURPOSE. The alternative — copying this logic per slot — would have
+ * duplicated the h57 QH-overlay-halt check, the r53/r54 patience watchdog and the short-transfer accounting,
+ * and every one of those took a hardware cycle to get right. Two copies drift; the second copy is where the
+ * next four-run hunt would come from. The routing that genuinely DIFFERS between slots stays in down_reap.
+ * `len` is the slot's requested length, used only to turn the residue into a delivered byte count. */
+static int slot_poll(EpQ *q, ehci_qtd *td, UInt32 armTick, UInt32 len, long *statusOut, UInt32 *actualOut)
 {
     UInt32 tok; long status; UInt32 actual = 0;
-    if (gDpBusy) {
-        tok = ehci_le32_to_cpu(gDpTd->token);   /* r63: poll the qTD activated on the endpoint's own QH */
-        if (tok & EHCI_QTD_STATUS_ACTIVE) {
-            UInt32 el = TICKS_NOW - gDpArmTick;
-            if (el > gMaxStallTicks) gMaxStallTicks = el;   /* r54: track the device's worst-case GC pause */
-            if (el > DOWN_WATCHDOG_TICKS) { gDownTimeouts++; capture_timeout_state(); status = -6640L; }  /* watchdog + r39 snapshot */
-            else return;
-        } else if (tok & (EHCI_QTD_STATUS_HALTED | EHCI_QTD_STATUS_XACTERR | EHCI_QTD_STATUS_BABBLE | EHCI_QTD_STATUS_DBERR)) {
+    if (!td) return 0;
+    tok = ehci_le32_to_cpu(td->token);      /* r63: poll the qTD activated on the endpoint's own QH */
+    if (tok & EHCI_QTD_STATUS_ACTIVE) {
+        /* h57 (verbatim reasoning, see the long note formerly at this site): a transaction error is retried
+         * CERR times and then the controller HALTS THE QUEUE HEAD. The halt lands in the QH OVERLAY, not in
+         * the qTD we activated, and a halted QH executes nothing queued behind it — so our qTD sits ACTIVE
+         * for ever with a pristine token (CERR 3, no error bits) and polling it alone can never see this.
+         * Measured m8/h56: three control failures, every qTD token ACTIVE/CERR 3/clean, overlay reading
+         * 0x80088148 = HALTED|XACTERR with CERR exhausted to 0.
+         * ⚠ epq_arm_idle from interrupt level is legal HERE AND NOWHERE ELSE: the gate is the HALTED bit
+         * read from hardware, and a halted QH is by definition one the controller has abandoned. Do not
+         * relax that gate and do not lift this call elsewhere. */
+        UInt32 ovl = q ? ehci_le32_to_cpu(q->qh->ovlToken) : 0;
+        if (ovl & EHCI_QTD_STATUS_HALTED) {
+            gQhHalted++;
+            ehci_os_ilogx("!! h57 QH HALTED in the OVERLAY while our qTD still reads ACTIVE — failing "
+                          "fast instead of waiting out the cap; ovlToken", ovl);
+            ehci_os_ilogx("!! h57   qTD token (pristine — this is why we never saw it)", tok);
+            epq_arm_idle(q);         /* clear the halt: safe ONLY because HALTED is set (see above) */
+            gQhUnhalted++;
+            ehci_os_ilog("!! h57   overlay re-initialised — the NEXT attempt starts on a clean endpoint "
+                         "instead of being dead on arrival");
             gDownErr++; status = -6640L;
         } else {
-            UInt32 resid = EHCI_QTD_BYTES_GET(tok);
-            status = 0; gDownDone++;
-            if (gDpMeasured) {   /* r67: data-phase rate — FRINDEX delta (125µs microframes), read BEFORE the copy */
-                UInt32 fr = ehci_read32(gSoftc.opBase, EHCI_FRINDEX) & 0x3FFFUL;
-                gDataFrames += (fr - gDataFr0) & 0x3FFFUL; gDataBytes += gDpLen; gDpMeasured = 0;
-            } else if (gBioPhase == BIO_PH_PREREAD) {   /* r74: ON-THE-WIRE per-command READ time = issue->reap (device latency + xfer
-                                                         * + CSW + the 1 IRQ); accumulated into the [dataphase] fields. Compare the
-                                                         * resulting rate to [speed] end-to-end: [rcmd] >> [speed] => the File Mgr / above-us
-                                                         * overhead is the wall (read-ahead is the lever); [rcmd] ~= [speed] => on-the-wire bound. */
-                UInt32 fr = ehci_read32(gSoftc.opBase, EHCI_FRINDEX) & 0x3FFFUL;
-                gDataFrames += (fr - gDataFr0) & 0x3FFFUL; gDataBytes += gDpLen;
-            }
-            actual = (resid <= gDpLen) ? (gDpLen - resid) : gDpLen;
-            if (gDpIsIn && gDpLen) {
-                volatile UInt8 *dd = (volatile UInt8 *)gDpDest; UInt32 i;
-                for (i = 0; i < actual; i++) dd[i] = gDownBuf[i];
-            }
-            /* r63: NO software toggle advance — with DTC=0 the controller maintains the bulk data toggle
-             * in the endpoint QH overlay across every transfer (the OHCI-style fix for the BOT desync). */
+            UInt32 el = TICKS_NOW - armTick;
+            if (el > gMaxStallTicks) gMaxStallTicks = el;   /* r54: track the device's worst-case GC pause */
+            if (el > DOWN_WATCHDOG_TICKS) { gDownTimeouts++; capture_timeout_state(q, td); status = -6640L; }
+            else return 0;                                  /* still running, and inside its patience budget */
         }
-        if (gDpBulkEp >= 0) {   /* snapshot for the task-context diagnostic log */
+    } else if (tok & (EHCI_QTD_STATUS_HALTED | EHCI_QTD_STATUS_XACTERR | EHCI_QTD_STATUS_BABBLE | EHCI_QTD_STATUS_DBERR)) {
+        gDownErr++; status = -6640L;
+    } else {
+        UInt32 resid = EHCI_QTD_BYTES_GET(tok);
+        status = 0; gDownDone++;
+        actual = (resid <= len) ? (len - resid) : len;
+    }
+    *statusOut = status; *actualOut = actual;
+    return 1;
+}
+
+static void down_reap(void)
+{
+    long status; UInt32 actual = 0;
+
+    /* ---------------- ENGINE slot: control + probe/enumeration bulk ---------------- */
+    if (gEgBusy && slot_poll(gEgQ, gEgTd, gEgArmTick, gEgLen, &status, &actual)) {
+        /* h94 ORPHAN GATE (the backstop; MUST never fire — the disconnect funnel nulls these pointers
+         * first). If this transfer's device has been rude-removed and the funnel somehow did not run,
+         * the client buffer and pipe below may already be FREED by the USL's teardown; writing through
+         * them is the h93-era heap scribble. Suppress the client-memory writes, keep every piece of our
+         * own bookkeeping, and count the save so the periodic dump exposes the funnel's hole. */
+        {   int orphan = 0;
+            if (gEgBulkEp >= 0) { if (gEgDev < USB_MAX_DEV && !gDev[gEgDev].inUse) orphan = 1; }
+            else if (addr_in_dead(gEgLastAddr)) orphan = 1;
+            if (orphan && (gEgUPP || gEgDest)) {
+                gH94Orphaned++;
+                ehci_os_ilogx("!! h94 ORPHAN GATE fired — funnel hole, client writes suppressed; addr",
+                              gEgLastAddr);
+                gEgUPP = 0; gEgPipe = 0; gEgDest = 0;
+            }
+        }
+        if (gEgIsIn && gEgLen) {                       /* copy IN data out of the ENGINE's own bounce */
+            volatile UInt8 *dd = (volatile UInt8 *)gEgDest; UInt32 i;
+            if (dd) for (i = 0; i < actual; i++) dd[i] = gEgBuf[i];
+        }
+        if (gEgBulkEp >= 0) {                          /* probe/enumeration BULK completion */
             UInt32 i; gBulkLastStat = status;
-            if (status == 0) gBulkDoneN++; else gBulkErrN++;
-            for (i = 0; i < 16; i++) gLastData[i] = gDownBuf[i];   /* IN: received CSW/data; OUT: sent CBW */
-        } else {
-            /* h13: a CONTROL completion. Record its verdict and byte count for ctl_step, and bump the serial
-             * LAST so a reader that sees the new serial is guaranteed to see both values with it. */
+            if (status == 0) gBulkDoneN++; else gBulkErrN++;      /* aggregate: any bulk activity */
+            if (status == 0) gEgBulkDoneN++; else gEgBulkErrN++;  /* ENGINE-only: what pb_ready/pb_failed watch */
+            for (i = 0; i < 16; i++) gLastData[i] = gEgBuf[i];
+        } else {                                       /* h13: a CONTROL completion — feed ctl_step */
             gCtlStat = status; gCtlActual = actual;
             __asm__ __volatile__("eieio");
             gCtlSeq++;
         }
-        gDpLastStat = status;                                  /* r36 diag: last downstream reap status */
-        gDpActual = actual;      /* h13: bytes actually delivered — 0 on error/timeout, since `actual` is only
-                                  * computed on the success branch. The control path now validates against it. */
-        gDpBusy = 0;
-        if (gDpUPP) {
-            if (gDpBulkEp >= 0) {   /* v20: defer bulk completion to task level on BOTH machines (was Mini-only via sharedCompanion). The MDD dedicated-line INLINE call intermittently DEADLOCKS Apple's bulk UPP at interrupt level = the pre-mount freeze v18/v19 hit. compl_drain (task level) delivers it. Control completions (gDpBulkEp<0) still go inline below. */
+        gDpLastStat = status; gDpActual = actual;      /* shared "last downstream reap" diagnostics */
+        gEgBusy = 0;
+        if (gEgUPP) {
+            if (gEgBulkEp >= 0) {   /* v20: defer bulk completion to task level (the MDD inline call
+                                     * intermittently deadlocked Apple's bulk UPP at interrupt level) */
                 UInt32 hh = gComplHead;
                 if ((hh - gComplTail) < NCOMPL) {
-                    gComplQ[hh & (NCOMPL - 1u)].upp = (void *)gDpUPP;
-                    gComplQ[hh & (NCOMPL - 1u)].pipe = (void *)gDpPipe;
+                    gComplQ[hh & (NCOMPL - 1u)].upp = (void *)gEgUPP;
+                    gComplQ[hh & (NCOMPL - 1u)].pipe = (void *)gEgPipe;
                     gComplQ[hh & (NCOMPL - 1u)].status = status;
                     gComplQ[hh & (NCOMPL - 1u)].actual = actual;
+                    gComplQ[hh & (NCOMPL - 1u)].twoArg = 0;        /* h94: normal deferred bulk = 3-arg */
                     gComplHead = hh + 1u;
                 } else gComplDrop++;
-            } else if (gDpBulkEp >= 0)
-                ((ehci_usl_intcomplete)gDpUPP)((void *)gDpPipe, status, (unsigned long)actual);
-            else
-                ((ehci_usl_complete)gDpUPP)((void *)gDpPipe, (unsigned long)status);
+            } else
+                ((ehci_usl_complete)gEgUPP)((void *)gEgPipe, (unsigned long)status);
         }
-        if (gBioPhase && !gDpUPP) bio_advance(status);   /* r34/r57: advance the async block-I/O state machine (pass the xfer status for recovery) */
+        /* ⚠ NOTE WHAT IS **NOT** HERE: an unconditional bio_advance. That is defect 2 from
+         * docs/CTL-BULK-SPLIT.md — `if (gBioPhase && !gDpUPP) bio_advance(status)` used to fire for CONTROL
+         * completions too, because our enumeration control transfers pass upp = 0, so a control completion
+         * could advance the BOT state machine with a status that had nothing to do with it.
+         * ★★★★★★ h75 — BUT EXACTLY ONE CLASS OF ENGINE COMPLETION *MUST* DRIVE IT: the BOT recovery's own
+         * control transfers, which are submitted through down_submit_recov and carry forBio. Without this
+         * the recovery starts and never advances, the bio ring never drains, and the Finder hangs on a
+         * wristwatch for ever — the m26 run-2 failure. The tag is what keeps this precise: an enumeration's
+         * control completion still cannot touch the recovery, which is what defect 2 was about. */
+        if (gEgForBio && gBioPhase >= REC_BASE) {
+            gEgForBio = 0;            /* consume it: this completion belongs to exactly one phase */
+            gEgRecovCompl++;
+            bio_advance(status);
+        } else {
+            gEgForBio = 0;
+        }
+    }
+
+    /* ---------------- BLOCK I/O slot: bio_issue_read / bio_issue_write ---------------- */
+    if (gDpBusy && slot_poll(gDpQ, gDpTd, gDpArmTick, gDpLen, &status, &actual)) {
+        if (status == 0) {
+            if (gDpMeasured) {   /* r67: data-phase rate — FRINDEX delta, read BEFORE the copy */
+                UInt32 fr = ehci_read32(gSoftc.opBase, EHCI_FRINDEX) & 0x3FFFUL;
+                gDataFrames += (fr - gDataFr0) & 0x3FFFUL; gDataBytes += gDpLen; gDpMeasured = 0;
+            } else if (gBioPhase == BIO_PH_PREREAD) {   /* r74: on-the-wire per-command READ time */
+                UInt32 fr = ehci_read32(gSoftc.opBase, EHCI_FRINDEX) & 0x3FFFUL;
+                gDataFrames += (fr - gDataFr0) & 0x3FFFUL; gDataBytes += gDpLen;
+            }
+        }
+        if (gDpIsIn && gDpLen) {
+            volatile UInt8 *dd = (volatile UInt8 *)gDpDest; UInt32 i;
+            if (dd) for (i = 0; i < actual; i++) dd[i] = gDownBuf[i];
+        }
+        if (gDpBulkEp >= 0) {
+            UInt32 i; gBulkLastStat = status;
+            if (status == 0) gBulkDoneN++; else gBulkErrN++;
+            for (i = 0; i < 16; i++) gLastData[i] = gDownBuf[i];
+        }
+        gDpLastStat = status; gDpActual = actual;
+        gDpBusy = 0;
+        if (gBioPhase) bio_advance(status);   /* r34/r57: advance the async block-I/O state machine */
     }
     down_pump();
 }
+
 
 /* r36 RELIABILITY: downstream-transfer engine health, read at task level from uim23. If err/timeouts
  * climb WHILE the SanDisk interface is being set up, OUR engine dropped a control transfer and the
@@ -1146,6 +1740,8 @@ static volatile UInt32 gHubPortGoneMask = 0; /* h7: DOWNSTREAM hub ports whose d
 static volatile UInt32 gHubGoneMask = 0;    /* h3: root ports whose claimed HUB was unplugged. Interrupt-set,
                                              * task-logged, so losing a hub (and every drive behind it) is
                                              * visible rather than inferred from drives vanishing. */
+static volatile UInt32 gPortUncedeMask = 0; /* h53: ports UN-CEDED because the companion released OWNER. */
+static volatile UInt32 gH53Unceded = 0;     /* h53: how many times a cede was taken back (0 = never fired) */
 static volatile UInt32 gPortUnparkMask = 0; /* n24: ports un-parked because their device left. Interrupt-set,
                                              * task-logged, so recovering a parked port is visible not silent. */
 static volatile UInt32 gPortOwnedMask = 0;  /* n21: ports enumeration was re-armed on while a live slot already
@@ -1163,9 +1759,54 @@ static volatile UInt32 gSihLastCnt = 0;     /* last (gBulkDoneN+gBulkErrN) the w
 static volatile UInt32 gSihArmTick = 0;     /* gVhubTick when we armed (diag, logged at task level on takeover) */
 static void ase_quiesce(void);     /* r87 fwd decl: stop the async schedule so a QH reprogram is safe */
 static void reconnect_reset(int d); /* r87 fwd decl: bounce-robust reset of stale device state */
+/* ★ h45: these were defined further down, after their first use by the h45 guard below. Moved up - they
+ * are the definition of "an address WE assigned", which the guard has to know. */
+#define SELFENUM_ADDR 1u                 /* base address; device N gets SELFENUM_ADDR + N */
+#define DEV_ADDR(slot) ((UInt32)(SELFENUM_ADDR + (UInt32)(slot)))
+static volatile UInt32 gH45Refused = 0;   /* h45: foreign-address bulk refusals (MUST be 0) */
+/* h46: how many times the h33 K-state cede branch ran. ONE PER LOW-SPEED DEVICE CEDED is correct; the h45
+ * run scored 78 for a single mouse because the branch left gSelfEnumPort aimed at the port it had just given
+ * away. This counter is the discriminator for that fix — see the note at the cede itself. */
+static volatile UInt32 gH46CedeSpinGuard = 0;
 long ehci_vhub_create_bulk(UInt32 addr, UInt32 endpt, UInt32 dirIn, UInt32 maxpkt)
 {
     int i, freeSlot = -1;
+    dead_ring_clear();   /* h94 FAIL-OPEN: a bulk-endpoint registration means this address is a LIVE device
+                          * again (re-enumeration reuses addresses); no stale "dead" entry may outlive it */
+    /* ★★★★★★ h45 — REFUSE A DEVICE APPLE ENUMERATED BEHIND OUR BACK. TWO STACKS, ONE MEDIUM = CORRUPTION.
+     *
+     * ⚠ THE T5b FREEZE (2026-08-10): keyboard ceded on a card port, drive re-inserted into another, and the log
+     * ends with APPLE'S stack driving mass storage through OUR dispatch table:
+     *     uim6 CreateBulkEndpoint devAddr 0x51 endpt 1 dirIn 0
+     *     uim6 CreateBulkEndpoint devAddr 0x51 endpt 2 dirIn 1
+     *     uim7 BulkTransfer ... prevD0_3 0x55534243   <- 'USBC', the Bulk-Only CSW signature
+     * then port 3 goes 0x1005 (WE enable it at high speed), then "SELFPROBE: SIH-armed reconnect takeover",
+     * then the machine freezes. Apple assigned address 0x51; OUR addresses are SELFENUM_ADDR + slot = 1..4.
+     * So Apple enumerated the re-inserted drive on our bus and began SCSI transfers on it while we were
+     * enumerating the same device and arming the r95 takeover. That is the n17 collision class - the one that
+     * corrupted a mounted volume once already - and it is a far worse outcome than any freeze: two independent
+     * stacks issuing writes to one medium.
+     *
+     * ★ APPLE_HIDE is supposed to make this impossible: we hide port connects so Apple's hub driver never
+     * enumerates our devices. Something let a connect through after four cede cycles, and THAT is the bug to
+     * find. But finding it must not risk the medium, so this is the guard: any bulk endpoint request for an
+     * address that is neither our virtual root hub nor one of OUR assigned device addresses is REFUSED and
+     * LOGGED. A refusal turns a freeze (and a possible two-stack write) into a clean, named failure we can
+     * read in the log - Apple's class driver gets an error and gives up, our own enumeration proceeds.
+     * ⚠ This is deliberately a SAFETY NET, not a fix. If it fires, the log line names the address and the next
+     * step is the hide logic in service_ports, not another guess here. */
+    {
+        int ours = (addr == gRootHubAddr);
+        for (i = 0; !ours && i < USB_MAX_DEV; i++)
+            if (addr == DEV_ADDR(i)) ours = 1;                 /* an address WE assigned */
+        if (!ours) {
+            ehci_os_ilogx("!! h45 REFUSED CreateBulkEndpoint for a FOREIGN device address — Apple enumerated a "
+                          "device on our bus behind APPLE_HIDE; two stacks on one medium is the n17 corruption "
+                          "hazard. addr<<16|endpt", (addr << 16) | (endpt & 0xFFFFUL));
+            gH45Refused++;
+            return -1;                                          /* Apple's class driver backs off */
+        }
+    }
     /* ★ n15 FIX: this test is PER-DEVICE. r87 read a new address as "the mounted device reinserted or
      * bounced", which was sound while only one device could exist. With two it is false: a new address
      * usually means a SECOND DEVICE. Enumerating drive B therefore ran reconnect_reset, which wiped slot
@@ -1342,33 +1983,33 @@ static void pb_cbw_dir(int d, const UInt8 *cdb, int cdbLen, UInt32 dataLen, UInt
     gPB[14]=(UInt8)cdbLen;                                                    /* CDB length */
     for (i = 0; i < cdbLen && i < 16; i++) gPB[15+i] = cdb[i];
     gPTag++;
-    gPMark = gBulkDoneN + gBulkErrN; gPErrMark = gBulkErrN;   /* p1b: also snapshot the ERROR count (see pb_failed) */
+    gPMark = gEgBulkDoneN + gEgBulkErrN; gPErrMark = gEgBulkErrN;   /* SPLIT: ENGINE completions only */   /* p1b: also snapshot the ERROR count (see pb_failed) */
     (void)ehci_vhub_bulk_xfer(0, 0, gPB, gBulkEP[gDev[d].pOut].addr, gBulkEP[gDev[d].pOut].endpt, 31, 0);   /* OUT (31B, via obuf) */
 }
 static void pb_cbw(int d, const UInt8 *cdb, int cdbLen, UInt32 dataLen) { pb_cbw_dir(d, cdb, cdbLen, dataLen, 0x80); }  /* data-IN CBW */
 static void pb_in(int d, UInt32 len)   /* read len bytes on the IN endpoint into gPB */
 {
     if (gDev[d].pIn < 0) return;
-    gPMark = gBulkDoneN + gBulkErrN; gPErrMark = gBulkErrN;   /* p1b */
+    gPMark = gEgBulkDoneN + gEgBulkErrN; gPErrMark = gEgBulkErrN;   /* SPLIT: ENGINE completions only */   /* p1b */
     (void)ehci_vhub_bulk_xfer(0, 0, gPB, gBulkEP[gDev[d].pIn].addr, gBulkEP[gDev[d].pIn].endpt, len, 1);     /* IN */
 }
 static void pb_out(int d, UInt32 len)  /* write len bytes from gPB on the OUT endpoint (large OUT via obig) */
 {
     if (gDev[d].pOut < 0) return;
-    gPMark = gBulkDoneN + gBulkErrN; gPErrMark = gBulkErrN;   /* p1b */
+    gPMark = gEgBulkDoneN + gEgBulkErrN; gPErrMark = gEgBulkErrN;   /* SPLIT: ENGINE completions only */   /* p1b */
     (void)ehci_vhub_bulk_xfer(0, 0, gPB, gBulkEP[gDev[d].pOut].addr, gBulkEP[gDev[d].pOut].endpt, len, 0);   /* OUT */
 }
-static int pb_ready(void) { return (gBulkDoneN + gBulkErrN) != gPMark; }      /* prior transfer finished */
+static int pb_ready(void) { return (gEgBulkDoneN + gEgBulkErrN) != gPMark; }  /* SPLIT: MY transfer finished */
 /* ★ p1b: pb_ready() means "the transfer FINISHED" — success OR error. That blindness is why the p1a probe
  * marched straight through a STALLed READ CAPACITY and still published 'Eusb': every state advanced on
  * pb_ready() alone, so a halted endpoint looked like progress and state 5 parsed the leftover CBW bytes
  * ('USBC' = 0x55534243, +1 = the bogus 0x55534244 "block count" in the log). pb_failed() distinguishes them. */
-static int pb_failed(void) { return gBulkErrN != gPErrMark; }                 /* prior transfer ERRORED (e.g. STALL) */
+static int pb_failed(void) { return gEgBulkErrN != gPErrMark; }               /* SPLIT: MY transfer ERRORED */
 #define PB_BE32(o) (((UInt32)gPB[o]<<24)|((UInt32)gPB[(o)+1]<<16)|((UInt32)gPB[(o)+2]<<8)|gPB[(o)+3])
 #define BUF_BE32(b,o) (((UInt32)(b)[o]<<24)|((UInt32)(b)[(o)+1]<<16)|((UInt32)(b)[(o)+2]<<8)|(b)[(o)+3])
 
 /* ==================== r22 (BYPASS m2): synchronous block-read SERVICE for our own disk driver ==========
- * Our block driver is a separate native PEF (installed post-selfprobe, like the eSATA driver) and can't
+ * Our block driver is a separate native PEF (installed post-selfprobe, like the author's earlier disk ndrv) and can't
  * reach this engine by CFM link, so the UIM publishes a service struct via Gestalt('Eusb'): a synchronous
  * BOT-read TVector + the geometry it found. The block driver's kRead calls readFn(lba,count,buf) through
  * the TVector (self-contained across fragments). Completion is SIH/timer-driven, so a task-level spin-wait
@@ -1502,7 +2143,9 @@ void ehci_vhub_health(UInt32 *reject, UInt32 *hiwater, UInt32 *downTimeouts, UIn
  * (ENDPOINT_HALT) on both bulk endpoints + reset the data toggles to DATA0, then RETRY the command. All via
  * ep0 control transfers (down_submit(...,-1)). Bounded by BIO_MAX_RETRY. Recovery phases live above the
  * normal BOT phases (1/2/3) in gBioPhase so the happy path is untouched. */
-#define REC_BASE          20
+/* h75: REC_BASE itself is defined far above, beside the engine slot — down_reap needs it to route a tagged
+ * recovery completion, and down_reap comes long before this block. Kept as ONE definition rather than a
+ * matching pair here: two #defines that must agree is precisely the "second copy" trap. */
 #define REC_RESET_SETUP   20
 #define REC_RESET_STATUS  21
 #define REC_CLRIN_SETUP   22   /* r64: bulk-IN cleared FIRST, per BOT r1.0 §5.3.4 */
@@ -1562,6 +2205,17 @@ static void bio_build_cbw(volatile UInt8 *dst, const UInt8 *cdb, UInt32 dataLen,
  * state, then activate data0 LAST — that single store unparks the whole chain. The gDp state and gDpBusy are
  * set before data0 goes active so an early reap sees the terminal CSW qTD ACTIVE and just waits. Slots:
  * nData + CSW + dummy = at most 9, within the QTD_POOL of 10. */
+/* ★★★ f4 DIRECTION B — BLOCK I/O IS ABOUT TO ARM THE SHARED SLOT. WAS SOMEONE ELSE USING IT?
+ * bio_issue_read/bio_issue_write overwrite the whole gDp* slot with no test of gDpBusy, and that is
+ * DELIBERATE (h18 added the test and froze the machine — see the long note in bio_kick). So the clobber is
+ * a live possibility on every block command, and if it lands on a probe transfer the victim's qTD is
+ * orphaned while BOTH remain live in hardware pointing at the SAME bounce (gDownBuf). That is the only
+ * mechanism on the table that can corrupt the MOUNT'S OWN data, so it is the one worth naming precisely.
+ * ⚠ Observation only — it does not refuse, delay or reorder anything.
+ * ⚠ Defined AFTER gAs (it reads gAs.running), which is declared ~1800 lines below this point. Forward
+ * declaration rather than a duplicate "is an enumeration running" flag: a second copy of state that must be
+ * kept in step with the first is the exact defect shape this driver's whole history is made of. */
+static void f4_note_bio_arm(void);
 static void bio_issue_read(int dv, UInt32 nbytes)
 {
     EpQ *qo = &gDev[dv].bulkQ[0];                                         /* bulk-OUT : CBW */
@@ -1573,6 +2227,7 @@ static void bio_issue_read(int dv, UInt32 nbytes)
     UInt32 cbwTok = EHCI_QTD_STATUS_ACTIVE | EHCI_QTD_CERR(3) | EHCI_QTD_BYTES(31) | EHCI_QTD_PID_OUT;                 /* no IOC */
     UInt32 cswTok = EHCI_QTD_STATUS_ACTIVE | EHCI_QTD_CERR(3) | EHCI_QTD_BYTES(13) | EHCI_QTD_PID_IN | EHCI_QTD_IOC;
     if (nData < 1) nData = 1;
+    f4_note_bio_arm();                                           /* f4: before we overwrite the shared slot */
     base = qi->dummy;                                            /* first data qTD = the parked slot */
     cswSlot = (base + nData) % QTD_POOL;
     dumSlot = (base + nData + 1) % QTD_POOL;
@@ -1607,6 +2262,7 @@ static void bio_issue_read(int dv, UInt32 nbytes)
             gDpBulkEp = gDev[dv].pIn; gDpDev = dv; gDpLastAddr = (gDev[dv].pIn >= 0) ? gBulkEP[gDev[dv].pIn].addr : 0; gDpLastPid = 1;
             gDpQ = qi; gDpTd = csw;                              /* reap the terminal CSW qTD */
             gDpArmTick = TICKS_NOW; gDpBusy = 1;                 /* arm watchdog; busy while the CSW qTD is ACTIVE */
+            gF4Owner = F4_OWNER_BIO;                             /* f4: tag the slot */
             gDataFr0 = ehci_read32(gSoftc.opBase, EHCI_FRINDEX) & 0x3FFFUL;   /* r74: stamp the on-the-wire command START */
             __asm__ __volatile__("eieio");                       /* whole chain + gDp* visible BEFORE data0 Active */
             d->token = ehci_cpu_to_le32(dTok);                   /* ACTIVATE the chain head LAST -> unpark */
@@ -1635,6 +2291,9 @@ static void bio_issue_write(int dv, const void *src, UInt32 nbytes)
     UInt32 cbwTok = EHCI_QTD_STATUS_ACTIVE | EHCI_QTD_CERR(3) | EHCI_QTD_BYTES(31) | EHCI_QTD_PID_OUT;                 /* no IOC */
     UInt32 cswTok = EHCI_QTD_STATUS_ACTIVE | EHCI_QTD_CERR(3) | EHCI_QTD_BYTES(13) | EHCI_QTD_PID_IN | EHCI_QTD_IOC;
     if (nData < 1) nData = 1;
+    /* f4: BEFORE the BlockMoveData — that write lands in gDownBuf, the bounce a victim transfer may still be
+     * DMAing to or from, so the bounce is clobbered here, ahead of the gDp* slot itself at the bottom. */
+    f4_note_bio_arm();
     BlockMoveData(src, (void *)gDownBuf, (Size)nbytes);          /* stage the write data into the DMA bounce */
     down_arm_ase();
     /* --- IN QH: CSW qTD (single, IOC) = the terminal reap. Active now; device NAKs the IN token until it has
@@ -1674,6 +2333,7 @@ static void bio_issue_write(int dv, const void *src, UInt32 nbytes)
     gDpUPP = 0; gDpPipe = 0; gDpDest = 0; gDpIsIn = 0; gDpLen = nbytes; gDpMeasured = 0;
     gDpBulkEp = gDev[dv].pIn; gDpDev = dv; gDpLastAddr = (gDev[dv].pOut >= 0) ? gBulkEP[gDev[dv].pOut].addr : 0; gDpLastPid = 0;
     gDpArmTick = TICKS_NOW; gDpBusy = 1;                          /* busy while the terminal CSW qTD is ACTIVE */
+    gF4Owner = F4_OWNER_BIO;                                      /* f4: tag the slot */
     __asm__ __volatile__("eieio");                               /* CBW body + data chain + gDp* visible BEFORE CBW Active */
     cbw->token = ehci_cpu_to_le32(cbwTok);                       /* ACTIVATE the CBW LAST -> unpark the OUT chain */
     __asm__ __volatile__("eieio");
@@ -1747,6 +2407,7 @@ static void bio_start_chunk(void)                 /* issue the CBW for the curre
         gBioPhase = BIO_PH_PREWRITE;
     }
 }
+static void bio_finish(BioReq *r, long res);      /* h81: bio_kick fails a departed device's request here */
 static void bio_kick(void)                        /* if idle and the queue is non-empty, start the next request */
 {
     if (gBioPhase != 0 || gBioHead == gBioTail) return;
@@ -1768,6 +2429,34 @@ static void bio_kick(void)                        /* if idle and the queue is no
      * heads both already in the async ring, and the controller can execute qTDs on both at once. The
      * serialisation is purely this single software slot. Splitting it is the fix; see the CTL/BULK split. */
     if (!gBioQ[gBioTail % BIOQ_N].ready) return;   /* r+: slot atomically claimed but not yet filled — wait */
+    /* ★★★★★★★ h81 — GUARD AT **ISSUE** TIME, NOT ONLY AT SUBMIT TIME. h80 GUARDED THE WRONG POINT.
+     *
+     * ⚠ h80 put the departed-device check in ehci_usb_submit, and on the m30 run IT FIRED ZERO TIMES while
+     * the machine still died on a yanked drive. The reason is the two-stage path: submit only ENQUEUES into
+     * gBioQ, and the hardware is armed LATER by bio_kick -> bio_start_chunk -> bio_issue_read, which arms
+     * gDp* DIRECTLY and never passes through submit again. So every request the Finder had already queued
+     * BEFORE the yank was issued to absent hardware with no re-check — and the m30 tail shows exactly that:
+     * "h57 QH HALTED in the OVERLAY", ovlToken 0x02000148 = HALTED|XACTERR with CERR EXHAUSTED, on a
+     * 512-byte read. The device was gone; we asked anyway.
+     * ★ THE WINDOW IS REAL AND UNAVOIDABLE AT SUBMIT: a request can sit in the ring for as long as the bio
+     * engine is busy, and the device can leave at any point in that interval. Only the issue site knows the
+     * truth at the moment it matters.
+     * ⇒ gDev[dev].inUse is cleared at INTERRUPT level by the disconnect handler, so this check is correct
+     * here and cannot be starved. offLinErr is n6e/n25's deliberate code: "off-line drive" tells the File
+     * Manager the medium is ABSENT, not DAMAGED, so the volume goes away instead of being called corrupt.
+     * ⚠ bio_finish ends by calling bio_kick again, so a ring full of requests for a departed device drains
+     * one per re-entry — bounded by BIOQ_N (16) and with small frames, which is the same shape the existing
+     * completion path already relies on. */
+    {   BioReq *rq = &gBioQ[gBioTail % BIOQ_N];
+        if (rq->dev < USB_MAX_DEV && !gDev[rq->dev].inUse) {
+            static UInt32 sIssGone = 0;
+            if (sIssGone++ < 32)
+                ehci_os_ilogx("!! h81: block request ISSUE for a device that has been REMOVED — completing "
+                              "offLinErr instead of arming the hardware; slot", (UInt32)rq->dev);
+            bio_finish(rq, (long)offLinErr);
+            return;
+        }
+    }
     gBioResult = 0; gBioRetry = 0;                 /* r57: fresh request -> full retry budget */
     bio_start_chunk();
 }
@@ -1821,8 +2510,12 @@ static void bio_recover_start(int d)
     if (gDev[d].pOut < 0 || gDev[d].pIn < 0) return;
     addr = gBulkEP[gDev[d].pOut].addr;
     gDownRecov++;
+    /* b12: a recovery START is exactly the event the B&W's full-speed stalls hide at LEVEL1 —
+     * the user watches a wristwatch while this machinery cycles. Name it on the '!!' channel. */
+    ehci_os_ilogx("!! b12 BOT RECOVERY START — slot<<16|totalRecoveries (a slow/refusing device or a "
+                  "timeout budget too tight for it)", ((UInt32)d << 16) | (gDownRecov & 0xFFFFu));
     recov_setup(0x21, 0xFF, 0x0000, 0x0000);       /* class, iface recipient; bRequest 0xFF = Bulk-Only Reset; iface 0 */
-    down_submit(0, 0, gRecovSetup, addr, 8, 2, -1);   /* SETUP on ep0 */
+    down_submit_recov(gRecovSetup, addr, 8, 2);   /* h75: SETUP on ep0, TAGGED as the recovery's own */
     gBioPhase = REC_RESET_SETUP;
 }
 /* r64: reset the HOST bulk QH hardware toggles to DATA0, to match the device after a Bulk-Only Reset +
@@ -1854,13 +2547,15 @@ static void bio_recover_advance(long status)
     UInt32 addr = (gDev[d].pOut >= 0) ? gBulkEP[gDev[d].pOut].addr : 0;
     if (status != 0) { bio_finish(r, status); return; }   /* ep0 itself unresponsive -> give up on this request */
     switch (gBioPhase) {
-    case REC_RESET_SETUP:   down_submit(0, 0, gPB, addr, 0, 1, -1); gBioPhase = REC_RESET_STATUS; break;  /* reset STATUS-IN (0 len) */
+    /* h75: every phase below goes out through down_submit_recov so its completion is TAGGED as belonging to
+     * this state machine. A plain down_submit here re-creates the m26 hang exactly. */
+    case REC_RESET_SETUP:   down_submit_recov(gPB, addr, 0, 1); gBioPhase = REC_RESET_STATUS; break;  /* reset STATUS-IN (0 len) */
     case REC_RESET_STATUS:  recov_setup(0x02, 0x01, 0x0000, (UInt16)(gBulkEP[gDev[d].pIn].endpt | 0x80u));   /* CLEAR_FEATURE(HALT) bulk-IN (IN first) */
-                            down_submit(0, 0, gRecovSetup, addr, 8, 2, -1); gBioPhase = REC_CLRIN_SETUP; break;
-    case REC_CLRIN_SETUP:   down_submit(0, 0, gPB, addr, 0, 1, -1); gBioPhase = REC_CLRIN_STATUS; break;
+                            down_submit_recov(gRecovSetup, addr, 8, 2); gBioPhase = REC_CLRIN_SETUP; break;
+    case REC_CLRIN_SETUP:   down_submit_recov(gPB, addr, 0, 1); gBioPhase = REC_CLRIN_STATUS; break;
     case REC_CLRIN_STATUS:  recov_setup(0x02, 0x01, 0x0000, gBulkEP[gDev[d].pOut].endpt);            /* CLEAR_FEATURE(HALT) bulk-OUT */
-                            down_submit(0, 0, gRecovSetup, addr, 8, 2, -1); gBioPhase = REC_CLROUT_SETUP; break;
-    case REC_CLROUT_SETUP:  down_submit(0, 0, gPB, addr, 0, 1, -1); gBioPhase = REC_CLROUT_STATUS; break;
+                            down_submit_recov(gRecovSetup, addr, 8, 2); gBioPhase = REC_CLROUT_SETUP; break;
+    case REC_CLROUT_SETUP:  down_submit_recov(gPB, addr, 0, 1); gBioPhase = REC_CLROUT_STATUS; break;
     case REC_CLROUT_STATUS: bot_reset_host_toggles(d);  /* r64: re-match host QH toggles to the device's post-reset DATA0 */
                             bio_start_chunk();         /* RETRY the timed-out chunk from the CBW (gBioPhase -> 1) */
                             break;
@@ -1944,6 +2639,32 @@ static long ehci_usb_submit(int dev, IOCommandID cmdID, UInt32 lba, UInt32 count
         ehci_os_ilog("!! n20 submit for an out-of-range device slot - refusing");
         ehci_os_ilogx("  dev", (UInt32)dev);
         return -1;
+    }
+    /* ★★★★★★★ h80 — REFUSE I/O FOR A DEVICE THAT IS PHYSICALLY GONE, IMMEDIATELY AND WITHOUT TASK LEVEL.
+     *
+     * ⚠ THE m29 RUN-4 FAULT, and it is the "crash" the user hit by opening a volume whose stick had been
+     * pulled without ejecting. n6e already makes reads fail with offLinErr "once the media is gone" — but
+     * the media-gone flag lives in the BLOCK DRIVER and is set by blk_notify_media(), which issues a
+     * synchronous Device Manager call and therefore runs at TASK LEVEL, off gSelfEnumRearm. On that run
+     * the task-level pump was taking 106.9 SECONDS per turn, so the flag was never set: the medium still
+     * read PRESENT, the Finder's reads were ACCEPTED, issued to a device that was not there, and each one
+     * then sat on the 10 s transfer watchdog. gDownErr reached 2 and the machine looked hung. It was the
+     * File Manager blocking on reads that could never complete.
+     *
+     * ★ THE UIM ALREADY KNOWS BETTER, AND KNOWS IT AT INTERRUPT LEVEL. gDev[dev].inUse is cleared by the
+     * disconnect handler in service_ports the moment the port reports the device gone — no pump, no File
+     * Manager, no waiting. Consulting it here gives n6e's protection on a path that CANNOT be starved.
+     * ⇒ offLinErr (-65) is exactly right and is the code n6e/n25 chose deliberately: "R/W requested for an
+     * off-line drive" tells the File Manager the medium is ABSENT, not DAMAGED, so the OS reports a removed
+     * disk instead of the "there may be a problem with the disk" alert that a generic ioErr produces.
+     * ⚠ ehci_os_ilog, not ehci_os_log: the File Manager re-issues I/O from inside our completion, so this
+     * function is also entered at INTERRUPT level (see the n20 note above). */
+    if (!gDev[dev].inUse) {
+        static UInt32 sGoneN = 0;
+        if (sGoneN++ < 32)          /* bounded: a Finder that keeps asking must not flood the ring */
+            ehci_os_ilogx("!! h80: block I/O for a device that has been REMOVED — refusing with offLinErr "
+                          "instead of issuing it and waiting out the 10 s watchdog; slot", (UInt32)dev);
+        return (long)offLinErr;
     }
     if (depth > gBioHiWater) gBioHiWater = depth;       /* r49: track peak ring occupancy for the thread-B diagnostic */
     { int save = gInSubmit; gInSubmit = save + 1;       /* r+ re-entrancy detector (nested via IOCommandIsComplete) */
@@ -2076,6 +2797,37 @@ static void ehci_vhub_publish_service(void)
     ehci_os_log("=== r34: USB block service published via Gestalt 'Eusb' (sync rw + async submit) ===");
 }
 
+/* ★★★★ h24: publish 'Eusb' AS SOON AS THE CONTROLLER IS UP, from uimInitialize, before any device has
+ * enumerated. Until now the ONLY callers were the post-probe handoff and the legacy sync probe, so the
+ * selector did not exist until a drive had already mounted.
+ *
+ * ★★ WHY, and it is a real chicken-and-egg that voided the n4h USL-pump run (2026-08-08): an external
+ * vehicle can only reach this driver through Gestalt('Eusb') — there is no CFM link into a ROM parcel, and
+ * DoDriverIO is never called (n0). The n4h experiment's idle loop therefore did
+ *     if (Gestalt('Eusb', &v) == noErr && v) { sv->tickFn(); }
+ * which can NEVER fire before the first mount, because the publication it needs is done BY the first mount,
+ * and the first mount needs the tick. The hardware log is unambiguous: init complete, then not one
+ * portmap_tick baseline line and not one tick marker for the rest of the session. Nothing ran at all, which
+ * is also why nothing froze.
+ *
+ * ⚠ SAFE BEFORE A MOUNT, checked rather than assumed:
+ *  - the geometry table already handles it — a slot that has not probed reports blkCnt 0 and present 0, and
+ *    devCount stays 0, so nothing reads as mountable;
+ *  - the block driver is not installed yet, so it cannot bind to a half-ready service (install_block_driver
+ *    still runs only on the probe-success path, which is where the n5 "endpoints missing" guard lives);
+ *  - the one shipping behaviour that changes is the activator's Cmd-Q: ask_driver_to_prepare_quit() treats a
+ *    missing selector as "nothing mounted by us -> safe", and will now call quitFn for real. That is
+ *    harmless — ehci_vhub_prepare_quit -> blk_unmount_our_volumes2 returns 0 on `if (!gBlkDref) return 0;`
+ *    with no block driver installed, so it walks no VCBs and unmounts nothing. It costs one log line.
+ * ★ NewGestaltValue on an already-registered selector simply fails, and the pointer never changes (&gSvc),
+ * so the per-device republication below keeps working exactly as before. */
+void ehci_vhub_publish_service_early(void)
+{
+    ehci_vhub_publish_service();
+    ehci_os_log("=== h24: 'Eusb' published AT INIT (before any device) — an external pump can now find "
+                "tickFn. The n4h run failed here: no selector meant no tick, and no tick meant no mount. ===");
+}
+
 /* ==================== v1 hot re-mount: engine teardown / rebuild (r81) ====================
  * The reliability-critical core of hot re-mount is stopping and restarting the async schedule at
  * runtime. We do NOT unlink our QHs from the ring (the r45/r60 lesson: the ring is ours, resident,
@@ -2103,7 +2855,8 @@ void ehci_vhub_engine_teardown(int resetToggles)
      * are preserved — enumeration owns those, not us. NOTE (C-phase TODO): the real disconnect path
      * must FAIL-COMPLETE any in-flight gBioQ request (IOCommandIsComplete with an error) rather than
      * just dropping it; here the caller guarantees the engine is idle first, so draining is safe. */
-    gDpBusy = 0;
+    gDpBusy = 0; gEgBusy = 0;                  /* THE SPLIT: a teardown must idle BOTH slots, or the engine
+                                                * slot stays latched and down_pump never issues again */
     gBioPhase = 0; gBioRetry = 0; gBioTail = gBioHead; { int _i; for (_i=0;_i<BIOQ_N;_i++) gBioQ[_i].ready = 0; }
     gDownReady = 0; gDownAseOn = 0;            /* rebuild re-enables ASE + readiness */
 }
@@ -2156,14 +2909,90 @@ UInt32 ehci_vhub_simulate_replug(UInt32 n)
 /* Phase 1 r87 (hot re-mount): stop the async schedule so a QH reprogram (create_bulk's epq_program) is safe
  * on a live ring — the r84/r85 freeze. Guarded on gDownAseOn so it is a no-op when the schedule is already
  * stopped (e.g. early boot). The next transfer re-arms ASE via down_arm_ase. */
+/* ★★★★★ INSTRUMENTED: how long does ase_quiesce ACTUALLY spin?
+ *
+ * WHY THIS MATTERS, and it is the one number the app-less design hangs on. The RE of Apple's
+ * USBMassStorageSupport (docs/APPLE-UMSS-RE.md) established that Apple gets to task level with
+ * NMInstall + nmStr=0, whose response procedure runs inside SOME APPLICATION'S EVENT LOOP. If we adopt
+ * that, the bulk-endpoint registration moves there, and create_bulk calls THIS function, whose bound is
+ * 200,000 MMIO reads of USBSTS. Apple never does anything remotely like that from an nmResp — their class
+ * drivers never reprogram a live async schedule — so this is precisely where our needs exceed theirs, and
+ * it has to be measured rather than assumed.
+ *
+ * WHAT IS MEASURED, and why in two units:
+ *   - ITERATIONS is the exact figure, directly comparable to the 200,000 bound, and needs no clock.
+ *   - TIMEBASE TICKS give real time. Deliberately via UpTime(), which this driver ALREADY calls on the
+ *     heartbeat path, rather than AbsoluteDeltaToNanoseconds (InterfaceLib, which we should not enter from
+ *     a driver path) or a raw mftb (this project has a scar from privileged-SPR reads faulting).
+ *     Only the low word is taken: a quiesce is microseconds and cannot wrap it.
+ *   - The tick rate is machine-specific, so it self-calibrates on the heartbeat, which already reads
+ *     UpTime() and already advances the microframe accumulator. gAseTbSpan/gAseUfSpan are that calibration
+ *     pair; 1 microframe = 125 us, so us = ticks * 125 * gAseUfSpan / gAseTbSpan. No division here.
+ *
+ * ★ AND IT CAPTURES A SILENT FAILURE THAT HAS BEEN THERE ALL ALONG: if the loop exhausts its 200,000
+ * iterations WITHOUT the schedule stopping, it falls through and reprograms a QH on a still-running ring
+ * anyway, with nothing logged. That is the documented r84/r85 freeze shape. gAseTimeouts makes it loud.
+ * The early return when the schedule is already stopped is counted separately, because most calls take it
+ * and averaging them in would flatter the result. */
+static volatile UInt32 gAseCalls = 0, gAseSkip = 0, gAseSpun = 0, gAseTimeouts = 0;
+static volatile UInt32 gAseIterLast = 0, gAseIterMax = 0, gAseIterSum = 0;
+static volatile UInt32 gAseTbLast = 0, gAseTbMax = 0;
+static volatile UInt32 gAseTbSpan = 0, gAseUfSpan = 0;   /* calibration, filled on the heartbeat */
+static volatile UInt32 gAseTimeoutKind = 0;              /* 1 = the 10 ms time bound, 2 = the iteration cap */
+
+/* ★★★★★ BOUNDED BY TIME, NOT BY ITERATION COUNT. Measured on hardware 2026-08-07 (MDD, h22):
+ * worst case 1718 iterations = 1.55 ms, mean 950 = 0.85 ms, 0 timeouts, at 0.88 us per MMIO read.
+ *
+ * WHY THIS CHANGED. The old bound was 200,000 iterations, which at that measured cost is ~181 ms. Nothing has
+ * ever come near it (the worst case observed is 0.86% of it), but app-less moves this call inside a
+ * Notification Manager response procedure, which runs in SOME APPLICATION'S EVENT LOOP -- and an nmResp has to
+ * be bounded by what the code ALLOWS, not by what it has happened to do. A sixth of a second of frozen event
+ * loop is not acceptable there; 10 ms is, and is still ~6x the worst case ever seen.
+ *
+ * WHY FRINDEX AND NOT A SOFTWARE CLOCK. FRINDEX is the controller's own microframe counter, 125 us per tick.
+ * It needs no calibration (unlike UpTime, whose rate is machine-specific), it is available immediately at boot
+ * (unlike our heartbeat-fed frame_ms, which would deadlock this loop if the heartbeat could not run), and it is
+ * one more read of a register we are already polling. 14 bits, wrapping every 2.048 s, so the masked
+ * subtraction is wrap-safe for a 10 ms window.
+ *
+ * ★ AND THE FROZEN-COUNTER CASE IS NOT A HANG: FRINDEX only advances while the controller is running, and a
+ * controller that is not running has ASS clear, so the very first status read below exits the loop. The
+ * iteration cap is therefore pure paranoia -- kept, but lowered from 200,000 to 20,000 (~11x the worst case
+ * ever observed) so that even the impossible case is bounded work.
+ * The clock is read once per 256 status reads (~225 us at the measured cost), which bounds the overshoot to
+ * well under the 10 ms budget while adding ~0.4% to the loop. */
+#define ASE_QUIESCE_LIMIT_US   10000UL
+#define ASE_QUIESCE_LIMIT_UF   (ASE_QUIESCE_LIMIT_US / 125UL)   /* microframes = 80 */
+#define ASE_QUIESCE_ITER_CAP   20000L                            /* backstop only; see above */
+
 static void ase_quiesce(void)
 {
     volatile void *op = gSoftc.opBase;
     long spin;
-    if (!gDownAseOn) return;
+    UInt32 tb0, uf0;
+    int timedOut = 0;
+    gAseCalls++;
+    if (!gDownAseOn) { gAseSkip++; return; }
+    tb0 = UpTime().lo;
+    uf0 = ehci_read32(op, EHCI_FRINDEX) & 0x3FFFUL;
     ehci_write32(op, EHCI_USBCMD, ehci_read32(op, EHCI_USBCMD) & ~EHCI_CMD_ASE);
-    for (spin = 0; spin < 200000; spin++)
-        if (!(ehci_read32(op, EHCI_USBSTS) & EHCI_STS_ASS)) break;   /* wait for the schedule to actually stop */
+    for (spin = 0; spin < ASE_QUIESCE_ITER_CAP; spin++) {
+        if (!(ehci_read32(op, EHCI_USBSTS) & EHCI_STS_ASS)) break;   /* the schedule actually stopped */
+        if ((spin & 0xFF) == 0xFF) {                                 /* check the clock 1 read in 256 */
+            UInt32 d = (ehci_read32(op, EHCI_FRINDEX) - uf0) & 0x3FFFUL;
+            if (d >= ASE_QUIESCE_LIMIT_UF) { timedOut = 1; break; }
+        }
+    }
+    if (spin >= ASE_QUIESCE_ITER_CAP) timedOut = 2;                  /* the paranoia backstop fired */
+    {   UInt32 dt = UpTime().lo - tb0;                               /* unsigned: wrap-safe for a short span */
+        gAseTbLast = dt; if (dt > gAseTbMax) gAseTbMax = dt; }
+    gAseSpun++;
+    gAseIterLast = (UInt32)spin; gAseIterSum += (UInt32)spin;
+    if ((UInt32)spin > gAseIterMax) gAseIterMax = (UInt32)spin;
+    /* ★ Still the same silent failure it always was: we are about to reprogram a QH on a ring that did not
+     * stop, which is the documented r84/r85 freeze shape. Now it is bounded AND counted, and the two causes
+     * are distinguished so a future log says which limit was hit. */
+    if (timedOut) { gAseTimeouts++; gAseTimeoutKind = (UInt32)timedOut; }
     gDownAseOn = 0;
 }
 /* Phase 1 r87 (hot re-mount, bounce-robust): reset the stale device state on a POST-MOUNT re-enumeration at a
@@ -2178,7 +3007,8 @@ static void reconnect_reset(int d)
     int i;
     ehci_os_log("=== RECONNECT: post-mount re-enumeration at a new address — reset stale state (r88) ===");
     epq_arm_idle(&gDev[d].bulkQ[0]); epq_arm_idle(&gDev[d].bulkQ[1]);   /* fresh device => bulk toggles back to DATA0 */
-    gDpBusy = 0; gBioPhase = 0; gBioRetry = 0; gBioTail = gBioHead; { int _i; for (_i=0;_i<BIOQ_N;_i++) gBioQ[_i].ready = 0; }   /* idle the BOT/down engine */
+    gDpBusy = 0; gEgBusy = 0;   /* THE SPLIT: both slots — see the teardown note in the rebuild path */
+    gBioPhase = 0; gBioRetry = 0; gBioTail = gBioHead; { int _i; for (_i=0;_i<BIOQ_N;_i++) gBioQ[_i].ready = 0; }   /* idle the BOT/down engine */
     gFenceApple = 0;                                     /* r93: do NOT fence during Apple's reconnect probing. r90 set this to
                                                           * 1 immediately, to "free the pump" for a self-probe we now know was
                                                           * never being CALLED post-reconnect (not starved) — r92's tickFn is
@@ -2191,6 +3021,13 @@ static void reconnect_reset(int d)
     gDev[d].pstate = 0; gPIdle = 0; gPLastCnt = 0;              /* self-probe re-runs from the top (passive park-wait, as at boot) */
     gDev[d].probedPort = -1;                             /* n13: no device is probed once the state is reset */
     gDev[d].pOut = gDev[d].pIn = -1;                                   /* pb_find_eps re-selects the CURRENT device's endpoints */
+    /* ★ I3, and it is what makes the I15 guard at the exposure honest. This function resets a slot
+     * completely — pstate, probedPort, endpoints, its gBulkEP[] entries — and left the GEOMETRY behind, so a
+     * slot that had lost its device kept reporting the departed drive's block count until some later probe
+     * overwrote it. Harmless while nothing read it before a rewrite; not harmless once "gDevBlkCnt != 0" is
+     * being used to mean "THIS device was probed". Reset per-operation state at the transition that changes
+     * its meaning. Found by the §7 write-site sweep, not on hardware. */
+    gDevBlkCnt[d] = 0; gDevBlkSize[d] = 512;
     for (i = 0; i < NBULK; i++)                          /* n15: drop only THIS device's stale regs. Clearing
         if (gBulkEP[i].dev == (UInt8)d) gBulkEP[i].used = 0;   /* the whole table destroyed the other devicers) */
     gDownReady = 1;                                      /* engine ready; ASE re-arms on the next transfer */
@@ -2219,8 +3056,8 @@ void ehci_vhub_loopcrumb(UInt32 tag)
 }
 /* ================================================================================================
  * PHASE 1b: control transfers, the error-checked BOT probe, self-enumeration, and the n5 async engine.
- * RECONSTRUCTED 2026-08-01 from verbatim fragments captured before
- * the file was lost. Placed here because it needs recov_setup,
+ * RECONSTRUCTED 2026-08-01 from verbatim source fragments captured before the file was lost.
+ * Placed here because it needs recov_setup,
  * bot_reset_host_toggles, ase_quiesce and reconnect_reset, and must precede selfprobe_tick.
  * ================================================================================================ */
 
@@ -2344,6 +3181,16 @@ static int pb_unit_ready(void)
  * there is no media. One-shot: installing twice would add a duplicate Drive-Queue entry. */
 static int   gBlkInstalled = 0;
 static short gBlkDref = 0;
+static void h41_queue_dump(const char *when);   /* h41: defined further down, used by as_tick */
+static volatile UInt32 gH41LateDue;              /* h41: one-shot post-mount dump deadline */
+/* ★★★★★★ f4: AN EARLY VERDICT DEADLINE, BECAUSE THE MACHINE DIED INSIDE THE LATE ONE.
+ * m24 crashed within 15 s of the exposure — the h41 +15 s dump NEVER FIRED, which is itself how we know
+ * the death was inside that window. Hanging the f4 verdict solely off that deadline would have reproduced
+ * the exact failure the whole run exists to avoid: the evidence dies with the machine.
+ * ⇒ Two deadlines. +5 s guarantees a floor (the mount attempt has begun; any clobber during it is already
+ * counted), +15 s gives the full window. Both print; the labels say which is which. Cheap insurance against
+ * losing a reboot. */
+static volatile UInt32 gF4EarlyDue;
 /* n4c: tell the ALREADY-INSTALLED block driver that the media state changed, via its private
  * kCsUsbDiskMedia control (magic-guarded; see usb_disk.c). This is the piece hot-plug was missing: the
  * re-enumeration and re-probe were always correct, but AddDrive + PostEvent(diskEvt) live in the block
@@ -2392,7 +3239,7 @@ static int    gNMPosted = 0;
  * the slot is what lets the removal path retract exactly the right notification. */
 static int    gNMDev = -1;
 /* ★ n8: WORD-FOR-WORD Apple. Recovered from their USB Mass Storage Support extension's resource fork
- * (Apple's own USBMassStorageSupport resources), which carry this exact text with the device name substituted
+ * (USBMassStorageSupport's own resources), which carries this exact text with the device name substituted
  * between Mac Roman curly quotes (0xD2/0xD3) and CR (\r) as the line break:
  *
  *   Please reconnect the USB device "^".
@@ -2433,6 +3280,7 @@ static void capture_device_name(int dev, const UInt8 *inq)
  *    The cartridge will not be remounted until it is removed from the drive."
  * Posted when the Finder ejects our volume, which is the case the user showed had no message at all. */
 static void notify_reconnect(const unsigned char *volName);
+static void notify_rude_removal(const unsigned char *volName);   /* h82: Apple's "unexpectedly disconnected" */
 /* ★ n24: takes the SLOT being ejected, so the alert names the drive the user actually ejected.
  * Signature change is safe against the n4g activator: ejectFn sits at offset 88, AFTER the activator's
  * view of gSvc (which ends at quitFn, offset 80) and the activator never calls it. The only caller is the
@@ -2586,6 +3434,10 @@ static long blk_unmount_our_volumes2(int notifyIfBusy, int onlyAbsentMedia)
             pb.volumeParam.ioVRefNum    = vcb->vcbVRefNum;
             e = PBUnmountVol((ParmBlkPtr)&pb);
             ehci_os_logx("n7 UnmountVol on our volume, err", (UInt32)(long)e);
+            /* ★ h82: a SUCCESSFUL unmount on the onlyAbsentMedia path IS a rude removal — the volume was
+             * still mounted when the device physically left. A clean eject has already torn the VCB down,
+             * so this loop never sees it and stays silent, which is correct and matches Apple. */
+            if (e == noErr && onlyAbsentMedia) notify_rude_removal(nm);
             if (e != noErr) {
                 busy++;
                 /* Busy (fBsyErr = open files) — Apple's exact fallback: ask for the device back. */
@@ -2600,6 +3452,79 @@ static long blk_unmount_our_volumes2(int notifyIfBusy, int onlyAbsentMedia)
 }
 /* n23: a REMOVAL unmounts only the drive that actually went away (onlyAbsentMedia = 1). */
 static void blk_unmount_removed_volumes(void) { (void)blk_unmount_our_volumes2(1, 1); }
+
+/* ★★★★★★★ h82 — "The device for disk X was unexpectedly disconnected." APPLE'S OWN ALERT, VERBATIM.
+ *
+ * ⚠ AND IT CORRECTS SOMETHING I TOLD THE USER. After m31 I said Apple is silent when an IDLE drive is
+ * removed, citing n25. n25 is right about a CLEAN removal — eject first, then unplug — but the user
+ * photographed Apple's OHCI stack on a RUDE removal (unplug while still mounted) and it shows this alert.
+ * We were silent in BOTH cases. That is the gap.
+ *
+ * ★ THE STRINGS ARE APPLE'S, RECOVERED BYTE-EXACT from the Mac OS 9.2.2 install image, where they sit in
+ * the SYSTEM string table beside "The disk X appears to be damaged" and the UPS/thermal messages — NOT in
+ * USBMassStorageSupport's STR# 128, which has no such case. The stored form is
+ *     "The device for disk \xD2" <name> "\xD3 was unexpectedly disconnected." \r\r
+ *     "To prevent data loss, always use the Finder to \xD2Put Away\xD3 a disk before disconnecting its disk device."
+ * The \r\r is the headline/explanation break, which is exactly StandardAlert's two-argument form.
+ * 0xD2/0xD3 are MacRoman curly quotes — they MUST stay as raw bytes; typing ASCII quotes would visibly
+ * differ from Apple's alert, and matching Apple word for word is this project's standing rule.
+ *
+ * ★★ WHY StandardAlert IS SAFE FROM HERE, and why n26's note said otherwise. n26 recorded that drawing a
+ * real alert "needs a task-level APPLICATION context" and declined to try. docs/APPLE-UMSS-RE.md later
+ * disassembled Apple's presenter and found the opposite: StandardAlert is called with NO BeginSystemMode
+ * wrapper — system mode wraps only the hand-built GetNewDialog+ModalDialog fallback. The Notification
+ * Manager response context is by itself sufficient. This runs on exactly that path (selfprobe_tick).
+ * ⚠ StandardAlert lives in AppearanceLib, which we do not link. Apple reaches it as a weak import and, if
+ * unresolved, via GetSharedLibrary/FindSymbol — the same CFM route h48 already uses. Resolved ONCE and
+ * cached; if it cannot be resolved we simply skip the alert. FAIL SILENT, NEVER FAIL LOUD: this is a
+ * courtesy message, and it must never be able to take down a stack that took this long to stabilise. */
+typedef pascal OSErr (*StandardAlertProc)(short, StringPtr, StringPtr, void *, short *);
+static StandardAlertProc gStdAlert = 0;
+static int gStdAlertTried = 0;
+static StandardAlertProc resolve_standard_alert(void)
+{
+    CFragConnectionID cid; Ptr mainAddr; Str255 err;
+    if (gStdAlertTried) return gStdAlert;
+    gStdAlertTried = 1;
+    if (GetSharedLibrary("\pAppearanceLib", kPowerPCCFragArch, kLoadCFrag, &cid, &mainAddr, err) == noErr) {
+        CFragSymbolClass cls; Ptr sym = 0;
+        if (FindSymbol(cid, "\pStandardAlert", &sym, &cls) == noErr && sym)
+            gStdAlert = (StandardAlertProc)sym;
+    }
+    ehci_os_logx("h82: StandardAlert resolved from AppearanceLib (0 = unavailable, alert will be skipped)",
+                 (UInt32)(gStdAlert ? 1 : 0));
+    return gStdAlert;
+}
+static void notify_rude_removal(const unsigned char *volName)
+{
+    /* Apple's bytes. \xD2 = left curly quote, \xD3 = right curly quote (MacRoman). */
+    static const char kHeadPre[]  = "The device for disk \xD2";
+    static const char kHeadPost[] = "\xD3 was unexpectedly disconnected.";
+    static const char kExpl[]     = "To prevent data loss, always use the Finder to \xD2Put Away\xD3 "
+                                    "a disk before disconnecting its disk device.";
+    StandardAlertProc sa = resolve_standard_alert();
+    Str255 head, expl;
+    UInt32 i, n = 0;
+    if (!sa) return;                                   /* fail silent — see the note above */
+    for (i = 0; kHeadPre[i] && n < 254; i++)  head[++n] = (unsigned char)kHeadPre[i];
+    if (volName) for (i = 1; i <= volName[0] && n < 254; i++) head[++n] = volName[i];
+    for (i = 0; kHeadPost[i] && n < 254; i++) head[++n] = (unsigned char)kHeadPost[i];
+    head[0] = (unsigned char)n;
+    n = 0;
+    for (i = 0; kExpl[i] && n < 254; i++) expl[++n] = (unsigned char)kExpl[i];
+    expl[0] = (unsigned char)n;
+    {   short hit = 0;
+        /* ★★★★ h86 — NIL alertParam, NOT a hand-laid struct. h82 laid AlertStdAlertParamRec out by hand
+         * "so we need no Dialogs.h", and that is exactly what broke it: Dialogs.h wraps the real struct in
+         * #pragma options align=mac68k (2-byte), the by-hand copy got PPC natural alignment, so filterProc
+         * and every field after it sat +2 from where StandardAlert reads. PROVEN CALLED AND SILENT on m32:
+         * three yanks, gate noErr x3, resolver ok, "h82: posting" logged x3, nothing drawn.
+         * nil is the DOCUMENTED all-defaults form — one OK button, not movable — which is precisely
+         * Apple's own alert. No struct, no alignment question, nothing left to be wrong. */
+        ehci_os_log("h82: posting Apple's \"unexpectedly disconnected\" alert for a RUDE removal");
+        (void)(*sa)(1 /* kAlertNoteAlert */, head, expl, 0 /* nil = defaults */, &hit);
+    }
+}
 
 /* ★★ n8: CLEAN QUIT. The activator calls this through the 'Eusb' service BEFORE it exits.
  * WHY IT EXISTS (found on hardware): quitting the activator with a drive still mounted SHADOWED the
@@ -2688,9 +3613,17 @@ static void compl_drain(void)   /* MINI FIX: deliver deferred Apple bulk complet
         UInt32 t = gComplTail & (NCOMPL - 1u);
         void *upp = gComplQ[t].upp, *pipe = gComplQ[t].pipe;
         long st = gComplQ[t].status; UInt32 act = gComplQ[t].actual;
+        UInt8 two = gComplQ[t].twoArg;
         gComplTail++;
-        if (upp) ((ehci_usl_intcomplete)upp)(pipe, st, (unsigned long)act);
+        if (upp) {
+            if (two) ((ehci_usl_complete)upp)(pipe, (unsigned long)st);   /* h94: retired control (2-arg) */
+            else ((ehci_usl_intcomplete)upp)(pipe, st, (unsigned long)act);
+        }
     }
+    /* h94: everything queued (including any substitute completions for a rude removal) has now been
+     * DELIVERED at task level — the clients' memory was still live when they ran. Only now may the USL be
+     * told the port changed; releasing the hold here is what makes that ordering a real happens-before. */
+    gH94Hold = 0;
 }
 /* v22: mirror of the block driver's gCsLog (usb_disk.c), published via Gestalt('Ucsl'). Lets the UIM dump
  * the FM-level Prime trace into the reliable EHCIUIM log. Layout MUST match usb_disk.c exactly. */
@@ -2715,11 +3648,10 @@ static DioLogMirror *gDioLogPtr = 0;
  *
  * The address is now derived from the device SLOT, so each device has its own. These live in our own
  * namespace (Apple's hub sits far higher), and USB_MAX_DEV is at most 4, so 1..4 is safe. */
-#define SELFENUM_ADDR 1u                 /* base address; device N gets SELFENUM_ADDR + N */
-#define DEV_ADDR(slot) ((UInt32)(SELFENUM_ADDR + (UInt32)(slot)))
 static volatile int   gSelfEnumDone = 0; /* 1 once endpoints are registered (or the port went to the companion) */
 static int            gSelfEnumPort = -1;
 static UInt32         gSelfEnumTries = 0;
+static volatile UInt8 gBounceCnt[15];      /* h33: consecutive reset-bounces per root port; 3 = cede, not strand */
 static volatile int   gSelfEnumRearm = 0;  /* set at ISR when an ENUMERATED device is pulled; consumed at task
                                             * level, because reconnect_reset does File-Mgr logging and must
                                             * NOT run at interrupt level */
@@ -2962,15 +3894,166 @@ static void ctl_begin(UInt8 bmRT, UInt8 bReq, UInt16 wValue, UInt16 wIndex,
  * counter as gDownDone — so before h13 an errored or timed-out phase read as a successful one and this
  * function returned 1 (complete). The caller then parsed whatever was already in its buffer. gDpLastStat is
  * the reap's verdict (0 = clean, -6640 = error/watchdog), so each phase now checks it. */
+/* ★★★★★★ h54 — THE CONTROL-FAILURE PROBE. Diagnostic only: it changes NO behaviour and is the entire
+ * point of the m6 ROM.
+ *
+ * ⚠ WHAT IT IS FOR. On the mini, a drive attached at COLD BOOT enables at high speed on every attempt
+ * (PORTSC 0x1005) and then its first control transfer to address 0 dies three times, and the port is parked.
+ * The in-flight dump from 2026-08-11 read gAs.pc 2, gDownDone 1 (only the SETUP retired), gIsrHits 3, and
+ * gDownErr / gDownTimeouts BOTH 0 — issued, never reaped, invisible to the watchdog, which is the recorded
+ * h18 signature. The MDD does the same thing successfully (h47+v8 phase 1, four clean runs), so this is
+ * mini-specific, and the mini-specific thing on this path is sharedCompanion = 1: our ISR chains Apple's on
+ * every one of our own interrupts.
+ *
+ * ★ AND THE EXISTING LOG CANNOT TELL US WHICH FAILURE IT IS. "control transfer FAILED at step 0x02" prints
+ * the AS_CTL label, not gCtl.pc, so SETUP / DATA-IN / STATUS are indistinguishable, and a timeout is
+ * indistinguishable from a transfer that reported an error. This prints both, plus the four things that
+ * separate the candidates:
+ *
+ *   qTD token, bit 7 ACTIVE:  SET   -> the controller NEVER finished it  => a schedule / doorbell problem
+ *                             CLEAR -> it finished and WE NEVER REAPED   => the SIH / reap path
+ *   USBINTR:                  0     -> our interrupts are still MASKED. The ISR masks on entry and only the
+ *                                      SIH restores them, so 0 here means the SIH did not get to run.
+ *   FRINDEX:                  frozen across the three failures => the controller's schedule is not running
+ *                                      at all, which is a different fault again.
+ *   gSihRuns:                 flat across the failures => the SIH is starved (the shared-line suspicion);
+ *                                      climbing => it runs and the reap still misses.
+ *
+ * ⚠ ilogx ONLY — ctl_step runs from the SIH, and ehci_os_log is synchronous File Manager I/O, which hangs
+ * the machine below task level. This has bitten three times (r18, n4, the r95 bulk trace). */
+/* ★ h55: the CONTROL per-phase cap. Was 800 ms since the engine was written; r53 raised the BULK watchdog to
+ * 10 s for a NAKing device and never revisited this one. 5 s sits comfortably inside that 10 s backstop.
+ * ⚠ Deliberately NOT applied to pb_ctrl_phase (the blocking task-level form) — a different, largely dead path;
+ * changing something this run does not exercise would only add risk. */
+#define CTL_PHASE_MS 5000UL
+/* ★★★★★★ h55 — THE CAP, AND THE DUMP THAT THE CAP WAS HIDING.
+ *
+ * ⚠⚠ TWO READINGS SURVIVED h54, AND THIS BUILD SEPARATES THEM. h54 measured, in all three failures: qTD
+ * ACTIVE, CERR = 3, no error bits, not halted, USBINTR 0x7 (not masked), gSihRuns climbing (SIH alive),
+ * FRINDEX moving and both schedules enabled. So the qTD was armed and never executed. That leaves:
+ *   (a) THE DEVICE IS NAKing — busy after its power-cycle. A NAK does NOT decrement CERR, which is exactly
+ *       why CERR reads an untouched 3. ★ THIS PROJECT HAS SEEN THIS SIGNATURE BEFORE AND CALLED IT CORRECTLY:
+ *       the r53 fix quotes the r39 snapshot as "qTD ACTIVE, CERR=3 (no errors), NOT halted ... schedule
+ *       running on our QH -- i.e. a BUSY device, not a fault", and the answer there was PATIENCE.
+ *   (b) THE QH IS UNREACHABLE — active, but the async ring does not reach it.
+ *
+ * ★ CHANGE 1, THE CAP. r53 raised the BULK watchdog to 10 s for exactly reading (a) and the CONTROL phase cap
+ * was never revisited: it is still 800 ms, TWELVE TIMES shorter, and it is what gives up here. CTL_PHASE_MS
+ * takes it to 5 s — still well inside the 10 s down watchdog, and Apple's own stack uses ~30 s.
+ * ⚠ COST IF (b) IS RIGHT: three attempts at 5 s = ~15 s before the port parks, so on the mini the keyboard
+ * stays hostage ~15 s instead of ~2.4 s. Known, accepted for one run, and flagged in the test card.
+ *
+ * ★ CHANGE 2, THE DUMP. capture_timeout_state() already snapshots USBCMD / USBSTS / ASYNCLISTADDR / the QH
+ * address / epChar / curQtd / ovlToken / the qTD token — precisely what separates (a) from (b). It has never
+ * run on this path because it hangs off the 10 s down watchdog, and the 800 ms control cap always fired
+ * first. So the one dump that could settle this was itself unreachable. Now the control failure calls it.
+ *
+ * ★★ HOW TO READ IT: ovlToken/curQtd pointing at our ACTIVE qTD, with ASYNCLISTADDR reaching gCtrlQ.qhP,
+ * means the controller IS parked on our QH and the device is simply not answering => (a). A terminated or
+ * stale overlay, or an anchor link that does not lead to our QH, means => (b), and gDownRelink/gLastAnchorLink
+ * say whether the r60 backstop ever noticed. */
+static void h54_ctl_fail(void)
+{
+    /* THE SPLIT: control now lives in the ENGINE slot, so this diagnostic must read gEg*. Pointing it at
+     * gDp* would describe BLOCK I/O's transfer while a CONTROL transfer failed — a diagnostic that lies,
+     * which is I10 and has cost this project cycles four times. */
+    UInt32 tok = gEgTd ? ehci_le32_to_cpu(gEgTd->token) : 0xFFFFFFFFUL;
+    volatile void *op = gSoftc.opBase;
+    capture_timeout_state(gEgQ, gEgTd);   /* h55: fill the gTo* snapshot on THIS path for the first time */
+    ehci_os_ilogx("!! h54 CTL FAIL: gCtl.pc<<16|gCtlStat (pc 1=SETUP 2=DATA-IN 3=STATUS)",
+                  ((UInt32)gCtl.pc << 16) | (gCtlStat & 0xFFFFUL));
+    ehci_os_ilogx("!! h54   ms waited in this phase (>800 = the cap fired; <800 = a status error)",
+                  frame_ms() - gCtl.t0);
+    ehci_os_ilogx("!! h54   ★ qTD TOKEN — bit 7 (0x80) SET = controller NEVER finished it; CLEAR = it "
+                  "finished and WE NEVER REAPED", tok);
+    ehci_os_ilogx("!! h54   ★ USBINTR — 0 = OUR INTERRUPTS ARE STILL MASKED (ISR masks, only the SIH restores)",
+                  op ? ehci_read32(op, EHCI_USBINTR) : 0xFFFFFFFFUL);
+    ehci_os_ilogx("!! h54   USBSTS", op ? ehci_read32(op, EHCI_USBSTS) : 0xFFFFFFFFUL);
+    ehci_os_ilogx("!! h54   ★ FRINDEX — frozen across the three failures = the schedule is not running",
+                  op ? ehci_read32(op, EHCI_FRINDEX) : 0xFFFFFFFFUL);
+    ehci_os_ilogx("!! h54   ★ gSihRuns — flat across the failures = the SIH is STARVED", gSihRuns);
+    ehci_os_ilogx("!! h54   gSihQueued<<16|gIsrConsec", ((UInt32)gSihQueued << 16) | (gIsrConsec & 0xFFFFUL));
+    ehci_os_ilogx("!! h54   gIsrHits", gIsrHits);
+    ehci_os_ilogx("!! h54   gDownDone<<16|gDownErr", ((gDownDone & 0xFFFFUL) << 16) | (gDownErr & 0xFFFFUL));
+    ehci_os_ilogx("!! h54   gDownTimeouts<<16|gEgBusy (engine slot)", ((gDownTimeouts & 0xFFFFUL) << 16) | (UInt32)(gEgBusy & 1));
+    ehci_os_ilogx("!! h54   gVhubTick (8 ms heartbeat — advancing = the SIH source is alive)", gVhubTick);
+    /* ---- h55: the snapshot that the 800 ms cap has been hiding. THESE FOUR SETTLE (a) vs (b). ---- */
+    ehci_os_ilogx("!! h55   ★ ASYNCLISTADDR — compare with gCtrlQ.qhP below and the anchor link", gToAsync);
+    ehci_os_ilogx("!! h55   ★ the ACTIVE QH's phys addr (gEgQ->qhP) — should BE our control QH", gToQhP);
+    ehci_os_ilogx("!! h55   ★ our control QH phys (gCtrlQ.qhP) — if these two differ, we are on the wrong QH",
+                  gCtrlQ.qhP);
+    ehci_os_ilogx("!! h55   ★ QH ovlToken — ACTIVE(0x80) here = the controller is PARKED ON OUR qTD and the "
+                  "DEVICE IS NAKing (reading a). Terminated/stale = unreachable (reading b)", gToQhOvlTok);
+    ehci_os_ilogx("!! h55   ★ QH curQtd — should point at the qTD we armed", gToQhCurQtd);
+    ehci_os_ilogx("!! h55   QH epChar (endpoint characteristics: addr, ep, speed, maxpkt)", gToQhEpChar);
+    ehci_os_ilogx("!! h55   USBCMD (bit5 ASE = async schedule enable, bit0 RS = run/stop)", gToCmd);
+    ehci_os_ilogx("!! h55   anchor->hlink NOW (masked) — must lead into one of our QHs",
+                  gSoftc.asyncAnchor ? QH_LINK_PTR(gSoftc.asyncAnchor->hlink) : 0xFFFFFFFFUL);
+    ehci_os_ilogx("!! h55   gDownRelink<<16|gLastAnchorLink&0xFFFF (r60 backstop: did it ever fire?)",
+                  ((gDownRelink & 0xFFFFUL) << 16) | (gLastAnchorLink & 0xFFFFUL));
+}
+/* ★★★★★★★ h61 — INSTRUMENT WHAT THE DEVICE ACTUALLY RETURNS. THE PIVOT.
+ *
+ * ⚠ WHY THIS EXISTS. Six builds adjusted OUR side — the control cap (h55), the halt recovery (h57), the
+ * engine release (h56), the exposure latch and guard (h58/h59), a bring-up settle (h60, which locked the
+ * driver out and cost a CD boot). Every one fixed something real; none made a cold-boot-attached drive
+ * enumerate. The one thing never measured is THE DEVICE'S ANSWER.
+ *
+ * ★★ AND THE COMPARISON IS THE INSTRUMENT. A hot-plugged drive ALWAYS works; the same drive attached at cold
+ * boot fails. So this traces EVERY control phase of EVERY enumeration UNCONDITIONALLY — success and failure
+ * alike — and the run captures both cases in ONE log: boot with the drive attached (fails), then hot-plug it
+ * (works). The difference is then read off directly instead of inferred across runs, which is what every
+ * previous cycle had to do.
+ *
+ * WHAT IT ANSWERS, per phase: did anything come back at all, was it partial, and how long did it take.
+ *   · phase + status + elapsed ms          — where, and how fast
+ *   · qTD token AND QH overlay             — the two words h55/h57 proved disagree
+ *   · bytes requested vs actually delivered — a SHORT answer looks nothing like a silent one
+ *   · the first 8 bytes of the buffer      — a real device descriptor starts 12 01; garbage or zeros do not
+ * ⚠ ilogx only: ctl_step runs from the SIH. */
+static void h61_trace(const char *tag)
+{
+    /* ★ THE SPLIT: h61 traces CONTROL phases (it reads gCtl.pc/gCtl.dir/gCtlStat), and control now lives in
+     * the ENGINE slot. Left on gDp* this would print BLOCK I/O's qTD and overlay beside a control phase's
+     * status — a diagnostic that lies, which is I10 and is exactly the class of error that has cost this
+     * project four separate hunts. h61 is also the trace that found the TRSTRCY root cause, so it is the
+     * last one that should be allowed to drift. */
+    UInt32 tok = gEgTd ? ehci_le32_to_cpu(gEgTd->token) : 0xFFFFFFFFUL;
+    UInt32 ovl = gEgQ ? ehci_le32_to_cpu(gEgQ->qh->ovlToken) : 0xFFFFFFFFUL;
+    ehci_os_ilog(tag);
+    ehci_os_ilogx("    h61 pc<<24|dir<<16|status", ((UInt32)gCtl.pc << 24) | ((UInt32)gCtl.dir << 16)
+                                                   | (gCtlStat & 0xFFFFUL));
+    ehci_os_ilogx("    h61 ms in phase", frame_ms() - gCtl.t0);
+    ehci_os_ilogx("    h61 qTD token", tok);
+    ehci_os_ilogx("    h61 QH ovlToken", ovl);
+    ehci_os_ilogx("    h61 requested<<16|delivered (short answer != silent one)",
+                  ((gCtl.len & 0xFFFFUL) << 16) | (gCtlActual & 0xFFFFUL));
+    if (gCtl.buf) {
+        ehci_os_ilogx("    h61 buf[0..3]  (a real device descriptor starts 0x12 0x01)",
+                      ((UInt32)gCtl.buf[0] << 24) | ((UInt32)gCtl.buf[1] << 16)
+                      | ((UInt32)gCtl.buf[2] << 8) | (UInt32)gCtl.buf[3]);
+        ehci_os_ilogx("    h61 buf[4..7]",
+                      ((UInt32)gCtl.buf[4] << 24) | ((UInt32)gCtl.buf[5] << 16)
+                      | ((UInt32)gCtl.buf[6] << 8) | (UInt32)gCtl.buf[7]);
+    }
+}
 static int ctl_step(void)
 {
     switch (gCtl.pc) {
     case 0:
+        /* h61: PORTSC and the time since the port enabled, immediately before the first packet goes out.
+         * This is the number the whole cold-boot-vs-hot-plug question turns on. */
+        ehci_os_ilogx("  h61 SETUP about to issue; PORTSC",
+                      (gPortEnabledPort >= 0 && gSoftc.opBase)
+                          ? ehci_read32(gSoftc.opBase, EHCI_PORTSC(gPortEnabledPort)) : 0xFFFFFFFFUL);
+        ehci_os_ilogx("  h61   ms since this port enabled (hot-plug gives the device far more than cold boot)",
+                      frame_ms() - gPortEnabledMs);
         ctl_issue(gEnumSetup, gCtl.addr, 8, 2);                         /* SETUP */
         gCtl.pc = 1; gCtl.t0 = frame_ms(); return 0;
     case 1:
-        if (!ctl_done()) return (frame_ms() - gCtl.t0 > 800UL) ? -1 : 0;
-        if (gCtlStat != 0) return -1;                                   /* h13: the SETUP itself failed */
+        if (!ctl_done()) { if (frame_ms() - gCtl.t0 <= CTL_PHASE_MS) return 0; h54_ctl_fail(); return -1; }
+        if (gCtlStat != 0) { h61_trace("  h61 SETUP phase DONE (error)"); h54_ctl_fail(); return -1; }
+        h61_trace("  h61 SETUP phase DONE");                            /* h13: the SETUP itself failed */
         if (gCtl.dir) {
             ctl_issue(gCtl.buf, gCtl.addr, gCtl.len, 1);                /* DATA-IN */
             gCtl.pc = 2; gCtl.t0 = frame_ms(); return 0;
@@ -2978,16 +4061,19 @@ static int ctl_step(void)
         ctl_issue(gEnumDesc, gCtl.addr, 0, 1);                          /* STATUS-IN (no-data control) */
         gCtl.pc = 3; gCtl.t0 = frame_ms(); return 0;
     case 2:
-        if (!ctl_done()) return (frame_ms() - gCtl.t0 > 800UL) ? -1 : 0;
-        if (gCtlStat != 0) return -1;                                   /* h13: the DATA-IN phase failed */
+        if (!ctl_done()) { if (frame_ms() - gCtl.t0 <= CTL_PHASE_MS) return 0; h54_ctl_fail(); return -1; }
+        if (gCtlStat != 0) { h61_trace("  h61 DATA-IN phase DONE (error)"); h54_ctl_fail(); return -1; }
+        h61_trace("  h61 ★ DATA-IN phase DONE — THIS is the device's answer");
         gCtl.got = gCtlActual;   /* h13: what actually landed, from THIS control completion */
         ctl_issue(gEnumDesc, gCtl.addr, 0, 0);                          /* STATUS-OUT */
         gCtl.pc = 3; gCtl.t0 = frame_ms(); return 0;
     case 3:
-        if (!ctl_done()) return (frame_ms() - gCtl.t0 > 800UL) ? -1 : 0;
-        if (gCtlStat != 0) return -1;                                   /* h13: the STATUS phase failed */
+        if (!ctl_done()) { if (frame_ms() - gCtl.t0 <= CTL_PHASE_MS) return 0; h54_ctl_fail(); return -1; }
+        if (gCtlStat != 0) { h61_trace("  h61 STATUS phase DONE (error)"); h54_ctl_fail(); return -1; }
+        h61_trace("  h61 STATUS phase DONE — control transfer COMPLETE");
         return 1;
     }
+    h54_ctl_fail();
     return -1;
 }
 
@@ -3089,6 +4175,31 @@ static volatile int gAsBusy = 0;      /* re-entrancy guard: heartbeat and uim23 
  * is where 'Eusb' publication and the block-driver handoff have to happen (NewGestaltValue and
  * InstallDriverFromMemory are both task-only). This flag IS the interrupt->task boundary of the design. */
 static volatile int gAsProbeOK = 0;
+/* ★★★ f4 DIRECTION B, the body — declared far above (before bio_issue_read), defined here because it reads
+ * gAs.running and gAs is only in scope now. See the long f4 note beside the counters. Pure observation. */
+static void f4_note_bio_arm(void)
+{
+    /* ★★★★★★ THE INSTRUMENT THAT PROVES THE SPLIT. Before the split, arming block I/O while the ENGINE had a
+     * transfer in flight WAS the clobber — it wiped the slot and orphaned the victim's qTD. Now the engine
+     * has its own slot and its own bounce, so the same moment is HARMLESS. Counting it is what turns "the
+     * split should work" into "the split demonstrably did work, N times, on this boot".
+     * ⇒ Expect gSplitSaved > 0 and gF4Clobber* == 0. If gF4ClobberProbe or gF4ClobberCtl is EVER non-zero
+     * again, something has re-merged the slots. */
+    if (gEgBusy) gSplitSaved++;
+    if (!gDpBusy) return;               /* the common, healthy case: block I/O's own slot was free */
+    /* Reaching here now means BLOCK I/O armed over BLOCK I/O — the engine cannot be the victim any more.
+     * That would be a bio-engine bug (bio_kick/bio_advance are supposed to be strictly serial), so the
+     * counter changes meaning from "the known defect" to "an unexpected one". Keep it loud. */
+    gF4Clobber++;
+    switch (gF4Owner) {
+        case F4_OWNER_PROBE: gF4ClobberProbe++; break;   /* ★ the dangerous one */
+        case F4_OWNER_CTL:   gF4ClobberCtl++;   break;
+        case F4_OWNER_BIO:   gF4ClobberBio++;   break;
+        default: break;
+    }
+    if (gAs.running) gF4ClobberEnum++;
+    if (!gF4ClobberFirstMs) { UInt32 t = frame_ms(); gF4ClobberFirstMs = t ? t : 1; }
+}
 /* Set by the engine at interrupt level when it needs TASK level to register the bulk endpoints; cleared by
  * selfprobe_tick once done. create_bulk must not run from the SIH — see the note at its call site. */
 static volatile int gAsNeedBulk = 0;
@@ -3120,7 +4231,23 @@ static void park_port(int p, const char *why)
 {
     if (p < 0 || p >= 15) return;
     gPortParked[p] = 1;                      /* survives every port event EXCEPT the device leaving — n24 */
-    gSelfEnumDone = 1; gAs.running = 0; gAs.pc = 0;
+    /* ★★★★★★★ h70 — PARKING ONE PORT MUST NOT END ENUMERATION FOR THE WHOLE CONTROLLER.
+     * This is h39's defect on a THIRD path. h39 fixed the CEDE path, h56 fixed the SUCCESS path, and park_port
+     * was never revisited -- while THIS function's own comment states the intent it was violating: "return the
+     * transfer engine to a clean idle SO A DEVICE ON ANOTHER PORT STILL WORKS".
+     * ⚠ gPortParked[p] ALREADY records the decision per port, and the h39 scan consults it. Setting the GLOBAL
+     * as well killed enumeration for every other port.
+     * ★ AND IT IS THE DIRECT CAUSE OF THE SYMPTOM THE USER HAS REPORTED ON EVERY FAILING BOOT. When the drive
+     * fails 3x and parks, the global stop meant the KEYBOARD'S port was never serviced -- so it was never
+     * ceded to Apple's companion, and input stayed dead until the user PHYSICALLY MOVED the keyboard, whose
+     * connect event clears gSelfEnumDone in service_ports and lets enumeration resume. "Had to switch the
+     * keyboard over" was this line, every time.
+     * ⇒ Found by the mechanical exposure-path flag sweep (2026-08-11), not by another hardware run: 11 writes
+     * to gSelfEnumDone across 7 functions is what made it visible. Same technique, and same payoff, as the n24
+     * PER-DEVICE-SWEEP that found three bugs for zero hardware cycles. */
+    gAs.running = 0; gAs.pc = 0;
+    ehci_os_ilog("  h70: port PARKED but enumeration NOT ended for the controller — another port may still "
+                 "hold a device (gPortParked already records this port)");
     if (gSelfEnumPort == p) gSelfEnumPort = -1;
     dp_engine_idle();                        /* never leave a transfer in flight on a port we just gave up */
     ehci_os_ilog(why);
@@ -3240,6 +4367,442 @@ static void as_fail(const char *why, UInt32 v)
                      if (_r == 0) return; \
                      if (_r < 0) { as_fail("!! n5 PROBE: BOT transport failure at step", (L)); return; } } \
     } while (0)
+
+/* ★★★★★★★ h48 — THE PROBE. Diagnostic only: it changes no USB behaviour of ours.
+ *
+ * WHAT IT IS TESTING. The desk RE of Apple's USB keyboard shim found that Apple's
+ * `USBKeyboardSupport` shim patches **_SystemTask (trap 0xA9B4)** with a handler living in the fragment's own
+ * memory, saving the original in TOC[0x58] — and that its `.term` restores that saved address onto
+ * **_EventAvail (trap 0xA971)**, a trap it never patched. SetToolTrapAddress has exactly two call sites in
+ * that fragment: 0x280 (install, 0xA9B4) and 0x5d8 (term, 0xA971). So `.term` NEVER un-patches _SystemTask.
+ * Once the shim terminates and its fragment is released, _SystemTask still points into freed memory — and
+ * _SystemTask is called constantly by the Finder and every application. Our five crashes are all consistent
+ * with that: a PC inside a FREE System-heap block holding valid PowerPC, entered from
+ * KeyboardSystemTaskPatch via the Mixed Mode glue.
+ * The Expert-side RE shows CloseConnection — which is what runs a fragment's
+ * term — IS reachable from LoadUIMForEntry, through a helper that also calls SetDriverClosureMemory(conn, 0),
+ * i.e. a full release.
+ *
+ * ⇒ TWO MEASUREMENTS, AND THEY ARE INDEPENDENT:
+ *
+ * A. WATCH THE TRAP. Log _SystemTask's handler and the first two words at it, every periodic dump, so we get
+ *    a timeline rather than two snapshots. A live Mixed Mode routine descriptor begins with **0xAAFE** (the
+ *    _MixedModeMagic A-trap that makes JSRing a descriptor dispatch). If those bytes stop looking like a
+ *    descriptor, the fragment behind the still-installed patch has been released — the crash's precondition,
+ *    observed directly, before it fires.
+ *
+ * B. MAKE THE EXPERT TELL US. USBFamilyExpertLib exports the data symbol `gUSBStatusBuffer`, and
+ *    USBServicesLib exports `void USBExpertSetStatusLevel(UInt32)`. Level 5 (kUSBStatusLevelVerbose) turns on
+ *    "General status messages from the Expert and USL"; the default at boot is 3. The Expert's own strings
+ *    include "unloading plugin.", "AddDriverForReference - calling RemoveDriverForReference", "Checking disk
+ *    for USB shims" and "Send driver removal notifications to shims" — so if it is tearing a plugin down
+ *    around our activation, it says so in its own words. We SCAN for those phrases and log a found-mask
+ *    rather than dumping the buffer, which keeps this to a few lines.
+ *
+ * ⚠ SAFETY, deliberately conservative:
+ *  - Task level only. This is called from selfprobe_tick_body, alongside the existing periodic dump, so the
+ *    Toolbox and CFM calls are legal here. Nothing in it runs at interrupt level.
+ *  - We do NOT add USBServicesLib to the UIM's link line. This driver is loaded from the ROM by the USL, and
+ *    an unresolvable import would break activation outright. Everything foreign is reached with
+ *    GetSharedLibrary + FindSymbol at runtime and degrades to a logged failure.
+ *  - The handler pointer is range-checked before it is dereferenced.
+ *  - We never CALL anything whose prototype we are guessing. USBExpertSetStatusLevel's signature is read
+ *    from USB.h. gUSBStatusBuffer is DATA, so it is only ever read.
+ * ⚠⚠ ONE ADMITTED PERTURBATION: raising the status level makes Apple's Expert do more work, which could
+ * shift the very race we are chasing. If h48 behaves differently from h47, suspect this first. Both the old
+ * and new level are logged so the change is visible. */
+#define H48_SYSTEMTASK_TRAP  ((short)0xA9B4)   /* _SystemTask — the trap the shim patches */
+#define H48_EVENTAVAIL_TRAP  ((short)0xA971)   /* _EventAvail — the trap its .term wrongly restores */
+static UInt32 gH48Handler = 0;      /* last seen _SystemTask handler */
+static UInt32 gH48Word0 = 0;        /* first word at it (0xAAFE.... = live descriptor) */
+static UInt32 gH48Changed = 0;      /* times the handler address changed */
+static UInt32 gH48WentBad = 0;      /* ★ times the first word stopped looking like a descriptor */
+static UInt32 gH48Mask = 0;         /* Expert phrases seen (bit per phrase, see h48_probe) */
+static UInt32 gH48LevelOld = 0xFFFFFFFF, gH48LevelSet = 0;
+static Ptr    gH48StatusBuf = 0;
+static int    gH48Tried = 0;
+/* h49: the descriptor's TARGET — the code address the crash PCs actually land in. */
+static UInt32 gH49Target = 0, gH49T0 = 0, gH49T1 = 0;
+static UInt32 gH49TargetChanged = 0;   /* TVector contents changed */
+static UInt32 gH49TargetMoved = 0;     /* target address changed = a re-patch, a different thing */
+static int    gH49Seen = 0;
+/* h51: the SHIM'S OWN STATE, read rather than inferred, and the Expert's REAL text buffer. */
+static UInt32 gH51ShimToc = 0;      /* USBKeyboardSupport's TOC, from any exported TVector's word1 */
+static UInt32 gH51Saved = 0;        /* TOC[0x58] = the ORIGINAL _SystemTask handler the shim saved */
+static UInt32 gH51SavedChanged = 0;
+static UInt32 gH51TermRan = 0;      /* ★★ _EventAvail == TOC[0x58] ⇒ Apple's .term executed */
+static UInt32 gH51Text = 0, gH51Size = 0, gH51Off = 0, gH51LastOff = 0xFFFFFFFF;
+static int    gH51Windows = 0;       /* budget for text-window dumps */
+/* h50: one level further — the actual CODE the TVector points at. THIS is the precondition. */
+static UInt32 gH50Code = 0, gH50C0 = 0, gH50C1 = 0;
+static UInt32 gH50CodeChanged = 0;     /* ★★ code bytes changed = freed AND reused = the crash precondition */
+static UInt32 gH50CodeMoved = 0;
+static int    gH50Seen = 0;
+
+/* ★★★★★★★ h52 — WATCH THE DRIVER SWAP. The first probe here that does not need to catch a crash.
+ *
+ * WHY. The crashing code is byte-matched to Apple's... no: to **ATI's** display drivers inside
+ * `Extensions/ATI Driver Update` — three 20-byte runs from three crashes, landing in `ATY,Pheonix` twice and
+ * `ATY,Moonraker` once (a byte-match scan across the driver set). And the MDD ROM carries **no ATY parcel at all**
+ * (checked: parcel files, parcel blob, manifest), so on this machine the display driver comes from the
+ * Radeon's own declaration ROM and `ATI Driver Update` then REPLACES it during extension load. That is what
+ * the extension is for, so **a display-driver swap happens every boot, by design.**
+ *
+ * ⇒ A superseded 'ndrv' whose unit-table entry is still reachable is a use-after-free of ATI code, reached
+ * from 68K Device Manager dispatch through Mixed Mode — which is exactly the signature of all five crashes:
+ * 68K executing PowerPC, `Int 0` (task level), `CurApName Finder`, during desktop load, with the caller at a
+ * STABLE `0x0053xxxx-0x0054xxxx` low-system-heap address while ordinary heap addresses move every boot.
+ *
+ * ★★ WHAT THIS MEASURES, AND IT WORKS ON A CLEAN BOOT. Walk the unit table, snapshot every `dCtlDriver`, and
+ * thereafter report only the entries that CHANGE — that is the swap, caught as it happens. Then keep reading
+ * the SUPERSEDED address: if its bytes stay put, a stale call would still execute valid code and the boot
+ * survives; if they change, the block was freed AND reused, which is the difference between a boot that lives
+ * and a boot that dies. Every previous probe needed the fault in the act. This one does not — and if the old
+ * block is reused on clean boots too, then reuse is NOT the discriminator and I am wrong again, which we learn
+ * from one boot instead of ten.
+ *
+ * ⚠ Pure memory reads: `UTableBase` (0x011C) and `UnitNtryCnt` (0x01D2) from low memory, one handle deref per
+ * slot, `dCtlDriver` at +0 and `dCtlRefNum` at +0x18. No QuickDraw (so no dependence on an app's A5 world), no
+ * CFM, no Toolbox call that can move memory. Every pointer is range-checked before use. Task level only. */
+#define H52_MAX 64
+static UInt32 gH52Drv[H52_MAX];
+static short  gH52Ref[H52_MAX];
+static int    gH52Init = 0;
+static UInt32 gH52Changes = 0;      /* ★ driver-pointer swaps observed */
+static UInt32 gH52Old[4], gH52OldW0[4], gH52OldW1[4];
+static int    gH52Nold = 0;
+static UInt32 gH52OldReused = 0;    /* ★★ a superseded driver's bytes CHANGED = freed and reused */
+
+static int h52_ok(UInt32 p) { return p > 0x1000UL && !(p & 1UL); }
+
+static void h52_probe(void)
+{
+    void **utab = *(void ** volatile *)0x011CUL;      /* UTableBase */
+    int n = (int)*(volatile short *)0x01D2UL;         /* UnitNtryCnt */
+    int i;
+
+    if (!h52_ok((UInt32)utab) || n <= 0) {
+        ehci_os_logx("!! h52 unit table unavailable; UTableBase", (UInt32)utab);
+        return;
+    }
+    if (n > H52_MAX) n = H52_MAX;
+
+    for (i = 0; i < n; i++) {
+        void *dceh = utab[i];
+        UInt32 drv = 0; short ref = 0;
+        if (h52_ok((UInt32)dceh)) {
+            void *dce = *(void * volatile *)dceh;      /* the unit table holds DCtlHandles */
+            if (h52_ok((UInt32)dce)) {
+                drv = *(volatile UInt32 *)dce;                        /* dCtlDriver  +0x00 */
+                ref = *(volatile short *)((char *)dce + 0x18);        /* dCtlRefNum  +0x18 */
+            }
+        }
+        if (!gH52Init) {
+            gH52Drv[i] = drv; gH52Ref[i] = ref;
+            if (drv) ehci_os_logx("  h52 snapshot slot<<24|refNum ; dCtlDriver next line",
+                                  ((UInt32)i << 24) | ((UInt32)(UInt16)ref));
+            if (drv) ehci_os_logx("    h52   dCtlDriver", drv);
+        } else if (drv != gH52Drv[i]) {
+            gH52Changes++;
+            ehci_os_logx("!! h52 DRIVER SWAPPED — slot<<24|refNum", ((UInt32)i << 24) | ((UInt32)(UInt16)ref));
+            ehci_os_logx("  h52   old dCtlDriver", gH52Drv[i]);
+            ehci_os_logx("  h52   new dCtlDriver", drv);
+            /* remember the superseded address and watch it for reuse */
+            if (gH52Nold < 4 && h52_ok(gH52Drv[i]) && !(gH52Drv[i] & 3UL)) {
+                gH52Old[gH52Nold] = gH52Drv[i];
+                gH52OldW0[gH52Nold] = *(volatile UInt32 *)gH52Drv[i];
+                gH52OldW1[gH52Nold] = *(volatile UInt32 *)(gH52Drv[i] + 4);
+                ehci_os_logx("  h52   now watching the SUPERSEDED driver at", gH52Old[gH52Nold]);
+                gH52Nold++;
+            }
+            gH52Drv[i] = drv; gH52Ref[i] = ref;
+        }
+    }
+    gH52Init = 1;
+
+    for (i = 0; i < gH52Nold; i++) {
+        UInt32 a = gH52Old[i];
+        UInt32 w0 = *(volatile UInt32 *)a, w1 = *(volatile UInt32 *)(a + 4);
+        if (w0 != gH52OldW0[i] || w1 != gH52OldW1[i]) {
+            gH52OldReused++;
+            ehci_os_logx("!! h52 SUPERSEDED DRIVER'S BYTES CHANGED — freed AND reused; addr", a);
+            ehci_os_logx("  h52   was", gH52OldW0[i]);
+            ehci_os_logx("  h52   now", w0);
+            gH52OldW0[i] = w0; gH52OldW1[i] = w1;
+        }
+    }
+    ehci_os_logx("!! h52 gH52Changes (driver-pointer swaps seen this boot)", gH52Changes);
+    ehci_os_logx("!! h52 gH52OldReused (a superseded driver's code was overwritten — THE crash precondition)",
+                 gH52OldReused);
+}
+
+static void h48_probe(void)
+{
+    UInt32 h, w0 = 0, w1 = 0;
+
+    /* ---- B, once: reach the Expert's status facility and turn it up ---- */
+    if (!gH48Tried) {
+        CFragConnectionID conn; Ptr mainAddr; Str255 err; CFragSymbolClass cls; Ptr p;
+        gH48Tried = 1;
+        if (GetSharedLibrary("\pUSBServicesLib", kPowerPCCFragArch, kLoadCFrag,
+                             &conn, &mainAddr, err) == noErr) {
+            if (FindSymbol(conn, "\pUSBExpertGetStatusLevel", &p, &cls) == noErr && p)
+                gH48LevelOld = ((UInt32 (*)(void))p)();
+            /* ⚠ h52 REMOVES THE STATUS-LEVEL RAISE. h48-h51 called
+             * USBExpertSetStatusLevel(kUSBStatusLevelVerbose) so Apple's Expert would narrate a shim teardown.
+             * That purpose is MOOT — crash 5 proved _SystemTask healthy and _EventAvail app-owned, so the
+             * USBKeyboardSupport .term theory is not our crash path. Meanwhile the call made Apple's Expert do
+             * more work every boot, which is a real perturbation of the very layout/timing this crash is
+             * sensitive to. Dropping it removes a confound and shrinks the driver. The level is still READ and
+             * logged, which costs nothing. */
+            gH48LevelSet = 0;
+        }
+        if (GetSharedLibrary("\pUSBFamilyExpertLib", kPowerPCCFragArch, kLoadCFrag,
+                             &conn, &mainAddr, err) == noErr) {
+            if (FindSymbol(conn, "\pgUSBStatusBuffer", &p, &cls) == noErr) gH48StatusBuf = p;
+        }
+        ehci_os_logx("!! h48 Expert status level  old<<8|new (0xFFFFFFFF old = lookup failed)",
+                     (gH48LevelOld == 0xFFFFFFFFUL) ? 0xFFFFFFFFUL
+                                                    : ((gH48LevelOld << 8) | gH48LevelSet));
+        ehci_os_logx("!! h48 gUSBStatusBuffer (0 = FindSymbol failed; nothing else to read)",
+                     (UInt32)gH48StatusBuf);
+        /* ★★ h50 — STOP GUESSING AT THIS BUFFER AND LOOK AT IT.
+         * h49 proved the phrase scan does not work: the symbol resolves to a real address (0x002c8a0c) but
+         * the "Expert" positive control never matched, so the region is not the plain-text log I assumed.
+         * Most likely it is a header or ring structure whose entries are reached by pointer. Rather than
+         * guess a second time, dump the first 64 bytes ONCE. Sixteen words is cheap, it happens on one probe
+         * cycle only, and it turns the next step into reading rather than another assumption — any pointers
+         * in here can be chased in the following build. */
+        if (gH48StatusBuf) {
+            int w;
+            for (w = 0; w < 16; w++)
+                ehci_os_logx("  h50 statusbuf word (16 words, once, to read its STRUCTURE)",
+                             ((volatile UInt32 *)gH48StatusBuf)[w]);
+        }
+
+        /* ★★★★★★ h51 — READ THE SHIM'S OWN STATE INSTEAD OF INFERRING IT.
+         *
+         * h48/h49/h50 all watched the HEAD of the _SystemTask trap chain on the assumption it was Apple's
+         * keyboard shim. h50 disproved that: the code behind the trap began 7c0802a6 bfa1fff4, and that
+         * prologue does not occur ANYWHERE in USBKeyboardSupport's 9728-byte code section (search method
+         * validated first -- it finds the same pair at 0x161c in the Expert, exactly where LoadUIMForEntry's
+         * prologue is). Trap patches CHAIN; the head is only the most recently installed one, each patch
+         * stores its predecessor privately, and the chain cannot be walked from outside. So three builds of
+         * mine were pointed at the wrong object.
+         *
+         * ⇒ Go to the source. The RE says the shim keeps the ORIGINAL _SystemTask handler in **TOC[0x58]**
+         * (install at code 0x274: `addi r12, r2, 0x58` / `stw r3, 0(r12)`). A PowerPC TVector is
+         * {code, TOC}, so FindSymbol on ANY exported TVector of the shim hands us its TOC in word1 -- and
+         * then TOC+0x58 is the saved handler, read directly rather than deduced.
+         *
+         * ★★ AND THIS GIVES A CLEAN, CHAIN-INDEPENDENT TEST THAT .term RAN. Apple's .term writes that saved
+         * value onto _EventAvail (0xA971), a trap it never patched. So `_EventAvail == TOC[0x58]` is proof
+         * .term executed. On clean boots _EventAvail has held ordinary app-heap values (0x5e853ca0 /
+         * 0x5ef639f0), so this is a sharp discriminator, not a coincidence risk.
+         *
+         * ⚠⚠ kFindCFrag, NOT kLoadCFrag. kFindCFrag (0x0002) finds an existing copy WITHOUT incrementing
+         * reference counts; kReferenceCFrag/kLoadCFrag would use-or-load it and bump the count. Loading the
+         * shim ourselves would run its .init and patch a trap -- we would be CAUSING the thing we are
+         * measuring. (Noted for the eventual fix: kReferenceCFrag's refcount bump is exactly how the "pin the
+         * fragment" repair would be implemented, in one call.) */
+        {
+            CFragConnectionID sc; Ptr sm; Str255 se; CFragSymbolClass scl; Ptr sp;
+            OSErr e = GetSharedLibrary("\pUSBKeyboardSupport", kPowerPCCFragArch, kFindCFrag,
+                                       &sc, &sm, se);
+            ehci_os_logx("!! h51 GetSharedLibrary(USBKeyboardSupport, kFindCFrag) err (0 = it IS loaded)",
+                         (UInt32)(SInt32)e);
+            if (e == noErr && FindSymbol(sc, "\pUSBShim", &sp, &scl) == noErr && sp) {
+                gH51ShimToc = *(volatile UInt32 *)((char *)sp + 4);   /* TVector word1 = the shim's TOC */
+                ehci_os_logx("!! h51 shim TVector / its TOC", gH51ShimToc);
+                if (gH51ShimToc > 0x1000UL && !(gH51ShimToc & 3UL))
+                    gH51Saved = *(volatile UInt32 *)(gH51ShimToc + 0x58);
+                ehci_os_logx("!! h51 shim TOC[0x58] = the ORIGINAL _SystemTask it saved (0 = never patched)",
+                             gH51Saved);
+            }
+        }
+    }
+
+    /* ---- A, every dump: the _SystemTask trap, the descriptor, AND WHAT THE DESCRIPTOR POINTS AT ----
+     *
+     * ★★★★★★ h49 — h48 WATCHED THE WRONG ADDRESS, and its own output is what showed it.
+     * h48 logged the descriptor at 0x018E8018 with word0 0xAAFE0700 — a live Mixed Mode descriptor, so the
+     * install half of the RE is hardware-confirmed. But the four crash PCs were 0x01E7A2BA / 0x01E8F2AA /
+     * 0x01E8F182 / 0x01E797A2, about 0x59000 AWAY from the descriptor. The PC is therefore not the descriptor
+     * — it is the CODE THE DESCRIPTOR POINTS AT, which is what gets released. On a crashing boot the
+     * descriptor would very likely still read 0xAAFE0700 while its target had gone, gH48WentBad would have
+     * stayed 0, and I would have read that as "the theory is refuted". Watching only the magic could produce
+     * a confident false negative, which is the one outcome this project cannot afford again.
+     *
+     * ⇒ h49 follows the descriptor. RoutineDescriptor / RoutineRecord layout (MixedMode.h):
+     *      +0x00 UInt16 goMixedModeTrap   0xAAFE = _MixedModeMagic
+     *      +0x02 SInt8  version           (0x07 here)
+     *      +0x03 UInt8  flags
+     *      +0x04 UInt32 reserved1         (0 here — matches what h48 logged as word1)
+     *      +0x0A UInt16 routineCount
+     *      +0x0C UInt32 procInfo          the first RoutineRecord starts at +0x0C
+     *      +0x11 UInt8  ISA               kM68kISA = 0, kPowerPCISA = 1
+     *      +0x14 ProcPtr procDescriptor   ★ THE CODE ADDRESS
+     * ★ ISA is logged because the crashes were PowerPC bytes executed AS 68K. If the descriptor claims 68K
+     * while the target holds PowerPC, that is the mechanism stated outright.
+     *
+     * ★★ AND THE RIGHT INVARIANT FOR THE TARGET IS "DID ITS BYTES CHANGE", not "is it still magic". Freed
+     * memory that nobody has reused still holds the original code and would still RUN — that is why some
+     * boots survive. The crash needs the block freed AND overwritten. So a change in the first two words at
+     * the target IS the crash precondition, and it gets its own counter. */
+    h = (UInt32)GetToolTrapAddress(H48_SYSTEMTASK_TRAP);
+    if (h > 0x1000UL && !(h & 1UL)) {                /* non-null, even, past low memory */
+        w0 = *(volatile UInt32 *)h;
+        w1 = *(volatile UInt32 *)(h + 4);
+    }
+    if (gH48Handler && h != gH48Handler) gH48Changed++;
+    if ((gH48Word0 >> 16) == 0xAAFEUL && (w0 >> 16) != 0xAAFEUL) gH48WentBad++;
+    gH48Handler = h; gH48Word0 = w0;
+    ehci_os_logx("!! h48 _SystemTask(0xA9B4) handler", h);
+    ehci_os_logx("  h48   word0 at handler (0xAAFExxxx = LIVE Mixed Mode descriptor)", w0);
+    ehci_os_logx("  h48   word1 at handler", w1);
+    ehci_os_logx("!! h48 gH48WentBad (descriptor magic LOST; MUST be 0)", gH48WentBad);
+    ehci_os_logx("  h48 gH48Changed (handler address changed; 0 = the shim never re-patched)", gH48Changed);
+    ehci_os_logx("  h48 _EventAvail(0xA971) handler (== old _SystemTask ⇒ .term ran)",
+                 (UInt32)GetToolTrapAddress(H48_EVENTAVAIL_TRAP));
+
+    /* ★ h49: follow it. Only if we really are looking at a descriptor. */
+    if ((w0 >> 16) == 0xAAFEUL) {
+        UInt32 tgt = *(volatile UInt32 *)(h + 0x14);
+        UInt32 cnt = (*(volatile UInt32 *)(h + 8)) & 0xFFFFUL;      /* routineCount at +0x0A */
+        UInt32 pinf = *(volatile UInt32 *)(h + 0x0C);
+        UInt32 isa = (*(volatile UInt8 *)(h + 0x11));
+        UInt32 t0 = 0, t1 = 0;
+        if (tgt > 0x1000UL && !(tgt & 3UL)) {        /* non-null and 4-byte aligned (PPC code must be) */
+            t0 = *(volatile UInt32 *)tgt;
+            t1 = *(volatile UInt32 *)(tgt + 4);
+        }
+        if (gH49Target && tgt != gH49Target) gH49TargetMoved++;
+        if (gH49Seen && tgt == gH49Target && (t0 != gH49T0 || t1 != gH49T1)) gH49TargetChanged++;
+        gH49Target = tgt; gH49T0 = t0; gH49T1 = t1; gH49Seen = 1;
+        ehci_os_logx("!! h49 descriptor TARGET code address (+0x14) — THIS is what the crash PC is in", tgt);
+        ehci_os_logx("  h49   word0 at target", t0);
+        ehci_os_logx("  h49   word1 at target", t1);
+        ehci_os_logx("  h49   routineCount<<16|ISA (ISA: 0=68K 1=PowerPC)", (cnt << 16) | isa);
+        ehci_os_logx("  h49   procInfo", pinf);
+        ehci_os_logx("  h49 gH49TargetChanged (TVector contents changed)", gH49TargetChanged);
+        ehci_os_logx("  h49 gH49TargetMoved (target address changed; a re-patch, not a free)",
+                     gH49TargetMoved);
+
+        /* ★★★★★★ h50 — ONE MORE LEVEL, AND THIS IS THE ONE THAT MATTERS.
+         *
+         * The h49 run showed word0 at the target reading 0x019b46e8 — opcode 0, which is not a valid
+         * PowerPC instruction. That is because for a PowerPC routine the RoutineRecord's procDescriptor
+         * points at a **TVector**, not at code: {code address, TOC pointer}. So h49 was watching a TVector,
+         * and a TVector lives in a DIFFERENT heap block from the code it names. If the fragment's code
+         * section is freed and reused, the TVector reads unchanged while the code underneath has gone —
+         * h49's counter would miss exactly the event we are hunting.
+         *
+         * ⇒ Follow it. ISA (+0x11) says which kind of pointer procDescriptor is:
+         *      kPowerPCISA (1) -> procDescriptor is a TVector; code = *(tgt), TOC = *(tgt+4)
+         *      kM68kISA    (0) -> procDescriptor IS the 68K code address
+         * The h49 boot read ISA = 1, so the TVector branch is the live one here, but both are handled so a
+         * future re-patch by 68K code does not silently read as "no data".
+         *
+         * ★ The invariant is the same and it is the right one: freed-but-untouched memory still holds the
+         * original code and would still RUN, which is why boots survive. The crash needs the block freed AND
+         * overwritten. A CHANGE in the first two words at a code address that has NOT moved is therefore the
+         * precondition itself. gH50CodeMoved is kept separate — a moved address is a re-patch, not a free. */
+        {
+            UInt32 code = 0, toc = 0, c0 = 0, c1 = 0;
+            if (isa == 1UL) {                        /* kPowerPCISA: procDescriptor is a TVector */
+                if (tgt > 0x1000UL && !(tgt & 3UL)) { code = t0; toc = t1; }
+            } else {                                  /* kM68kISA: procDescriptor is the code itself */
+                code = tgt;
+            }
+            if (code > 0x1000UL && !(code & 3UL)) {
+                c0 = *(volatile UInt32 *)code;
+                c1 = *(volatile UInt32 *)(code + 4);
+            }
+            if (gH50Code && code != gH50Code) gH50CodeMoved++;
+            if (gH50Seen && code == gH50Code && (c0 != gH50C0 || c1 != gH50C1)) gH50CodeChanged++;
+            gH50Code = code; gH50C0 = c0; gH50C1 = c1; gH50Seen = 1;
+            ehci_os_logx("!! h50 CODE address behind the TVector (ISA 1) or the descriptor (ISA 0)", code);
+            ehci_os_logx("  h50   TOC pointer (ISA 1 only)", toc);
+            ehci_os_logx("  h50   word0 at code", c0);
+            ehci_os_logx("  h50   word1 at code", c1);
+            ehci_os_logx("!! h50 gH50CodeChanged (CODE BYTES changed = freed AND reused — THE CRASH "
+                         "PRECONDITION; MUST be 0)", gH50CodeChanged);
+            ehci_os_logx("  h50 gH50CodeMoved (code address changed; a re-patch, not a free)", gH50CodeMoved);
+        }
+    }
+
+    /* ---- h51, every dump: the shim's saved handler, and the chain-independent .term test ---- */
+    if (gH51ShimToc > 0x1000UL && !(gH51ShimToc & 3UL)) {
+        UInt32 sv = *(volatile UInt32 *)(gH51ShimToc + 0x58);
+        UInt32 ea = (UInt32)GetToolTrapAddress(H48_EVENTAVAIL_TRAP);
+        if (gH51Saved && sv != gH51Saved) gH51SavedChanged++;
+        gH51Saved = sv;
+        /* ★★ THE TEST. Apple's .term writes the shim's saved _SystemTask handler onto _EventAvail, a trap it
+         * never patched. Equality is therefore proof .term executed — and it does not depend on the trap
+         * chain, on which fragment owns the head, or on any pointer assumption of mine. */
+        if (sv && ea == sv) gH51TermRan++;
+        ehci_os_logx("!! h51 shim TOC[0x58] saved _SystemTask handler", sv);
+        ehci_os_logx("!! h51 gH51TermRan (_EventAvail == that saved handler ⇒ APPLE'S .term RAN; MUST be 0)",
+                     gH51TermRan);
+        ehci_os_logx("  h51 gH51SavedChanged (the shim re-patched)", gH51SavedChanged);
+    }
+
+    /* ---- B, every dump: has the Expert said any of the teardown words? ---- */
+    if (gH48StatusBuf) {
+        /* ★ h49 adds bit 6, "Expert", as a POSITIVE CONTROL. h48 returned gH48Mask = 0 and that reading was
+         * uninterpretable: it could not distinguish "the Expert never said any of these things" from "my scan
+         * is looking at the wrong memory, or the buffer is not plain text". Every message this library emits
+         * begins "Expert - ", so bit 6 MUST be set if the scan is working at all. **If b6 is clear, bits 0-5
+         * carry no information** — that is now written into the log line itself rather than left to me. */
+        static const char *phrase[7] = { "unloading plugin", "RemoveDriverForReference",
+                                         "Checking disk for USB shims", "will not be unloaded",
+                                         "removal notifications to shims", "DeferredTermination",
+                                         "Expert" };
+        /* ★★★ h51 — SCAN THE REAL TEXT, NOT THE HEADER. h50's 16-word dump showed gUSBStatusBuffer is a
+         * HEADER: +0x00 pointer to the text (0x002cb330), +0x04 size (0x2000 = 8192), +0x08 current offset
+         * (0x1fba — a nearly-full ring), +0x0C a timestamp. My earlier scans read the header itself, which is
+         * why the "Expert" positive control never matched. Follow the pointer and scan `size` bytes there. */
+        const volatile char *b;
+        UInt32 scanLen;
+        int i, k, n;
+        gH51Text = ((volatile UInt32 *)gH48StatusBuf)[0];
+        gH51Size = ((volatile UInt32 *)gH48StatusBuf)[1];
+        gH51Off  = ((volatile UInt32 *)gH48StatusBuf)[2];
+        if (gH51Text > 0x1000UL && gH51Size >= 0x100UL && gH51Size <= 0x20000UL) {
+            b = (const volatile char *)gH51Text;
+            scanLen = gH51Size;
+        } else {                                  /* header did not look like one — fall back, and say so */
+            b = (const volatile char *)gH48StatusBuf;
+            scanLen = 2048;
+        }
+        ehci_os_logx("  h51 statusbuf text ptr", gH51Text);
+        ehci_os_logx("  h51 statusbuf size<<16|writeOffset", ((gH51Size & 0xFFFFUL) << 16) | (gH51Off & 0xFFFFUL));
+        /* ★ Dump a window of the NEWEST text when the ring's write offset moves — that is the Expert saying
+         * something new, in its own words. Budgeted so a chatty Expert cannot flood the log. */
+        if (gH51Off != gH51LastOff && gH51Windows < 6 && b == (const volatile char *)gH51Text) {
+            UInt32 start = (gH51Off > 64UL) ? (gH51Off - 64UL) : 0UL;
+            int w;
+            gH51LastOff = gH51Off; gH51Windows++;
+            for (w = 0; w < 16; w++)
+                ehci_os_logx("  h51 newest text word (window at the ring's write offset)",
+                             *(volatile UInt32 *)(gH51Text + start + (UInt32)(w * 4)));
+        }
+        for (k = 0; k < 7; k++) {
+            if (gH48Mask & (1UL << k)) continue;          /* already seen; do not rescan */
+            n = 0; while (phrase[k][n]) n++;
+            for (i = 0; (UInt32)(i + n) < scanLen; i++) {  /* h51: scan the whole text buffer, bounded by its
+                                                           * own declared size rather than a guessed 2048 */
+                int j = 0;
+                while (j < n && b[i + j] == phrase[k][j]) j++;
+                if (j == n) { gH48Mask |= (1UL << k); break; }
+            }
+        }
+        ehci_os_logx("!! h49 mask b6=\"Expert\" IS THE CONTROL — if b6 is 0, bits 0-5 MEAN NOTHING. "
+                     "b0 unloading-plugin b1 RemoveDriverForReference b2 checking-disk-for-shims "
+                     "b3 will-not-be-unloaded b4 removal-notifications-to-shims b5 DeferredTermination",
+                     gH48Mask);
+    }
+}
 
 static void as_advance(void)
 {
@@ -3433,7 +4996,12 @@ static void as_advance(void)
             AS_CTL(74);
             ctl_begin(0x23, 0x01, 0x0010, (UInt16)gAs.hubPort, gAs.hubAddr, gEnumDesc, 0, 0);
             AS_CTL(75);
-            AS_DELAY(76, 12);        /* TRSTRCY — reset recovery before addressing the device */
+            /* h60: TRSTRCY was 12 ms — the spec MINIMUM (10) plus two. That is enough for a device that has
+             * been powered for a while and is only recovering from a reset; it is not enough for one that is
+             * also finishing its power-on sequence, which is every cold-boot device here because HCReset
+             * power-cycles the port. 50 ms costs nothing on the happy path and is still far inside every
+             * enclosing timeout. */
+            AS_DELAY(76, 50);        /* TRSTRCY — reset recovery before addressing the device */
             gDev[gAs.dev].viaHub = 1; gDev[gAs.dev].hubPort = (UInt8)gAs.hubPort;
             gHub.scanPort++;         /* consumed: the walk moves on whatever happens to this device */
             gAs.pc = 77; return;     /* join the PROVEN path AT the device-descriptor issue (not case 2) */
@@ -3454,6 +5022,56 @@ static void as_advance(void)
         gAs.pc = 20; return;
     case 20:
         if (frame_ms() - gAs.t0 < 100UL) return;          /* T_ATTDB */
+        /* ★★★★★ h33 — LOW SPEED IS KNOWABLE BEFORE THE RESET, AND AN LS DEVICE MUST NEVER BE RESET HERE.
+         * EHCI PORTSC Line Status (bits 11:10): 01b = K-state = a LOW-SPEED device is attached, and the
+         * spec's own instruction for that case is "release ownership to the companion" — no reset, no
+         * chirp test. The T4-on-v4 run (2026-08-09) is why this matters: the keyboard's port read K
+         * (0x3400) at sweep time, we reset it anyway, the LS device bounced under an HS-timed reset, and
+         * the port was KEPT — a dead keyboard until it was physically moved. The port is OURS and idle at
+         * this point (100 ms debounced, nobody driving it), so a single read is reliable — there is no
+         * companion traffic to alias the sample, unlike at INIT/sweep time where we sample repeatedly. */
+        {   UInt32 pv = ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port));
+            if (((pv >> 10) & 3) == 1) {                  /* K-state: low-speed attached */
+                UInt32 w = pv & ~EHCI_PORTSC_RW1C;
+                w |= EHCI_PORT_OWNER;
+                ehci_write32(gSoftc.opBase, EHCI_PORTSC(gAs.port), w);
+                gPortCeded[gAs.port] = 1;                 /* n11: record the decision, don't re-read it */
+                ehci_os_ilogx("  h33: LOW-SPEED by line state (K) — ceded to the companion WITHOUT reset; port",
+                              (UInt32)gAs.port);
+                /* ★★★★★★ h46 — CLEAR THIS PORT'S AIM, OR THIS CEDE SPINS FOREVER.
+                 *
+                 * ⚠ THE h45 RUN (2026-08-10): the mouse went into a card port and this exact branch ran
+                 * **78 times** on a port already reading 0x3400 (Owner set, we had ceded it on the first
+                 * pass). The arm guard in as_tick is
+                 *     if (!gAs.running && !gSelfEnumDone && gSelfEnumPort >= 0 && gSelfEnumTries < 3u)
+                 * and the old code here cleared ONLY gAs.running — leaving gSelfEnumPort still aimed at the
+                 * port we had just given away and gSelfEnumTries still 0. So the guard was satisfied again on
+                 * the very next heartbeat: re-arm, 100 ms T_ATTDB, read K, cede a port that was already
+                 * Apple's, repeat. It stopped only because a drive insertion re-aimed gSelfEnumPort.
+                 *
+                 * ★ THE SIBLING PATH ALREADY HAD THE ANSWER. The 3-attempt cede below (the h39 fix) ends with
+                 * exactly these three lines, which is precisely why the KEYBOARD ceded once and stayed quiet
+                 * in that same run while the MOUSE spun: h39 fixed one of the two cede sites and this fast
+                 * path, added in h33, never got the same treatment. The h15 livelock note eight lines under
+                 * the arm guard describes this shape verbatim — "clears gAs.running but touches neither
+                 * gSelfEnumPort, gSelfEnumDone nor gSelfEnumTries — and as_tick armed the identical run
+                 * again". 5th instance of a decision recorded per-port while the AIM was left pointing at it.
+                 *
+                 * ⚠ THE HAZARD THIS REMOVES, which is worse than the wasted work: the spin holds gAs.running
+                 * for 100 ms of every cycle, and a real device's arm requires !gAs.running. In the h45 run
+                 * nothing was mounted so it cost only log lines; with a volume mounted it puts a repeating
+                 * enumeration attempt alongside block I/O, which is the documented starvation shape.
+                 *
+                 * gSelfEnumDone still stays CLEAR — it means "nothing left to enumerate ANYWHERE", which is
+                 * false while another port may hold a drive. That was h39's other half and it is not undone
+                 * here. */
+                gAs.running = 0; gAs.pc = 0; gAs.dev = -1;
+                if (gSelfEnumPort == gAs.port) gSelfEnumPort = -1;   /* stop aiming at a port that is Apple's */
+                gSelfEnumTries = 0;
+                gH46CedeSpinGuard++;      /* h46: how many times this branch ran; 1 per LS device is correct */
+                return;
+            }
+        }
         gNoProgressArms = 0;       /* h15: a root-port reset is real forward progress too */
         /* 1. Port reset. The existing interrupt-level machinery deasserts at +50ms and reports enable. */
         {
@@ -3477,12 +5095,61 @@ static void as_advance(void)
          * That handover is a ONE-WAY DOOR (Owner=1 + gSelfEnumDone=1): Apple's OHCI then mounts the drive
          * at 1.1 and we never retry. It is what produced every "mounted as USB 1.1" run.
          * service_ports clears gSelfEnumPort to -1 the instant it sees a disconnect, so that is our
-         * bounce flag: abandon this attempt WITHOUT surrendering the port, and let the re-connect re-arm. */
-        if (gSelfEnumPort != gAs.port) {
-            ehci_os_ilog("  n5 SELFENUM: device bounced during reset — abandoning this attempt, port KEPT");
+         * bounce flag: abandon this attempt WITHOUT surrendering the port, and let the re-connect re-arm.
+         *
+         * ★★★★★★ h37 — ASK THE PORT I AM ENUMERATING, NOT THE GLOBAL "WHICH PORT NEXT". THIS WAS THE T4 BUG.
+         *
+         * ⚠ The test was `gSelfEnumPort != gAs.port`, and gSelfEnumPort is the SINGLE global that
+         * service_ports overwrites on the most recent connect event on ANY port. So with a keyboard/mouse also
+         * on the card, the HID's connect event flips gSelfEnumPort from the drive's port to the HID's port
+         * WHILE THE DRIVE IS MID-RESET, and this guard then declared the drive "bounced" and abandoned a
+         * perfectly good high-speed enumeration. The h36 log is explicit: port 2 attempt -> "device bounced
+         * during reset" -> engine straight to port 4, while the PORTMAP shows port 2 at 0x1005 — CONNECTED AND
+         * ENABLED throughout. Nothing bounced. With the drive alone (T2) no other connect event exists, the
+         * test never misfires, and the drive mounts perfectly: four T2 passes against four T4 failures.
+         *
+         * ★★ IT ALSO EXPLAINS THE CORRUPT MEDIUM, not merely a delay. The abandoned port is left ENABLED with
+         * its device still at ADDRESS 0 (we abandon before SET_ADDRESS). The engine then moves to the HID's
+         * port and issues address-0 control traffic for THAT device — which the drive, still enabled at
+         * address 0, answers too. That breaks this driver's own recorded invariant (one enabled port at a
+         * time, because a freshly reset device answers at address 0), scrambles the drive's state, and makes
+         * the eventual mount read garbage: "this disk needs to be initialized". A physical replug is a full
+         * USB reset, which is exactly why re-inserting always mounted cleanly at 2.0.
+         *
+         * ★ THE FIX is the n21 lesson for the third time — where the fact is per-port, consult the per-port
+         * record. gPortConn[] is maintained per port by service_ports at interrupt level, so ask whether MY
+         * port lost its device. A genuine bounce still abandons (the device really is gone, so it answers
+         * nothing and the leftover enable is harmless); another port's event no longer touches this run. */
+        if (!gPortConn[gAs.port]) {
+            /* ★ h33 BACKSTOP: n5's keep-on-bounce is right for a DRIVE (its bounce is a one-off attach
+             * transient and the reconnect re-arms). But T4-on-v4 stranded a keyboard here: an LS/FS device
+             * that cannot take an HS-timed reset bounces EVERY attempt, and "port KEPT" then means "port
+             * dead forever". Three consecutive bounces with the device still present is not a transient —
+             * cede it; the companion can drive what we cannot. Cleared on any successful enumeration. */
+            if (gAs.port >= 0 && gAs.port < 15 && ++gBounceCnt[gAs.port] >= 3) {
+                UInt32 w = ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port));
+                if (w & EHCI_PORT_CONNECT) {
+                    w &= ~EHCI_PORTSC_RW1C; w |= EHCI_PORT_OWNER;
+                    ehci_write32(gSoftc.opBase, EHCI_PORTSC(gAs.port), w);
+                    gPortCeded[gAs.port] = 1;
+                    ehci_os_ilogx("  h33: THREE consecutive bounces with the device still present — ceding "
+                                  "to the companion rather than stranding the port; port", (UInt32)gAs.port);
+                    gBounceCnt[gAs.port] = 0;
+                    gAs.running = 0; gAs.pc = 0;
+                    return;
+                }
+                gBounceCnt[gAs.port] = 0;     /* nothing connected: a real removal, not a stuck bouncer */
+            }
+            ehci_os_ilogx("  n5 SELFENUM: MY port's device really disconnected during reset — abandoning this "
+                          "attempt, port KEPT; port", (UInt32)gAs.port);
             gAs.running = 0; gAs.pc = 0;      /* deliberately NOT gSelfEnumDone, NOT a tries++ */
             return;
         }
+        /* h37: another port signalling mid-reset is NOT a bounce. Log it (this is what used to abandon the
+         * drive) and carry on with MY port; gSelfEnumPort is left alone so that port gets its turn after. */
+        if (gSelfEnumPort != gAs.port)
+            ehci_os_ilogx("  h37: another port signalled mid-reset (a FALSE 'bounce' before h37) — CONTINUING "
+                          "this port; mine<<8|next", ((UInt32)gAs.port << 8) | ((UInt32)gSelfEnumPort & 0xFF));
         if (!(ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)) & EHCI_PORT_ENABLE)) {
             UInt32 portsc = ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port));
             if (portsc & EHCI_PORT_CONNECT) {
@@ -3500,14 +5167,63 @@ static void as_advance(void)
                 gPortCeded[gAs.port] = 1;   /* n11: record the decision, don't re-read it back */
                 ehci_os_ilog("  n5 SELFENUM: not high-speed after 3 attempts -> handed the port to the 1.1 companion");
                 ehci_os_ilogx("  portsc", portsc);
-                gSelfEnumDone = 1; gAs.running = 0; gAs.pc = 0;   /* companion owns it; do not retry */
+                /* ★★★★★★ h39 — CEDING ONE PORT MUST NOT END ENUMERATION FOR THE WHOLE CONTROLLER.
+                 *
+                 * ⚠ This line used to be `gSelfEnumDone = 1` with the note "companion owns it; do not retry".
+                 * That is right for the port just ceded and catastrophic for every OTHER port: gSelfEnumDone is
+                 * the GLOBAL "stop looking" flag, so surrendering an FS mouse ended enumeration for the entire
+                 * card. The h38+v7 run shows it exactly — all three attempts on port 4 (the mouse), cede,
+                 * gSelfEnumDone=1, engine stops, and the DRIVE on port 2 sits at 0x1801 in the final PORTMAP:
+                 * ours, powered, connected, NEVER ENUMERATED. Nothing of ours ever mounted, which is why
+                 * "Eject" left no volume behind.
+                 *
+                 * ★ THIRD INSTANCE OF ONE PATTERN in this driver: a GLOBAL standing in for a PER-PORT fact.
+                 * n21 was gSelfEnumPort stealing a live slot's port; h37 was the bounce guard reading that same
+                 * global instead of gPortConn[]; this is gSelfEnumDone. The per-port record ALREADY EXISTS here
+                 * — gPortCeded[gAs.port], set on the line above — so the global adds nothing but the bug.
+                 *
+                 * FIX: record the cede per-port (done), release the engine, and clear this port's aim so the
+                 * next tick picks up any OTHER port still holding an unenumerated device. gSelfEnumDone stays
+                 * CLEAR: it means "there is nothing left to enumerate anywhere", which is simply false while a
+                 * connected, unenumerated device sits on another port. gSelfEnumTries resets because the next
+                 * port's attempts are its own, not a continuation of this port's three. */
+                gAs.running = 0; gAs.pc = 0; gAs.dev = -1;
+                if (gSelfEnumPort == gAs.port) gSelfEnumPort = -1;   /* stop aiming at a port that is Apple's */
+                gSelfEnumTries = 0;
+                ehci_os_ilog("  h39: engine RELEASED (not gSelfEnumDone) — another port may still hold an "
+                             "unenumerated device");
                 return;
             }
             as_fail("!! n5 SELFENUM: port did not enable and nothing is connected; portsc", portsc);
             return;
         }
+        gPortEnabledMs = frame_ms(); gPortEnabledPort = gAs.port;   /* h61: the clock the cold-boot-vs-hot-plug comparison hangs on */
         ehci_os_ilogx("  port ENABLED at high speed; portsc",
                       ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)));
+        /* ★★★★★★★ h62 — TRSTRCY ON THE ROOT-PORT PATH, WHICH HAS NEVER HAD ONE. THE m13 MEASUREMENT.
+         *
+         * ⚠ USB 2.0 §7.1.7.3: after a port reset the device gets TRSTRCY — 10 ms MINIMUM — before it may be
+         * addressed. A device behind a HUB gets it (AS_DELAY(76, …) on that path). A device on a ROOT PORT
+         * got NOTHING: the port enabled and the very next step was AS_CTL(2), the first control transfer.
+         * h61 measured the gap on hardware: ★ 8 ms ★ — BELOW THE SPEC MINIMUM, on every attempt.
+         *
+         * ★★ AND h61 SHOWED EXACTLY WHAT THAT COSTS, which is what makes this the answer rather than another
+         * guess. The SETUP stage SUCCEEDS — "req 8 / delivered 8", status 0 — so the device is on the bus and
+         * answering. The DATA stage then never completes: overlay ACTIVE, CERR still 3, buffer all zeroes.
+         * A device that ACKs SETUP and then withholds the data stage is NAKing, i.e. out of reset but not yet
+         * ready — and NAKs do not decrement CERR, which is precisely the "ACTIVE, CERR=3, no error bits"
+         * signature this hunt has been staring at since m6.
+         * ★ It also explains the two things that never fitted: HOT-PLUG ALWAYS WORKED (the connect-debounce
+         * and event path put far more than 8 ms in front of the first transfer) and the failure was
+         * INTERMITTENT (8 ms against a device wanting 10-100 is exactly on the edge).
+         *
+         * ★★★ WHY THIS IS SAFE WHERE h60 WAS NOT — the lesson from that regression, applied.
+         *  · It is a DELAY INSIDE THE SEQUENCE, not a gate in front of the arm. AS_DELAY parks as_advance and
+         *    returns; as_tick then reaches `gAsBusy = 0` as it always does. It cannot latch the guard.
+         *  · It sits AFTER "port ENABLED at high speed", so it is reached ONLY by devices that chirped high
+         *    speed. A full-speed keyboard takes the not-enabled branch and cedes WITHOUT EVER GETTING HERE:
+         *    ★ the user's route back to input is untouched by this change. */
+        AS_DELAY(85, 100);
 
     /* ★ h3 TIER 1 JOIN POINT. The hub path jumps HERE, not to case 2 — case 2 is the COMPLETION half of
      * AS_CTL(2), so entering there would call ctl_step() with no ctl_begin issued for this device and act on
@@ -3800,7 +5516,35 @@ static void as_advance(void)
                 ehci_os_ilogx("  h3 released the gDev slot the hub used during its own enumeration; slot",
                               (UInt32)gAs.dev);
             }
-            gSelfEnumDone = 1;                 /* the root port is settled — do not re-arm on it */
+            /* ★★★★★★★ h71 — "THE ROOT PORT IS SETTLED" IS A PER-PORT STATEMENT. THIS SET A GLOBAL.
+             * h39's defect on a FOURTH path (h39 cede, h56 success, h70 park, h71 hub-claim). The old comment
+             * on this line said "the ROOT PORT is settled — do not re-arm on it" while the code stopped
+             * enumeration for the ENTIRE CONTROLLER.
+             * ★ AND THE PER-PORT PROTECTION ALREADY EXISTS: the h39 scan skips the hub's root port explicitly
+             * (`if (gHub.claimed && p == gHub.rootPort) continue;`). The global was not merely wrong, it was
+             * redundant.
+             * ★★ MEASURED, the hub + two drives cold boot (2026-08-11): the display's hub was claimed on
+             * port 1, this line fired, and the scan never looked at PORT 0 again -- so the keyboard stayed
+             * APPLE_HIDden and dead for the whole boot. Its cede only appears at log line 4248, right after
+             * the user PHYSICALLY REPLUGGED it, because a connect event is the one thing that clears
+             * gSelfEnumDone (service_ports). Both drives mounted; the keyboard was collateral.
+             * ⇒ The engine's ORDERING was never the problem -- the root-port arm already outranks the hub
+             * sweep, and the scan runs before both. Enumeration was simply switched off. */
+            /* ★★★★★★★ h72 — h71 WAS HALF A FIX AND THE OTHER HALF MATTERED.
+             * ⚠ Removing `gSelfEnumDone = 1` was right in principle -- a per-port decision must not stop the
+             * controller -- but that line was quietly doing a SECOND job its comment never mentioned: with the
+             * global set, the root-port arm could not re-fire. Remove it and leave gSelfEnumPort STILL AIMED
+             * AT THE HUB'S OWN PORT, and the root arm simply re-enumerates the hub for ever.
+             * ★ MEASURED, m23: exactly 2 SELFENUM starts, BOTH on port 1 (the hub), ZERO h39 scans, ZERO
+             * downstream walks, no drives. The hub was claimed and then re-enumerated instead of swept.
+             * ⇒ THE CORRECT PER-PORT EXPRESSION OF "THIS ROOT PORT IS SETTLED" IS TO CLEAR THE AIM, not to
+             * stop the world. With gSelfEnumPort = -1 the scan runs, skips the hub's own port (it already
+             * does: `if (gHub.claimed && p == gHub.rootPort) continue;`), resolves any OTHER port -- the
+             * keyboard cedes in ~600 ms -- and once nothing is eligible the hub sweep's else-if finally gets
+             * the engine. All three things we need, from one assignment. */
+            gSelfEnumPort = -1;
+            ehci_os_ilog("  h72: hub claimed — AIM cleared for that port (not a controller-wide stop), so the "
+                         "scan can resolve other ports and the hub sweep can then run");
             gAs.running = 0; gAs.pc = 0; gAs.dev = -1;
             return;
         }
@@ -3842,7 +5586,10 @@ static void as_advance(void)
          * successful reset IS the EHCI speed determination (see the HPS_HIGHSPEED derivation in port_status). */
         gDev[ad].hiSpeed = (UInt8)((ehci_read32(gSoftc.opBase, EHCI_PORTSC(gAs.port)) & EHCI_PORT_ENABLE) ? 1 : 0);
         gNewDevMask |= (1UL << (ad & 0x0F));
-        ehci_os_ilog("=== n5 SELFENUM COMPLETE — we enumerated + own the device; starting BOT probe ===");
+        if (gAs.port >= 0 && gAs.port < 15) gBounceCnt[gAs.port] = 0;   /* h33: a success clears the streak */
+        /* CRITICAL channel from here to the exposure latch: these are the lines that say a device was really
+         * verified, and the m24 rate cap dropped 458 ring lines straight through the middle of them. */
+        ehci_os_ilogc("=== n5 SELFENUM COMPLETE — we enumerated + own the device; starting BOT probe ===");
         ehci_os_ilogx("  outEp.addr/ep", ((UInt32)gBulkEP[gDev[ad].pOut].addr << 16) | gBulkEP[gDev[ad].pOut].endpt);
         ehci_os_ilogx("  inEp.addr/ep",  ((UInt32)gBulkEP[gDev[ad].pIn].addr  << 16) | gBulkEP[gDev[ad].pIn].endpt); }
 
@@ -3878,15 +5625,15 @@ static void as_advance(void)
         if (gBot.csw != 0) { as_fail("!! n5 PROBE: READ CAPACITY CSW status", (UInt32)gBot.csw); return; }
         gAs.blocks  = BUF_BE32(gAsCap, 0) + 1UL;      /* READ CAPACITY returns the LAST LBA */
         gAs.blkSize = BUF_BE32(gAsCap, 4);
-        ehci_os_ilogx("  n5 SELFPROBE READ CAPACITY blocks",  gAs.blocks);
-        ehci_os_ilogx("                     blockSize", gAs.blkSize);
+        ehci_os_ilogcx("  n5 SELFPROBE READ CAPACITY blocks",  gAs.blocks);
+        ehci_os_ilogcx("                     blockSize", gAs.blkSize);
         if (gAs.blkSize != 512UL || gAs.blocks < 4UL) {
             as_fail("!! n5 PROBE: implausible geometry (stale/garbage data phase); blockSize", gAs.blkSize);
             return; }
         {   /* ★ n18 FIX 3: record geometry against the slot that was probed, not globally. */
             int gd = (gAs.dev >= 0) ? gAs.dev : 0;
             gDevBlkCnt[gd] = gAs.blocks; gDevBlkSize[gd] = gAs.blkSize;
-            ehci_os_ilogx("  n18 geometry recorded for slot", (UInt32)gd);
+            ehci_os_ilogcx("  n18 geometry recorded for slot", (UInt32)gd);
         }
 
         /* ---- 12. READ block 0 — the proof we can really read the medium ---- */
@@ -3898,13 +5645,42 @@ static void as_advance(void)
         if (gBot.csw != 0) { as_fail("!! n5 PROBE: READ block 0 CSW status", (UInt32)gBot.csw); return; }
         ehci_os_ilogx("  n5 SELFPROBE READ block 0 b0_3", BUF_BE32(gAsBlk0, 0));
 
-        ehci_os_ilog("=== n5 SELFPROBE COMPLETE (async, interrupt-driven — no application involved) ===");
+        ehci_os_ilogc("=== n5 SELFPROBE COMPLETE (async, interrupt-driven — no application involved) ===");
         gAs.running = 0; gAs.done = 1; gAs.pc = 0;
         gAs.dev = -1;              /* n14 step 3: sequence over; the next device allocates its own slot.
                                     * Deliberately NOT cleared at SELFENUM COMPLETE: the BOT probe below
                                     * runs after that point and needs gAs.dev to target the right one. */
-        gSelfEnumDone = 1;
+        /* ★★★★★★ h56 — ENUMERATING ONE PORT MUST NOT END ENUMERATION FOR THE WHOLE CONTROLLER.
+         * THIS IS h39's DEFECT, ONE LAYER OVER, AND IT SURVIVED h39 BECAUSE h39 ONLY FIXED THE CEDE PATH.
+         *
+         * ⚠ This line was `gSelfEnumDone = 1`. gSelfEnumDone is the GLOBAL "stop looking" flag, and as_tick's
+         * scan is gated `if (gSelfEnumPort < 0 && !gSelfEnumDone && !gAs.running)` — so a SUCCESSFUL probe on
+         * one port stopped the engine from ever looking at any other port, exactly as a CEDE used to.
+         *
+         * ★ THE m7 RUN IS THE PROOF, and it is unambiguous. Keyboard on port 0, drive on port 1, both at cold
+         * boot. The drive enumerated CLEANLY — SELFENUM COMPLETE, INQUIRY ok, READ CAPACITY 0x780000, geometry,
+         * SELFPROBE COMPLETE — and the keyboard's port was then NEVER LOOKED AT. h39's scan only found port 0
+         * after the user PHYSICALLY PULLED the drive, which cleared the flag via the disconnect path. So the
+         * keyboard was dead for the whole session because a DIFFERENT port's enumeration had succeeded.
+         *
+         * ★★ AND IT IS CIRCULAR ON THIS MACHINE: the volume exposure is deferred while a modal dialog is up
+         * (h30/h44 logged isFinder<<8|dialogUp = 0x0101 — the Keychain dialog), and that dialog cannot be
+         * dismissed without the keyboard. Fix this line and both unwind: the keyboard is ceded in ~600 ms, the
+         * dialog is dismissed, the defer releases, the drive mounts.
+         *
+         * The per-port record already exists and is already consulted by the scan (gPortCeded, gPortParked,
+         * and gDev[].probedPort via the `owned` test), so releasing the engine here loses nothing: the next
+         * tick re-scans, skips this port because a live slot owns it, and picks up any OTHER port still
+         * holding an unenumerated device. Same shape as h39, same reasoning, same log line. */
+        gSelfEnumPort = -1;        /* release the aim so the scan can re-target */
+        ehci_os_ilog("  h56: engine RELEASED after a successful probe (not gSelfEnumDone) — another port may "
+                     "still hold an unenumerated device");
         gFenceApple   = 1;         /* belt-and-braces: Apple must never touch our endpoints */
+        /* h59: latch the slot NOW, while gEnumDev still describes the probe that just finished. The exposure
+         * may sit in the h30/h44 defer for up to 45 s, and gEnumDev will not survive another enumeration. */
+        gExposeDev    = gEnumDev;
+        ehci_os_ilogcx("  h59: exposure slot LATCHED at probe completion (read at release instead of "
+                       "gEnumDev, which a later enumeration would overwrite); slot", (UInt32)gExposeDev);
         gAsProbeOK    = 1;         /* task level picks this up to publish 'Eusb' + hand the mount over */
         return;
     }
@@ -3995,6 +5771,66 @@ static void as_tick(void)
             gEnumDeferBusy++;
         gAsBusy = 0; return;
     }
+    /* ★★★★★★ h39 part 2 — WHEN THERE IS NO AIM, SCAN FOR ONE. gSelfEnumPort holds ONE port and is set from a
+     * CONNECT EVENT, so with several devices attached at cold boot service_ports overwrites it and only the
+     * LAST connect survives; every earlier device is forgotten. The h38+v7 run is exactly that: the mouse's
+     * connect landed last, the engine worked port 4 only, and the drive on port 2 was never looked at even
+     * though it sat there connected and unenumerated (final PORTMAP 0x1801).
+     * ★ Event-driven arming stays the primary path (unchanged). This only fills the gap when there is no
+     * pending aim — which covers both "I just ceded a port, what else is out there" (h39 part 1) and
+     * "several devices were already attached before we existed". A port qualifies only if it is connected,
+     * not already ceded to Apple, not parked, and not owned by a live slot — all facts that are recorded
+     * PER PORT and simply were not being consulted here. */
+    /* ★★★★★★ h58 — THE h9 GUARD, WHICH THIS SCAN NEVER HAD, AND WHICH h56 MADE LOAD-BEARING.
+     *
+     * ⚠ gAsProbeOK and gAsNeedBulk are parks the interrupt engine sets for TASK LEVEL to finish, and both read
+     * gEnumDev to know which slot they are completing. Arming another port here overwrites it. h9 wrote that
+     * guard for the HUB sweep (a few lines below) and h39's port scan was added later without it — harmlessly,
+     * because a successful probe set gSelfEnumDone = 1 and this scan could never run afterwards anyway.
+     * ★ h56 REMOVED THAT BLOCK ON PURPOSE (so a second occupied port still gets serviced) AND THEREBY EXPOSED
+     * THE UNGUARDED PATH. The m9 run is h9's symptom, verbatim, three lines apart:
+     *     === n5 SELFPROBE COMPLETE ===
+     *       h56: engine RELEASED after a successful probe
+     *       h39: no pending aim — SCANNED and found a connected, unenumerated port; port 0
+     *     === n5 SELFENUM ... ===
+     * The keyboard was ceded correctly and the drive that had JUST PROBED was never exposed: no
+     * exposure-DEFERRED line, no AddDrive, no mount. Exactly what h9 recorded — "both drives enumerated, both
+     * recorded geometry, neither was ever EXPOSED".
+     * ⇒ The engine runs on the 8 ms heartbeat and the handoff only when task level gets a turn, so the scan
+     * wins this race every time. Wait for the handoff; it clears in a fraction of a second (selfprobe_tick
+     * sets gAsProbeOK = 0), and the other port is still serviced immediately afterwards — h56's whole point is
+     * preserved, it just no longer overtakes the mount it was released by. */
+    /* ★★★★★★ h59 — AND NOW THE GUARD CAN BE NARROWED, WHICH IS WHAT BREAKS THE DEADLOCK.
+     *
+     * ⚠ THE DEADLOCK, measured on m10: (1) the keyboard's port is not serviced until the drive's handoff
+     * completes; (2) the handoff is deferred until the modal dialog clears; (3) the Keychain dialog cannot be
+     * dismissed without the keyboard. So h58's blanket `!gAsProbeOK` held the scan for the FULL 45 s defer,
+     * the log shows "h44: defer CAP reached (45 s) — exposing anyway; dialogUp 1", and the user had to swap
+     * ports. m9 (no guard) freed the keyboard early but lost the mount. We were trading one for the other.
+     *
+     * ★ THE DISTINCTION THE CODEBASE ALREADY DRAWS: gExposureDeferred separates "task level must finish this
+     * NOW" from "task level has taken it and is parked waiting on the Finder". The NM re-arm gate has used
+     * exactly this predicate for the same reason since h35: `(gAsProbeOK && !gExposureDeferred)`.
+     * ⇒ h9's hazard is real only in the first state. In the second, the handoff is not about to read anything
+     * — and with h59 latching the slot it could not be hurt if it did.
+     * ⇒ The keyboard is now ceded while the exposure waits, the user dismisses the dialog, the defer releases
+     * in seconds instead of capping at 45, and the drive mounts. Both halves, instead of one. */
+    if (gSelfEnumPort < 0 && !gSelfEnumDone && !gAs.running
+        && !(gAsProbeOK && !gExposureDeferred) && !gAsNeedBulk) {
+        int p, np = (int)gSoftc.nPorts;
+        for (p = 0; p < np && p < 15; p++) {
+            int owned = 0, o;
+            if (!gPortConn[p] || gPortCeded[p] || gPortParked[p]) continue;
+            if (gHub.claimed && p == gHub.rootPort) continue;     /* the hub owns this one */
+            for (o = 0; o < USB_MAX_DEV; o++)
+                if (gDev[o].inUse && gDev[o].probedPort == p) { owned = 1; break; }
+            if (owned) continue;
+            gSelfEnumPort = p; gSelfEnumTries = 0;
+            ehci_os_ilogx("  h39: no pending aim — SCANNED and found a connected, unenumerated port; port",
+                          (UInt32)p);
+            break;
+        }
+    }
     /* ★★★ n21: NEVER enumerate a port a live slot already owns.
      * gSelfEnumPort is a single "which port next" variable and it is only cleared when THAT port's device is
      * pulled (service_ports: `if (p == gSelfEnumPort)`). Pull a device on a DIFFERENT port and gSelfEnumPort
@@ -4013,12 +5849,47 @@ static void as_tick(void)
                 break;
             }
     }
+    /* ★★★★★★★ h61 — THE h60 SETTLE IS REMOVED, AND THE REASON IS A HARD RULE NOW.
+     *
+     * ⛔ h60 GATED THIS ARM ON A 500 ms TIMER AND USED A BARE `return;` — WITHOUT CLEARING gAsBusy, WHICH
+     * as_tick SETS ON ENTRY AND EVERY OTHER EXIT PATH CLEARS. The guard latched on the first hold and as_tick
+     * returned at its first line for the rest of the session. No enumeration ever armed, so no port was ever
+     * ceded, while service_ports kept APPLE_HIDE-ing every port the user plugged into: hidden from Apple AND
+     * unused by us, i.e. the "bricked port" state this driver was written to eliminate. The machine could not
+     * be recovered by unplugging or by changing ports; it took an OS 9 CD boot and a stock-ROM restore.
+     *
+     * ★★ TWO LESSONS, AND THE SECOND MATTERS MORE THAN THE TYPO:
+     *  1. An early return from a function that holds a re-entrancy flag must release it. The compiler cannot
+     *     see this; only the reader can. (Same family as n12's "an abandoned attempt must not leave a transfer
+     *     in flight".)
+     *  2. ★ THE CEDE PATH IS THE USER'S ONLY ROUTE BACK TO A KEYBOARD, AND IT RUNS THROUGH THIS ARM. Anything
+     *     placed in front of it must FAIL OPEN. A timing gate that can stall — for any reason, including a
+     *     clock that stops advancing — must never be able to stand between the user and their input. If a
+     *     settle is ever wanted here again, it must be expressed as "arm anyway, but delay the first control
+     *     transfer", never as "do not arm".
+     * The settle hypothesis itself was never tested: the gate never opened, so h60 proved nothing about it.
+     * TRSTRCY stays at h60's 50 ms, which is a plain delay INSIDE the sequence and gates nothing. */
     if (!gAs.running && !gSelfEnumDone && gSelfEnumPort >= 0 && gSelfEnumTries < 3u) {
         int slot = (gAs.dev >= 0) ? gAs.dev : dev_alloc();
         if (slot >= 0) {
             gAs.dev = slot; gEnumDev = slot;
             gAs.pc = 0; gAs.port = gSelfEnumPort; gAs.running = 1; gAs.done = 0; gAs.failed = 0;
-            gAsProbeOK = 0;
+            /* ★★★★★★★ h69 — ARMING AN ENUMERATION MUST NOT DESTROY A PENDING EXPOSURE.
+             * ⚠ gAsProbeOK is the interrupt->task handoff that says "a probed volume is waiting to be
+             * exposed". Clearing it here means "cancel any probe-complete signal", which was right when one
+             * enumeration at a time owned everything. It is WRONG once h56/h59 let the engine service ANOTHER
+             * port while an exposure sits in the h30/h44 defer: arming the keyboard's port wiped the drive's
+             * pending exposure, so selfprobe_tick's `if (gAsProbeOK)` block never ran again -- no re-check, no
+             * 45 s cap, NO MOUNT.
+             * ★ THE CROSS-RUN PROOF: m10 (h58, BLANKET guard) blocked the scan during the defer, so nothing
+             * armed, gAsProbeOK survived, and it is THE ONLY COLD-BOOT RUN THAT EVER REACHED "defer CAP
+             * reached" AND "EXPOSED". Every run from m14 on carries h59's narrowed guard, which frees the
+             * keyboard during the defer -- and lost the mount here, silently.
+             * ⇒ h59's gExposeDev latch already protects WHICH SLOT the exposure targets against gEnumDev being
+             * overwritten just above. This protects the exposure's EXISTENCE. Both are needed; neither alone
+             * is sufficient. Same family as every other bug in this driver: state cleared by an event that is
+             * not the event it cares about. */
+            if (!gExposureDeferred) gAsProbeOK = 0;
             /* ★★★★ h15 THE h14 LIVELOCK. THIS IS A ROOT-PORT RUN, SO SAY SO. `gAs.hubAddr` is the switch that
              * sends every reset and port query through the hub, and it was cleared in exactly ONE place —
              * as_fail. A hub-downstream enumeration that SUCCEEDED left it set, and this arm did not clear it,
@@ -4091,17 +5962,526 @@ static void as_tick(void)
         gAs.dev = -1;            /* h9: gEnumDev is deliberately NOT touched here — it still names the slot
                                   * whose handoff may be in flight, and nothing in the port QUERY needs it.
                                   * It is set when a slot is actually allocated, below. */
-        gAs.pc = 0; gAs.running = 1; gAs.done = 0; gAs.failed = 0; gAsProbeOK = 0;
+        gAs.pc = 0; gAs.running = 1; gAs.done = 0; gAs.failed = 0;
+        if (!gExposureDeferred) gAsProbeOK = 0;   /* h69: same protection on the hub-sweep arm */
         gAs.port = gHub.rootPort;      /* still our root port for logging/ownership purposes */
         gAs.hubAddr = gHub.addr;       /* ★ the switch that makes reset go via the hub */
         gAs.hubPort = gHub.scanPort;
     }
+    /* f4: the overlap itself, independent of whether it did any harm — the enumeration engine is about to
+     * advance while a BLOCK transfer is live in hardware. If this reads 0 across the m24 topology then the
+     * two never coincide and F4 is refuted outright, whatever the other counters say. */
+    if (gAs.running && gDpBusy && gF4Owner == F4_OWNER_BIO) gF4EnumArmedWhileBio++;
     if (gAs.running) as_advance();
     gAsBusy = 0;
 }
 #endif /* APPLE_HIDE */
 
+/* ★★★★★★ h26 APP-LESS: the task-level pump, and the counters that say whether it is being starved.
+ *
+ * THE DESIGN, and it is Apple's own, not ours: `NMInstall` with **`nmStr = 0`** displays nothing and exists
+ * solely to get `nmResp` called at task level, inside whatever process is running its event loop (normally
+ * the Finder). Established by the RE of `USBMassStorageSupport` (`docs/APPLE-UMSS-RE.md`): their `nmResp` at
+ * code 0x01e00 does `GetVCBQHdr` → `UnmountVol` → `Eject`, which is very nearly line-for-line our
+ * `gSelfEnumRearm` block. `NMInstall` only ENQUEUES, so it is legal from where our detection happens
+ * (interrupt level), and we already import `NMInstall`/`NMRemove`.
+ *
+ * ★★ WHY THIS IS NOW BUILDABLE — all four recorded caveats of that RE are closed:
+ *   1. `USLPolledProcessDoneQueue` is **not needed at all** — n4h ran the whole stack with it compiled out,
+ *      and n4i also dropped `ExpertIdleTask`. Both passed. So there is nothing left to POLL, which was the
+ *      one thing `NMInstall` could not have supplied.
+ *   2. `ase_quiesce` inside an `nmResp` is **measured and bounded**: 10 ms by construction, worst observed
+ *      0.47-0.80 ms across three runs. That was the single place our needs exceed Apple's.
+ *   3. Our trigger stays our own interrupt-level detection (Apple's `USBInstallDeviceNotification` can never
+ *      fire for our devices — we hide the ports).
+ *   4. "App-less" means **no app of OURS**. Some process must still run an event loop for the NM queue; the
+ *      Finder always does. Unchanged from the `_SystemTask` sketch this replaces, but say it out loud.
+ *
+ * ★ WHY THE RESPONSE CALLS `selfprobe_tick` WHOLE rather than a factored-out subset. The four things needing
+ * task level are parks the interrupt engine sets — `gAsNeedBulk`, `gAsProbeOK`, `gSelfEnumRearm`,
+ * `gHubIntNeedArm` — and `selfprobe_tick` is exactly the function that drains them. Re-using it means the
+ * task-level path an app drove for 130 builds is byte-for-byte the path the NM now drives, so a pass here is
+ * evidence about the VEHICLE and not about a fresh copy of the logic. Splitting the function is a refactor
+ * worth doing on its own terms, not while changing the thing that calls it.
+ *
+ * ⚠ A SEPARATE NMRec FROM THE USER-VISIBLE ALERTS. `gNM` carries the eject / reconnect notifications; if the
+ * pump shared it, a mount could retract an alert the user is still reading, or vice versa. `gNMT` is ours.
+ *
+ * ★ THE COUNTERS ANSWER THE OPEN n4i QUESTION. n4i left two 300 ms same-qTD stalls whose cause could not be
+ * separated: a flash write-latency spike, or a starved task-level pump. `gTickGap*` measures the gap between
+ * consecutive task-level ticks and `gNmLat*` the delay from arming a request to `nmResp` actually running.
+ * Under load, a ~300 ms figure in either supports starvation; a few ms in both leaves the device as the
+ * explanation. This is the discriminator that run could not carry because there was no clock in the log. */
+static volatile UInt32 gTickCalls = 0, gTickGapLast = 0, gTickGapMax = 0, gTickLastExit = 0;
+/* h59: gExposureDeferred moved up beside gExposeDev so as_tick can read it. */
+static volatile UInt32 gNmArmed = 0, gNmFired = 0, gNmFailed = 0, gNmDeclined = 0;
+static volatile UInt32 gNmStuckRearms = 0;        /* h63: lost NM requests recovered by the watchdog */
+static volatile UInt32 gTickSeenLast = 0, gTickSeenMs = 0;
+static volatile UInt32 gTicksStallMaxMs = 0;      /* h64: longest observed freeze of lowmem Ticks, in ms */
+static volatile UInt32 gHbRuns = 0;              /* h65: heartbeat callbacks, vs gVhubTick = SIH passes */
+/* ★★★ h66 — THE PORT-POWER / OVER-CURRENT WATCH. Per port: last PORTSC seen, POWER 1->0 transitions, and
+ * over-current sightings. Sampled on every SIH pass and BEFORE service_ports, so an OCC latch is recorded
+ * before our own read-modify-write clears it. */
+static volatile UInt32 gPwPrev[16];
+static volatile UInt32 gPwLost[16], gOcSeen[16];
+static volatile int    gPwInit = 0;
+static volatile UInt32 gRepower[16];             /* h67: re-power attempts per port, hard-capped */
+#define H67_MAX_REPOWER 3UL
+static volatile UInt32 gNmLatLast = 0, gNmLatMax = 0;   /* ⚠ MILLISECONDS (frame_ms), NOT ticks — see h83 */
+static volatile UInt32 gNmArmTick = 0;            /* frame_ms() when the pending request was posted. ⚠ The
+                                                   * comment here said "lowmem Ticks" for eleven builds after
+                                                   * h64 changed it to frame_ms; that stale word is what made
+                                                   * a reader divide the latency by 60 and report a 50 s stall
+                                                   * that was really 3 s. Units belong next to the variable. */
+/* ★★★★★★★ h83 — THE STUCK-REQUEST WATCHDOG HAS BEEN DEAD SINCE h65, AND IT IS DEAD BY A UNIT MISMATCH.
+ *
+ * h63's check is `(long)(nowK - gNmArmTick) < NM_STUCK_TICKS`. h65 then changed `nowK` to **gVhubTick**
+ * (SIH passes, ~125/s) and NM_STUCK_TICKS to "7500 SIH passes", but left `gNmArmTick` as **frame_ms()**
+ * (milliseconds, 1000/s). Two clocks, two origins, one subtraction.
+ *
+ * frame_ms outruns gVhubTick by ~8x from the first second, so `nowK - gNmArmTick` is hugely NEGATIVE for
+ * the whole session, the compare is always true, and task_work_arm RETURNS ON ITS FIRST LINE forever once
+ * gNMTPosted is set. That is precisely the permanent-death case h63 was written to recover from — quoted in
+ * its own comment: "this function returns on its first line for the rest of the session and the app-less
+ * task-level pump is dead — permanently, with no counter to say so."
+ *
+ * ★ CONFIRMED BY DATA, not inferred: gNmStuckRearms is 0 in EVERY run ever logged, including the m27 and
+ * 2026-08-12 hangs where a lost request is the leading explanation. A watchdog that has never once fired
+ * across a hundred builds is not a quiet watchdog; it is a broken one.
+ *
+ * ★ THE FIX IS TO STAMP THE ARM IN THE SAME CLOCK THE CHECK READS. gNmArmTick stays frame_ms so the
+ * LATENCY instrument is untouched — the two uses wanted different clocks and were sharing one variable. */
+static volatile UInt32 gNmArmTickK = 0;           /* gVhubTick at the arm — the h63 check's OWN clock */
+/* ★★★★★★★ h84 — THE PUMP BODY'S DURATION HAS NEVER BEEN MEASURED, AND IT IS THE QUANTITY THAT DECIDES
+ * WHETHER THE MACHINE SURVIVES.
+ *
+ * m32/h83 settled what the pump does: at all three paints ARMED == FIRED with POSTED == 1, which can only
+ * mean we were INSIDE the response and it had been running longer than the watchdog's 5 s trigger. The
+ * 2026-08-12 hang is the same picture taken further along — the h76 dump read gTaskPumpN 0x0a, so we were
+ * inside body #10 when the second AddDrive happened, and it never reached 11. The response borrows the
+ * FINDER'S OWN THREAD. A body that does not return IS a wedged desktop, a wristwatch cursor and a frozen
+ * cyan number: one cause, every symptom.
+ *
+ * ⚠ AND NOTHING WE HAVE CAN SEE IT. task_work_arm returns on its first line while gNMTPosted is set, so the
+ * next arm can only happen AFTER the body ends. gNmLat (arm -> response) therefore measures the GAP;
+ * gTickGap (body exit -> next entry) measures the GAP by construction. Two instruments, same blind spot.
+ * Arithmetic across m32's paints (4315 SIH passes, ~34 s, for TWO pumps, gaps capped at 7.2 s) puts the
+ * bodies at 10 s or more during enumeration — inferred, never measured.
+ *
+ * ★ A HIGH-WATER MARK ALONE WOULD BE USELESS HERE, and that is the trap worth naming: it is written at body
+ * EXIT, and the failure is a body that never exits. So the load-bearing fields are the LIVE ones —
+ * gBodyPhase (where we are) and gBodyStartMs (since when) — which the paint reads at interrupt level and
+ * turns into "stuck in section N for M ms". The completed-body maxima are the supporting cast.
+ *
+ * ★ CLOCK: frame_ms(). It is driven by frame_time_update() in the heartbeat, it demonstrably kept advancing
+ * through the hang (the h61 traces carry ms values), and it is the clock every other timeout here trusts.
+ * If it ever DID stop, green gVhubTick would still climb while the elapsed sat still — itself readable.
+ *
+ * ⚠ COST: one UInt32 subtract and two stores per checkpoint, no logging, no allocation. That matters more
+ * than usual, because an instrument that lengthens the body is measuring itself (I10). */
+#define BP_N            16u
+#define BP_IDLE          0u   /* not inside the body at all */
+#define BP_ENTRY         1u   /* entry + compl_drain */
+#define BP_LOGDRAIN      2u   /* h78 bulk ring drain (160 lines, FSWrite + FlushVol each) */
+#define BP_LATEDUMP      3u   /* h41 late dump + f4 verdict */
+#define BP_PERIODIC      4u   /* the ~40-line periodic dump — the biggest known File Manager block */
+#define BP_NEEDBULK      5u   /* gAsNeedBulk: create the bulk endpoints */
+#define BP_HUBARM        6u   /* gHubIntNeedArm: program + park the hub status QH */
+#define BP_EXPOSE        7u   /* gAsProbeOK: THE SUSPECT — install, AddDrive, diskEvt */
+#define BP_REARM         8u   /* gSelfEnumRearm: unmount + reconnect_reset */
+#define BP_DRAINS        9u   /* the mask drains (n15/n13/h15/n21/h7/h3/n24/h53/n4b) */
+#define BP_TAIL         10u   /* as_tick + the legacy tail */
+/* ★★★★ h84b — SPLIT THE EXPOSURE, because the prior art makes a specific prediction and a lumped section 07
+ * could not test it. `docs/APPLE-UMSS-RE.md` establishes that Apple's block driver "imports no File Manager,
+ * no Notification Manager and no dialog APIs" and issues AddDrive + PostEvent from its OWN DoDriverIO, while
+ * Apple's nmResp does only GetVCBQHdr -> UnmountVol -> Eject. We do AddDrive from inside the nmResp AND wrap
+ * it in ~30 lines of synchronous FSWrite + FlushVol on the boot volume (h41 before, h76, h41 after).
+ * ⇒ PREDICTION: the cost is OUR LOGGING around the handover, not the handover. h78 already caught this exact
+ * pattern once (the DoDriverIO drain) and cut it; these dumps were never cut because they are what made the
+ * exposure legible in the first place. Four extra checkpoints settle it in the SAME run instead of the next
+ * one — and if 0C is the slow one instead, the prediction is wrong and the OS's mount path is the problem. */
+#define BP_EXP_PRE      11u   /* h41 BEFORE dump — ours */
+#define BP_EXP_ADD      12u   /* install_block_driver: InstallDriverFromMemory + AddDrive + diskEvt — the OS */
+#define BP_EXP_POST     13u   /* n19 line + the h76 dump — ours */
+#define BP_EXP_AFTER    14u   /* h41 AFTER dump — ours */
+static volatile UInt8  gBodyPhase   = BP_IDLE;
+static volatile UInt32 gBodyStartMs = 0;      /* frame_ms at body ENTRY — live, the one that matters */
+static volatile UInt32 gPhaseAtMs   = 0;      /* frame_ms when the CURRENT phase began */
+static volatile UInt32 gBodyLastMs  = 0, gBodyMaxMs = 0;   /* COMPLETED bodies only */
+static volatile UInt32 gBodySlowN   = 0;      /* completed bodies over BODY_SLOW_MS — frequency without a photo */
+#define BODY_SLOW_MS  1000UL
+static volatile UInt32 gPhaseMaxMs[BP_N];     /* per-phase high-water, so "which section" is answerable */
+static void bphase(UInt8 p)
+{
+    UInt32 now = frame_ms();
+    UInt8  prev = gBodyPhase;
+    if (prev < BP_N) {
+        UInt32 d = now - gPhaseAtMs;
+        if (d > gPhaseMaxMs[prev]) gPhaseMaxMs[prev] = d;
+    }
+    gPhaseAtMs = now;
+    gBodyPhase = p;
+}
+static NMRec   gNMT;                              /* the PUMP's own request — never gNM, see above */
+static NMUPP   gNMTUpp   = 0;
+static volatile int gNMTPosted = 0;
+/* ★ h27: a COUNTER, not a flag. The body can legitimately nest (it calls into Apple's USL via compl_drain,
+ * and into the File Manager), and a flag would be cleared by an inner exit while the outer call is still
+ * inside — leaving the NM response free to run in the middle of it. Depth counts nest correctly. */
+static volatile int gInTaskWork = 0;              /* >0 = a tick is somewhere on the stack */
+
+/* Is there task-level work parked? The exact set of parks selfprobe_tick drains.
+ * ★ h30: a DEFERRED exposure does not count — otherwise the pending gAsProbeOK would re-arm the NM at
+ * event-loop rate for the whole defer window (hundreds of no-display notifications during Finder startup).
+ * The ~2 s keepalive owns the re-check; worst case the mount lands one keepalive after the Finder settles. */
+/* ★★★★★★ h41 — MEASURE, DO NOT PATCH. Who owns a drive-queue entry for this medium, and when?
+ *
+ * ⚠ h40 restored CONFIGFLAG microseconds after HCReset to deny Apple an enumeration window, and the run came
+ * back LINE-FOR-LINE identical to h39: same scan, same 2.0 mount, same "initialize" prompt. So the window
+ * theory is unsupported, and that is the second patch aimed at a mechanism I cannot observe. Worse, EVERY T4
+ * log ends at "device EXPOSED" — there has never been a single line of evidence about the mount itself.
+ *
+ * Two possibilities remain and they call for opposite fixes:
+ *   (A) APPLE'S STALE ENTRY — Apple enumerated the drive at some point, registered a drive-queue entry, and we
+ *       took the device back. The prompt is Apple's orphan. Fix = keep Apple away from the drive entirely.
+ *   (B) OUR OWN BAD EXPOSURE — our scan/geometry produces a volume the File Manager cannot read. The prompt is
+ *       about OUR entry. Fix = the scan, and Apple is innocent.
+ * Both produce "prompt, then Eject, then our 2.0 mount", so no amount of re-reading the existing logs
+ * separates them. ONE dump does: walk the drive queue and the VCB queue immediately BEFORE we install, and
+ * again AFTER. A foreign drive-queue entry present BEFORE our install proves (A); nothing foreign before, and
+ * only our own entry after, proves (B).
+ * ★ Cheap, always-printed, task level (both queues are System Globals lists), and it answers the question the
+ * "USB Disk Log" would have answered — that file has never appeared in any app-less run, so it is not a
+ * reliable channel here and this does not depend on it. */
+static void h41_queue_dump(const char *when)
+{
+    QHdrPtr dq = GetDrvQHdr();
+    QHdrPtr vq = GetVCBQHdr();
+    void *e; int n;
+    ehci_os_log(when);
+    for (e = (void *)(dq ? dq->qHead : 0), n = 0; e && n < 12; e = (void *)((DrvQElPtr)e)->qLink, n++) {
+        DrvQElPtr d = (DrvQElPtr)e;
+        /* drive number and the DRIVER refNum that owns it — ours is gBlkDref once installed, so anything
+         * else on this medium is Apple's. Negative refNums are unit-table drivers (ours reads 0xffffffc8-ish). */
+        ehci_os_logx("  h41 drvq: drive<<16|refNum", (((UInt32)(UInt16)d->dQDrive) << 16)
+                                                    | ((UInt32)(UInt16)d->dQRefNum));
+        ehci_os_logx("  h41       fsid<<16|qType",   (((UInt32)(UInt16)d->dQFSID) << 16)
+                                                    | ((UInt32)(UInt16)d->qType));
+    }
+    ehci_os_logx("  h41 drive-queue entries", (UInt32)n);
+    for (e = (void *)(vq ? vq->qHead : 0), n = 0; e && n < 12; e = (void *)((VCB *)e)->qLink, n++) {
+        VCB *v = (VCB *)e;
+        ehci_os_logx("  h41 vcb: drvNum<<16|drvRefNum", (((UInt32)(UInt16)v->vcbDrvNum) << 16)
+                                                       | ((UInt32)(UInt16)v->vcbDRefNum));
+    }
+    ehci_os_logx("  h41 mounted volumes", (UInt32)n);
+    ehci_os_logx("  h41 our block driver refNum (0 = not installed yet)", (UInt32)(UInt16)gBlkDref);
+}
+
+static int task_work_pending(void)
+{
+    /* h35: gAsProbeOK is excluded while its exposure is deferred, so the keepalive (~2 s) owns the re-check
+     * during the Finder-settle window rather than the NM re-arming at event-loop rate — same reasoning h30
+     * used, restored with the split's revert. */
+    return (gAsNeedBulk || (gAsProbeOK && !gExposureDeferred)
+            || gSelfEnumRearm || gHubIntNeedArm) ? 1 : 0;
+}
+
+/* ★★★★★★ h27 — THE h26 FREEZE, AND IT WAS MINE. Run A (h26 + n4g, 2026-08-08) froze the activator during a
+ * drive insertion, right after AddDrive/diskEvt. Two coupled defects here, both from one wrong assumption:
+ *
+ * ⚠ **h26 asserted "the NM has dequeued us by the time the response runs; NMRemove here would be wrong."
+ * THAT IS FALSE**, and this codebase already contained the proof both ways:
+ *   - the alert posters set `nmResp = (NMUPP)-1L`, whose comment reads "the NM dequeues it once the user
+ *     dismisses" — the magic -1 is what buys auto-dequeue;
+ *   - `resident/bootmain.c`'s own NM response, with a REAL UPP like ours, calls `NMRemove(nmReqPtr)` and its
+ *     comment says "NMRemove's self".
+ * With a real UPP the request STAYS QUEUED until removed. h26 never removed it.
+ *
+ * ★★ THE FREEZE MECHANISM: h26 also cleared `gNMTPosted` at the TOP of the response, so while this function
+ * was still doing its (long, File-Manager-heavy) work, the 8 ms heartbeat could see a park pending and call
+ * `NMInstall(&gNMT)` on a record that was **still in the Notification Manager's queue**. An OS queue element
+ * installed twice links through its own `qLink` — a cycle — and the NM's queue walk then never terminates.
+ * Task level dies; interrupt level carries on, which is exactly what the log shows: it stops mid-body with
+ * the engine having been healthy a line earlier.
+ * ★ Why the earlier part of the run was clean, and why the counters misled me at first: the last periodic dump
+ * before the insertion read `gNmArmed/gNmFired = 0`, because with a fast app tick no park survives long enough
+ * at heartbeat time to arm anything. The arming window only opens during an INSERTION — which is precisely
+ * where it froze. A counter snapshot from before the window says nothing about the window.
+ *
+ * THE THREE FIXES:
+ *   1. `NMRemove` FIRST, before anything else, so the record is legally re-installable from that instant.
+ *   2. `gNMTPosted` stays SET for the whole of the work and is cleared only at the end, so an arm can never
+ *      overlap a response in progress. A park that survives is picked up by the next heartbeat.
+ *   3. The re-entrancy guard moved OFF the app path (see the wrapper) and INTO this response, so the path an
+ *      app has driven for 130 builds keeps h25 semantics byte for byte. h26 changed a validated path for a
+ *      benefit only the new path needed. */
+static pascal void ehci_nm_task_resp(NMRecPtr r)
+{
+    UInt32 now = frame_ms();               /* h64: same clock as gNmArmTick, so the latency stays meaningful
+                                            * even when VBL (and therefore lowmem Ticks) has stopped. */
+    if (r) (void)NMRemove(r);              /* h27 fix 1: dequeue BEFORE any work */
+    gNmFired++;
+    gNmLatLast = now - gNmArmTick;
+    if (gNmLatLast > gNmLatMax) gNmLatMax = gNmLatLast;
+    /* h27 fix 3: never run the body nested inside a tick that is already in progress. */
+    if (gInTaskWork) { gNmDeclined++; gNMTPosted = 0; return; }
+    /* ★ THE WHOLE POINT: task level, in some application's event loop, with no application of ours. */
+    ehci_vhub_selfprobe_tick();
+    gNMTPosted = 0;                        /* h27 fix 2: only NOW may the heartbeat arm a fresh request */
+}
+
+/* Post a request if work is parked and one is not already outstanding. Called from ehci_vhub_service, i.e.
+ * interrupt level, so a park is noticed within one 8 ms heartbeat. NMInstall only enqueues — that is
+ * precisely why Apple's design puts it here. */
+/* ★★★★★★ h28 — ARM ON A KEEPALIVE TOO, NOT ONLY ON PARKED WORK. Two reasons, one of them a diagnostic
+ * failure of my own making.
+ *
+ * ⚠ THE BLIND SPOT. Run B (h27 + n4j) produced a 73-line log that stopped at "pump armed" and said nothing
+ * else: `gTickCalls` 0, no PORTMAP, no counters. Three causes were possible — the engine never started, it
+ * parked but `task_work_arm` never posted, or `NMInstall` posted and the NM never called back — and **none of
+ * them could be told apart, because `gNmArmed`/`gNmFired`/`gNmFailed` print only in the periodic dump, the
+ * periodic dump runs only from a tick, and a tick is exactly what was missing.** The instrument was reachable
+ * only through the thing being measured. That is the h24 chicken-and-egg again, and I built it twice.
+ * ⇒ A keepalive makes the pump SELF-REPORTING: with no app at all, the counters and the interrupt-log ring
+ * reach the file on their own, so a failed run explains itself instead of needing a manual flush afterwards.
+ *
+ * ★ AND IT IS BETTER ENGINEERING INDEPENDENTLY. Event-only arming makes the whole task-level path depend on
+ * the park-detection predicate being exactly right; a park nobody notices is a mount that never happens, with
+ * no trace. The keepalive is the backstop: worst case, work waits one interval instead of forever.
+ *
+ * ⚠ Cost is small and bounded: one no-display NM request every ~2 s. The response is a single `selfprobe_tick`,
+ * which is strictly less work than the continuous ticking an application did — and the periodic dump inside it
+ * is rate-limited by CALL count (every 64), so at 2 s per call that is one dump every ~2 minutes, not a flood. */
+#define NM_KEEPALIVE_TICKS  250UL                  /* h65: SIH passes. ~2 s at the 8 ms heartbeat, and
+                                                    * sooner when the real IRQ is also driving it. */
+/* h63: how long a posted NM request may go unanswered before we treat it as LOST and re-arm. Deliberately far
+ * beyond any latency ever observed (phase A recorded a response arriving 1829 ticks / 30.5 s late), because
+ * re-arming while one is genuinely still queued would double-post. */
+#define NM_STUCK_TICKS      7500UL                 /* h65: SIH passes, ~60 s at 8 ms */
+static volatile UInt32 gNmKeepDue = 0, gNmKeepArms = 0;
+
+static void task_work_arm(void)
+{
+    /* ★★★★★★★ h64 — THE KEEPALIVE'S CLOCK WAS lowmem Ticks, AND lowmem Ticks IS DRIVEN BY VBL.
+     *
+     * ⚠ m15 refuted the h63 theory and pointed straight here. Its counters: gNmArmed/gNmFired = 1/1 with a
+     * latency of 49 ticks, i.e. the request was armed once, ANSWERED PROMPTLY, and then nothing ever armed
+     * again — gNmStuckRearms 0, so it was never "lost". task_work_arm runs on the 8 ms heartbeat and cannot
+     * be starved, and gNMTPosted was clear. The ONLY remaining way to not re-arm is for `keep` never to go
+     * true — and `keep` was computed from lowmem Ticks (0x016A), which the VBL interrupt increments.
+     *
+     * ★★ THIS MACHINE HAS A KNOWN, ONLY PARTIALLY FIXED VBL BUG. It is the whole subject of the sibling VBL
+     * project; the user keeps a VBLFix app on the desktop for it and hit a freeze during the m13 run. When VBL
+     * dies, Ticks stops — so a cadence keyed off Ticks stops with it, permanently and silently.
+     * ⇒ THE COLD-BOOT USB MOUNT FAILURE AND THE VBL BUG ARE THE SAME BUG. It also explains why HOT-PLUG ALWAYS
+     * WORKS: by then the desktop has settled (or the user has run VBLFix), Ticks advances, and the pump runs.
+     *
+     * ★ THE FIX: use frame_ms(), the driver's own clock, derived from the controller's FRINDEX. It advances
+     * for as long as the EHCI controller is running and is independent of VBL, the Time Manager and task
+     * level. Every control and BOT timeout in this driver already trusts it; the app-less pump was the one
+     * liveness path still keyed to a clock the machine cannot guarantee.
+     * ⚠ TICKS_NOW is still used by the down-engine stall watchdog (r54). That is a BACKSTOP, not a liveness
+     * path — a frozen Ticks makes it late, not fatal — so it is deliberately left alone rather than swept up
+     * in this change. */
+    /* ★★★★★★★ h65 — STOP GUESSING WHICH CLOCK DIED. DRIVE THE CADENCE OFF THE ONE THING DEMONSTRABLY ALIVE.
+     *
+     * ⚠ TWO CLOCK THEORIES HAVE NOW BEEN REFUTED BY THEIR OWN INSTRUMENTATION, which is the process working,
+     * but it is also the signal to stop substituting clocks one at a time:
+     *   h63 said the NM request was LOST -> refuted: m15 read gNmArmed/gNmFired 1/1, answered in 0.8 s,
+     *       gNmStuckRearms 0.
+     *   h64 said lowmem Ticks froze because VBL died -> refuted: m16 read gTicksStallMaxMs = 16 ms. VBL fine.
+     * Both runs still ended with `callN 1` -- armed once, answered, never re-armed.
+     *
+     * ★ WHAT IS LEFT, AND IT IS NARROW: task_work_arm runs from ehci_vhub_service on every SIH pass and
+     * gNMTPosted was clear, so the ONLY way not to re-arm is `keep` never going true -- i.e. whatever clock
+     * the cadence reads is not advancing. Ticks is fine. That leaves frame_ms(), which is advanced ONLY by
+     * frame_time_update() inside vhub_heartbeat -- the Time Manager one-shot. The SIH has a SECOND driver (the
+     * real EHCI IRQ), which is why port events keep flowing and gVhubTick keeps climbing even if the heartbeat
+     * has stopped re-arming itself. That asymmetry fits every run we have.
+     *
+     * ★★ SO USE gVhubTick: it is incremented on every SIH pass, and the SIH is fed by TWO independent sources.
+     * It is the most robust liveness signal in the driver, and unlike a wall clock it cannot be stopped by one
+     * subsystem failing. A cadence of SIH passes is not a precise 2 s, and it does not need to be -- this is a
+     * keepalive, not a deadline.
+     * ⚠ It also removes the LAST dependency of the app-less pump on anything outside the SIH, which is the
+     * point: the pump is a liveness path, and a liveness path must not be able to outlive its own clock. */
+    UInt32 nowK = gVhubTick;
+    int    keep = ((long)(nowK - gNmKeepDue) >= 0);
+    /* ★★★★★★★ h63 — THE KEEPALIVE IS A ONE-IN-FLIGHT CHAIN, AND ITS ONLY RECOVERY WAS THE RESPONSE FIRING.
+     *
+     * ⚠ gNMTPosted is set when NMInstall succeeds and cleared ONLY inside the NM response handler. So if that
+     * response is never delivered, this function returns on its first line for the rest of the session and the
+     * app-less task-level pump is dead — permanently, with no counter to say so.
+     *
+     * ★ MEASURED, m14 2026-08-11: `callN 0x00000001`. The pump ran EXACTLY ONCE in a whole session. That one
+     * fact explained everything the run showed — the deferred exposure never re-evaluated, the 45 s cap never
+     * fired, the log stopped draining, and dismissing the dialog changed nothing because nothing was left
+     * running to notice it.
+     * ★★ THE TRIGGER IS ENVIRONMENTAL AND NOT OURS TO PREVENT: an AppleShare alias in System Folder/Servers
+     * makes the OS block task level at boot while it tries to reach the server. The user measured ~15 s with
+     * the server absent and ~30 s with the Keychain prompt up, and during that window APPLE'S OWN HIDs are
+     * frozen too — this is the whole system's task level, not our driver. Phase A's gTickGapMax of 1855 ticks
+     * (30.9 s) was the same thing seen from the other side.
+     * ⇒ WE CANNOT STOP THE BLOCK. WE CAN SURVIVE IT. A user must be able to boot with Ethernet connected;
+     * that is a normal configuration, not one to design around.
+     *
+     * ★ THE WATCHDOG: if a request has been posted far longer than any latency ever observed, treat it as lost,
+     * NMRemove it and re-arm. 3600 ticks (60 s) is deliberately generous — Phase A saw a response arrive 1829
+     * ticks (30.5 s) late, and re-arming while one is genuinely still queued would double-post.
+     * ⚠ This can only ever ADD an arm, never remove one, so it cannot make the pump worse than it is. */
+    if (gNMTPosted) {
+        /* h83: gNmArmTickK, not gNmArmTick. Same clock as nowK and as NM_STUCK_TICKS — see the block by the
+         * declaration. This comparison has been reading milliseconds against SIH passes since h65, which is
+         * why gNmStuckRearms has been 0 in every run: the watchdog could never reach its own body. */
+        if ((long)(nowK - gNmArmTickK) < (long)NM_STUCK_TICKS) return;
+        (void)NMRemove(&gNMT);                 /* drop the lost request before posting a replacement */
+        gNMTPosted = 0; gNmStuckRearms++;
+    }
+    if (!task_work_pending() && !keep) return;
+    if (!gNMTUpp) return;                          /* UPP build failed at init; the app tick still works */
+    if (keep) { gNmKeepDue = nowK + NM_KEEPALIVE_TICKS; gNmKeepArms++; }
+    gNMT.qType   = nmType;
+    gNMT.nmMark  = 0;                              /* no Application-menu mark */
+    gNMT.nmIcon  = 0;
+    gNMT.nmSound = 0;
+    gNMT.nmStr   = 0;                              /* ★ nmStr = 0: displays NOTHING. This is the trampoline */
+    gNMT.nmResp  = gNMTUpp;
+    gNMT.nmRefCon = 0;
+    gNmArmTick  = frame_ms();     /* h64: the LATENCY clock — ms, matches ehci_nm_task_resp's frame_ms() */
+    gNmArmTickK = nowK;           /* h83: the WATCHDOG clock — gVhubTick, matches NM_STUCK_TICKS */
+    if (NMInstall(&gNMT) == noErr) { gNMTPosted = 1; gNmArmed++; }
+    else                            gNmFailed++;
+}
+
+/* ★★★★★ h31 — SWEEP COMPANION-OWNED PORTS AT BRING-UP, because our own HCReset just gave them away.
+ *
+ * ⚠ THE h30 T2 RESULT (2026-08-09): boot with a drive on the card → it mounted at USB 1.1, Apple's stack.
+ * The INIT's early claim WORKED — its own log shows the port going 0x2800 (companion) → 0x1803 (ours, CCS=1,
+ * drive visible). Then activation ran ehci_hc_reset, and **HCReset resets CONFIGFLAG to 0**, routing every
+ * port to the companions for the bring-up window. Apple's hot stack took the connected drive, and when
+ * hc_start set CONFIGFLAG=1 milliseconds later this NEC chip did NOT evict the active companion connection —
+ * the first PORTMAP reads 0x3800 (owner=1) and we are blind there (CCS reads 0 under owner=1). Apple mounted
+ * it at desktop time, at 1.1. The early claim was real; OUR OWN RESET un-did it nine seconds later.
+ *
+ * ★ THE EVICTION WRITE IS HARDWARE-PROVEN SAFE-AND-EFFECTIVE on this chip: the INIT claim's owner=0 write is
+ * exactly what produced 0x2800→0x1803 against an ACTIVE companion connection. n11's scar was clearing Port
+ * ENABLE; owner=0 with power preserved is the claim this driver has always made at CONFIGFLAG time.
+ * ★ Timing makes the yank clean: at bring-up Apple cannot have MOUNTED anything (its boot-attached mounts
+ * defer to the desktop, per the user's own observation), so an evicted device was enumerated-at-most, never
+ * a live volume. An FS/LS device swept here fails to chirp and is ceded straight back — the proven path.
+ * ★ The chip AUTO-REVERTS ownership on disconnect (observed this run: 0x3800→0x1000 on unplug with no PORTSC
+ * write of ours) — so this sweep is only needed for devices CONNECTED ACROSS bring-up, which is exactly the
+ * cold-boot-attached case T2 tests. */
+/* h43: public wrapper so uimInitialize can take the earliest snapshot (h41_queue_dump is static). */
+void ehci_vhub_queue_dump_public(const char *when) { h41_queue_dump(when); }
+
+void ehci_vhub_bringup_owner_sweep(void)
+{
+    int p, np = (int)gSoftc.nPorts, swept = 0;
+    if (!gSoftc.opBase || np <= 0 || np > 15) return;
+    for (p = 0; p < np; p++) {
+        UInt32 v = ehci_read32(gSoftc.opBase, EHCI_PORTSC(p));
+        if (v & EHCI_PORT_OWNER) {
+            /* ★★★★ h33 — NEVER EVICT A LOW-SPEED DEVICE. K-state on the line (bits 11:10 = 01) means a
+             * low-speed device is attached, and we can NEVER drive one on a root port (EHCI has no root-port
+             * splits) — evicting it just kills a working keyboard until the cede wanders back, or strands it
+             * outright (the T4-on-v4 dead keyboard, port read 0x3400 = K). The line state reads through
+             * Owner=1. ⚠ The companion may be actively DRIVING the device, and line state toggles during a
+             * transfer — an LS transfer lasts long enough that consecutive µs-reads can all land inside one
+             * packet reading J. So sample ACROSS a window longer than any LS transfer: 16 samples spaced
+             * ~100 µs; ANY K ⇒ low-speed (an FS/HS idle line never shows K). */
+            int k = 0, s, d;
+            for (s = 0; s < 16; s++) {
+                if (((ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)) >> 10) & 3) == 1) k++;
+                for (d = 0; d < 100; d++) (void)ehci_read32(gSoftc.opBase, EHCI_FRINDEX);  /* ~100 µs spacer */
+            }
+            /* ★ h34 MAJORITY, not any-K (the h33 filter was wrong for busy lines): FULL-SPEED signalling
+             * toggles J/K per packet, so a drive Apple is actively driving shows K on some samples — any-K
+             * would have skipped the drive's port and produced a 1.1 mount. LS idles at K (≥14/16); a busy
+             * FS line samples ≈50/50 in packets, J between (≤8/16). Threshold 12. K-count logged so hardware
+             * tells us the real distributions. */
+            if (k >= 12) {
+                ehci_os_logx("h34: K-majority (LOW-SPEED device) — LEFT WITH APPLE; port<<8|Kcount",
+                             ((UInt32)p << 8) | (UInt32)k);
+                continue;
+            }
+            ehci_os_logx("h34: K-samples of 16 (below 12 = not low-speed, evicting); port<<8|Kcount",
+                         ((UInt32)p << 8) | (UInt32)k);
+            ehci_os_logx("h31: port still COMPANION-OWNED after hc_start (our HCReset gave it away) — "
+                         "evicting; port<<28|PORTSC[before]", ((UInt32)p << 28) | (v & 0xFFFFFFF));
+            v &= ~EHCI_PORTSC_RW1C; v &= ~EHCI_PORT_OWNER; v |= EHCI_PORT_POWER;
+            ehci_write32(gSoftc.opBase, EHCI_PORTSC(p), v);
+            ehci_os_logx("h31:   PORTSC[after]", ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)));
+            swept++;
+        }
+    }
+    if (swept) ehci_os_logx("h31: owner sweep complete — ports evicted back to EHCI", (UInt32)swept);
+}
+
+void ehci_vhub_appless_init(void)
+{
+    /* ★★★★★★★ h96 — THE PUMP DESCRIPTOR MUST LIVE IN THE SYSTEM ZONE. NewNMUPP allocates in TheZone,
+     * and this runs at task level inside whatever context hosts the extension's NM response — a zone
+     * with no obligation to outlive boot. The 2026-08-14 MDD desktop-load crash was this exact class:
+     * a persistent descriptor in evaporating boot-era memory, recycled into the Helvetica FOND, then
+     * called — and THIS descriptor is the most-called pointer in the whole driver (every task tick,
+     * forever). h90 already carried the rule and the idiom ("the RD must outlive whichever app hosts
+     * boot"); the lesson existed in one place and was not consulted here. Now it is. */
+    if (!gNMTUpp) {
+        THz oldZone = GetZone();
+        SetZone(SystemZone());
+        gNMTUpp = NewNMUPP(ehci_nm_task_resp);
+        SetZone(oldZone);
+    }
+    ehci_os_logx("=== h26 APP-LESS: NMInstall(nmStr=0) task-level pump armed; UPP non-zero = ready (h96: SysZone-forced)", (UInt32)gNMTUpp);
+}
+
+static void selfprobe_tick_body(void);
+
+/* The public tick is a WRAPPER: the body keeps its several early returns, so the depth counter is maintained
+ * here where there is exactly one exit (inline set/clear around those returns would leak it).
+ *
+ * ⚠⚠ h27: THIS PATH NEVER SHORT-CIRCUITS. h26 put `if (gInTaskWork) return;` here and that made an app tick
+ * capable of being silently dropped — a behavioural change to the exact path an application has driven for 130
+ * builds, for the benefit of a new path that could have been guarded on its own. Run A froze. Whatever else
+ * was wrong (see ehci_nm_task_resp), changing a validated path to protect a new one was the wrong shape:
+ * ★ GUARD THE NEW CALLER, NOT THE SHARED CALLEE. */
 void ehci_vhub_selfprobe_tick(void)
+{
+    /* ★★ h28: measure IDLE time — previous body EXIT to this entry — not entry-to-entry.
+     * ⚠ h26/h27 measured entry-to-entry, which INCLUDES the body's own duration, and the body writes a ~40-line
+     * periodic dump with an FSWrite + FlushVol per line to the boot volume while USB copying is in flight. So
+     * h27's headline "gTickGapMax = 245 ticks = 4.08 s" may have been the instrument timing ITSELF rather than
+     * any starvation, and it could not distinguish the two. Idle time can only be time we were not called. */
+    {   UInt32 nowT = *(volatile UInt32 *)0x016AUL;      /* lowmem Ticks (60 Hz) */
+        if (gTickCalls) { gTickGapLast = nowT - gTickLastExit;
+                          if (gTickGapLast > gTickGapMax) gTickGapMax = gTickGapLast; }
+        gTickCalls++;
+    }
+    gInTaskWork++;
+    /* ★ h88: the DCE fix, retried from PROVEN task level until it lands. The uimInitialize call ran before
+     * the USL had registered the unit entry (the leading read of the m36 miss), so nothing was found. This
+     * runs seconds later, after all boot registration, and is a latched no-op once the plant succeeds. */
+    { extern void ehci_os_fix_native_dce(void); ehci_os_fix_native_dce(); }
+    h92_check();   /* h92: sweep the DMA guard zones — reads only, latched one-shot reporting */
+    /* h84: bracket the body. gBodyStartMs is the LIVE field — the paint reads frame_ms() - gBodyStartMs at
+     * interrupt level, so a body that never returns still reports how long it has been gone. */
+    gBodyStartMs = frame_ms();
+    bphase(BP_ENTRY);
+    selfprobe_tick_body();
+    {   UInt32 d;
+        bphase(BP_IDLE);                       /* closes the last phase's high-water on the way out */
+        d = frame_ms() - gBodyStartMs;
+        gBodyLastMs = d;
+        if (d > gBodyMaxMs) gBodyMaxMs = d;    /* COMPLETED bodies only — a wedge never reaches this line */
+        if (d >= BODY_SLOW_MS) gBodySlowN++;
+    }
+    gInTaskWork--;
+    gTickLastExit = *(volatile UInt32 *)0x016AUL;
+}
+
+static void selfprobe_tick_body(void)
 {
     static const UInt8 cdbInq[6]  = {0x12,0,0,0,36,0};
     static const UInt8 cdbCap[10] = {0x25,0,0,0,0,0,0,0,0,0};
@@ -4117,7 +6497,101 @@ void ehci_vhub_selfprobe_tick(void)
      *     drains it, so the ring simply ACCUMULATES and appears in the log the next time anything pumps
      *     us — which is exactly how to read back an appless run: insert with nothing running, then launch
      *     the activator afterwards and the whole enumeration trace lands in EHCIUIM_init.log. */
-    ehci_os_ilog_drain();
+    /* h78: the BULK drain. This is selfprobe_tick, running in the NM response — NOT inside a File
+     * Manager call chain — so a generous budget here is safe, and it is what keeps the ring from
+     * overflowing now that the DoDriverIO drain is capped at a handful of lines. */
+    bphase(BP_LOGDRAIN);
+    ehci_os_ilog_drain_bulk();
+    /* ★★★★★★ h42 — THE h41 LATE DUMP BELONGS **HERE**, AT TASK LEVEL. IT WAS IN as_tick, AT INTERRUPT LEVEL.
+     *
+     * ⚠⚠ h41 crashed the Finder into MacsBug: "Privilege Violation at 01E79BFC 'FOND 0015 02D6 Helvetica'" —
+     * the PC inside a FONT resource, i.e. data executed as code, from an "instrument only" build. Cause: I put
+     * h41_queue_dump (which calls ehci_os_log -> synchronous FSWrite + FlushVol) inside as_tick, and as_tick
+     * runs from the 8 ms HEARTBEAT at INTERRUPT LEVEL as well as from the task-level tick.
+     * ★ That is this project's FIRST rule — never call the File Manager below task level — and it has now bitten
+     * four times (r18, n4, r95, this). The interrupt-safe ring (ehci_os_ilog*) exists for exactly that path and
+     * the h39 scan a few lines below correctly uses it; I reached for the wrong logger and shipped it.
+     * ⇒ selfprobe_tick_body is task-level by construction (it is the NM response / slot-23 path, and it opens
+     * with the File-Manager drain above), so the dump is safe here and nowhere near the heartbeat. */
+    /* ★★★★★★ f4 VERDICT — PRINTED TWICE, AND ON THE **DIRECT** CHANNEL. BOTH CHOICES ARE THE POINT.
+     *
+     * ⚠ WHY TWICE. m24 DIED INSIDE THE +15 s WINDOW — that dump never fired, which is precisely how we know
+     * the crash was in there. Hanging the verdict off that one deadline would have reproduced the failure
+     * this whole run exists to avoid: the evidence dying with the machine. +5 s is the floor (the mount
+     * attempt has begun, so any clobber during it is already counted), +15 s is the full window.
+     *
+     * ⚠⚠ WHY ehci_os_logx AND NOT THE CRITICAL RING. I first wrote this on ehci_os_ilogc — reaching for
+     * "critical = rate-cap exempt" when the requirement here is actually CRASH SURVIVAL, which is a
+     * different property. A ring line sits in MEMORY until some task-level caller drains it; a machine that
+     * dies first takes it with it. ehci_os_log/logx is a synchronous FSWrite + FlushVol — ON DISK before the
+     * next line runs. This block is task level by construction (see the note above), so the direct channel
+     * is available, and at task level it is ALSO uncapped. Strictly better here on every axis.
+     * ⇒ The general lesson, and it is the §0 lesson again from the other side: pick the channel by what the
+     * line has to survive, not by which one has the word "critical" on it.
+     *
+     * ★ HOW TO READ IT — the three outcomes are mutually exclusive and the log states which one it is:
+     *   f4 clobberProbe > 0  => DIRECTION B. Block I/O armed the shared slot over a live PROBE transfer.
+     *                           The victim's qTD is orphaned AND both were pointed at the same bounce.
+     *                           This is the only mechanism that can corrupt the MOUNT'S OWN data, so it
+     *                           is the answer if the volume came up unreadable or the machine crashed.
+     *   f4 pumpBlockedByBio > 0 and maxWaitMs large => DIRECTION A. The probe was starved: its queued
+     *                           transfer was never issued while the mount re-armed the slot on every
+     *                           completion. Expect a failed/timed-out probe and a HEALTHY mount.
+     *   all zero, and enumWhileBio 0 => NEITHER. The two never coincided; F4 is refuted and the
+     *                           CTL/BULK split stays off the critical path. That is a real result.
+     * ⚠ enumWhileBio > 0 with both harm counters 0 means they overlapped WITHOUT contending — worth
+     * knowing, because it says the window is real and only the timing spared us.
+     *
+     * ZERO lines are added to the hot path — the whole instrument is counters until this moment. That
+     * discipline is h47's: 705 dumps inside one defer window were "noise and a plausible confound". */
+    bphase(BP_LATEDUMP);
+    {   int f4early = (gF4EarlyDue && (long)(*(volatile UInt32 *)0x016AUL - gF4EarlyDue) >= 0);
+        int f4late  = (gH41LateDue && (long)(*(volatile UInt32 *)0x016AUL - gH41LateDue) >= 0);
+        if (f4early) gF4EarlyDue = 0;
+        if (f4late) {
+            gH41LateDue = 0;
+            h41_queue_dump("=== h41 QUEUES **~15 s AFTER** the exposure (post-prompt end state: ONE entry or two?) ===");
+        }
+        if (f4early || f4late) {
+            ehci_os_log(f4late
+                ? "=== f4 SHARED IN-FLIGHT SLOT — VERDICT at ~15 s (the FULL mount window) ==="
+                : "=== f4 SHARED IN-FLIGHT SLOT — VERDICT at ~5 s (EARLY floor; the ~15 s one follows "
+                  "unless the machine dies first, which is exactly what m24 did) ===");
+            ehci_os_logx("  f4 snapshot AT AddDrive: asRunning<<24|asPc<<16|bioDepth<<8|dpBusy<<4|owner "
+                         "(owner 1=ctl 2=probe 3=bio)", gF4Snap);
+            ehci_os_logx("  f4   downQ depth at that moment", gF4SnapDownQ);
+            ehci_os_logx("* f4 B: CLOBBERS — bio armed over a BUSY slot (total)", gF4Clobber);
+            ehci_os_logx("* f4 B:   ...of a PROBE/enum bulk transfer (THE DANGEROUS ONE)", gF4ClobberProbe);
+            ehci_os_logx("  f4 B:   ...of a control transfer", gF4ClobberCtl);
+            ehci_os_logx("  f4 B:   ...of another block transfer (nonzero = a bio-engine bug)", gF4ClobberBio);
+            ehci_os_logx("  f4 B:   ...while an enumeration sequence was running", gF4ClobberEnum);
+            ehci_os_logx("  f4 B:   frame_ms of the FIRST clobber (0 = never happened)", gF4ClobberFirstMs);
+            ehci_os_logx("* f4 A: down_pump BLOCKED with work queued (total)", gF4PumpBlocked);
+            ehci_os_logx("* f4 A:   ...specifically because BLOCK I/O held the slot", gF4PumpBlockedByBio);
+            ehci_os_logx("* f4 A:   worst wait, ms, a queued transfer sat unissued", gF4PumpMaxWaitMs);
+            ehci_os_logx("  f4 A:   owner of the slot at that worst wait (1=ctl 2=probe 3=bio)",
+                         gF4PumpMaxWaitOwner);
+            ehci_os_logx("* f4 OVERLAP: heartbeats with an enumeration running AND a block transfer in flight",
+                         gF4EnumArmedWhileBio);
+            ehci_os_logx("  f4 context: gDownQDrop (queue overflowed) / gDownTimeouts",
+                         ((gDownQDrop & 0xFFFFUL) << 16) | (gDownTimeouts & 0xFFFFUL));
+            /* ★★★★★★ THE SPLIT'S OWN VERDICT. Read these three together:
+             *   splitSaved > 0 AND clobbers 0  => the split WORKED, and this says how many times.
+             *   splitSaved 0                   => the two never coincided this boot; proves nothing either
+             *                                     way, exactly like the single-drive m25 run. Try again with
+             *                                     the hub + two drives.
+             *   any clobber > 0                => block I/O armed over BLOCK I/O. The engine can no longer
+             *                                     be the victim, so this would be a NEW, different bug in
+             *                                     bio_kick/bio_advance serialisation. Do not ignore it.
+             *   egOversize > 0                 => a caller asked the engine for more than ENG_BUF_MAX and
+             *                                     was refused. Must be 0; if not, find the caller. */
+            ehci_os_logx("* SPLIT: times block I/O armed while the ENGINE was busy (each one WAS a clobber "
+                         "before this build; now harmless)", gSplitSaved);
+            ehci_os_logx("* SPLIT: engine transfers REFUSED for exceeding ENG_BUF_MAX (MUST be 0)", gEgOversize);
+            ehci_os_logx("  SPLIT: engine slot busy<<8 | block-I/O slot busy, right now",
+                         ((UInt32)(gEgBusy ? 1 : 0) << 8) | (UInt32)(gDpBusy ? 1 : 0));
+        }
+    }
     /* ★★ n5d LIVENESS PROBE — the one diagnostic that settles the n5r failure.
      * Symptom being chased: the app stays RESPONSIVE (so its pump loop is returning) yet nothing from this
      * function reaches the log after Apple's root-hub enumeration — no PORTMAP idle reminders, no port
@@ -4129,13 +6603,57 @@ void ehci_vhub_selfprobe_tick(void)
      *       the connect; a frozen gVhubTick means the heartbeat/SIH is dead so nothing is polling the ports.
      * Deliberately NOT EHCI_VERBOSE: that flag restores the whole per-tick v18-v42 trace, and its per-tick
      * FSWrite+FlushVol is itself a known enumeration-timing aggravator. This is one line per 512 calls. */
+    bphase(BP_PERIODIC);        /* h84: the ~40-line dump, every line an FSWrite + FlushVol on the boot volume */
     { static UInt32 gLiveN = 0;
       /* n5d2: every 64 calls, not 512. The first run produced exactly ONE block, which told us the state
        * was clean at call 1 but gave no TIME SERIES — and the decisive question is whether gVhubTick keeps
        * CLIMBING (heartbeat alive) or freezes (heartbeat dead, so service_ports never sees the insert,
        * which would explain both the missing port event and the 1.1 mount). ~10 calls/sec means a block
        * every ~6 s. */
-      if ((gLiveN++ & 0x3FUL) == 0) {
+      /* ★★★★★★★ h68 — THE INSTRUMENT WAS THE BOTTLENECK, NOT THE BUG.
+       * The periodic dump fired every 64 pump passes, and app-less the pump is paced by the keepalive at 250
+       * SIH passes -- so a dump landed roughly every 16,000 SIH passes, about every two minutes. That is why
+       * every run since m14 has yielded ONE OR TWO samples, and why four successive theories each died for
+       * lack of data rather than being settled by it. Every one of them would have been answered in a single
+       * run at a usable sample rate.
+       * ⇒ every 4 passes. 16x the samples, and the cost is log volume on a run we are reading anyway. */
+      /* ★★★★★★ h78 FIX 3 — PACE THIS BY THE WALL CLOCK, NOT BY PUMP PASSES.
+       *
+       * ⚠ MEASURED, m26 re-boot: this dump fired 62 TIMES in one session at ~86 lines each — 5365 lines
+       * AFTER the mount, every one a synchronous FSWrite + FlushVol at task level, landing exactly where
+       * the Finder is building the desktop. At the documented 1-5 ms per write that is 5-27 SECONDS of
+       * pure File Manager time. The defer that run was 38.8 s, the longest ever recorded.
+       * ★ THE DEFECT IS THE PACING BASIS, NOT h68's NUMBER. h68 changed the divisor from 64 to 4 for an
+       * excellent reason — the old rate gave ONE SAMPLE PER TWO MINUTES and four consecutive theories
+       * died for want of data — and its own comment accepted "the cost is log volume on a run we are
+       * reading anyway". But PUMP PASSES are not a clock: the pump rate swings enormously between
+       * app-driven and app-less, idle and busy, so the log rate ended up being an artifact of how busy
+       * the machine was rather than anything we chose.
+       * ⇒ Wall clock, and DENSE WHERE THE ACTION IS: every 2 s while we are still enumerating and
+       * probing, every 15 s once a volume has mounted and the interesting part is over. h68's sample
+       * rate is preserved exactly where h68 needed it, and the steady-state flood — which is what was
+       * actually hurting us — drops by roughly an order of magnitude. */
+      UInt32 nowDump = *(volatile UInt32 *)0x016AUL;          /* lowmem Ticks, 60 Hz */
+      static UInt32 sNextDump = 0;
+      gLiveN++;
+      if ((long)(nowDump - sNextDump) >= 0) {
+          /* ★★★★★★★ h79 — h78's GATE WAS WRONG AND MADE THE IDLE CASE TEN TIMES WORSE.
+           * ⚠ `gMountedOnce ? 900 : 120` reads as "2 s until something mounts, then 15 s". But with NO
+           * DRIVES ATTACHED gMountedOnce is NEVER SET, so it means 2 s FOR EVER. Measured on a no-drive
+           * boot: 18 dumps, ~1548 of the session's 1677 lines, every one a synchronous FSWrite+FlushVol
+           * at task level during desktop construction. Before h78 the gate was every 4 PUMP passes, and
+           * a pump that turns once per tens of seconds gave 1-2 dumps a boot — so h78 made the quiet
+           * case an order of magnitude WORSE, which is the exact opposite of its purpose, and the user
+           * felt it immediately as "desktop icons take much longer to load than before".
+           * ⇒ THE CONDITION IS "ARE WE ACTUALLY DOING SOMETHING", NOT "HAS ANYTHING EVER MOUNTED".
+           * h68 needed dense sampling DURING enumeration and probing; that is preserved exactly. What
+           * goes away is hammering the File Manager while the driver sits idle with nothing plugged in.
+           * ★ AND IT MATTERS MORE THAN LOG TIDINESS: 72.6 s of NM latency was measured on a boot with NO
+           * USB DEVICES AT ALL, where our only activity IS this logging. We are not a bystander to the
+           * task-level starvation — we are feeding it. */
+          {   int busy = gAs.running || gAsProbeOK || gAsNeedBulk || gBioPhase || gHubIntNeedArm;
+              sNextDump = nowDump + (busy ? 120UL : 1800UL);   /* 2 s working, 30 s idle */
+          }
           ehci_os_log("n5d uim23 ALIVE:");
           ehci_os_logx("  callN",         gLiveN);
           ehci_os_logx("  gVhubTick (heartbeat/SIH alive if climbing)", gVhubTick);
@@ -4148,16 +6666,219 @@ void ehci_vhub_selfprobe_tick(void)
           ehci_os_logx("  gAs.running",   (UInt32)gAs.running);
           ehci_os_logx("  gAs.pc",        (UInt32)gAs.pc);
           ehci_os_logx("  gHideLogMask",  gHideLogMask);
+          /* ★★★★★ h36 — THE TRANSFER-ENGINE HEALTH COUNTERS BELONG IN *THIS* DUMP, not only in the v47 stall
+           * dump. Four T4 runs failed with "the volume needs to be initialized" and I could not say whether a
+           * transfer had errored, timed out, or been starved — because gDownErr/gDownTimeouts/gIsrConsecMax
+           * print ONLY from the v47 dump, which is gated on gDpBusy and never fired in any of those runs. So
+           * the periodic dump reported a healthy-looking engine while saying nothing about the failure at all.
+           * ⚠ That is the same defect shape as the h28 keepalive: a diagnostic reachable only through a path
+           * the failure does not take. These are four cheap reads; they belong where the dump always runs.
+           * ★ gIsrConsecMax is the shared-IRQ storm peak, which is the counter that matters most for the T4
+           * configuration — HIDs on the card mean Apple's companion shares our PCI interrupt line and fires
+           * constantly, and a storm that masks USBINTR long enough would starve a File Manager read into
+           * ioErr, i.e. exactly "unreadable volume". This makes that hypothesis measurable instead of argued. */
+          ehci_os_logx("  h36 gDownErr / gDownTimeouts (both MUST be 0)",
+                       ((gDownErr & 0xFFFFUL) << 16) | (gDownTimeouts & 0xFFFFUL));
+          ehci_os_logx("  h36 gIsrConsecMax (shared-IRQ storm peak; high = companion flooding our line)",
+                       gIsrConsecMax);
+          ehci_os_logx("  h36 gDownDone (retirements; frozen while busy = engine stalled)", gDownDone);
+          /* h45: non-zero = Apple got onto our bus despite APPLE_HIDE and we refused it. */
+          ehci_os_logx("!! h45 gH45Refused (foreign-address bulk refusals; MUST be 0)", gH45Refused);
+          /* h46: ONE per low-speed device ceded. 78 for one mouse was the h45 spin. */
+          ehci_os_logx("!! h46 gH46CedeSpinGuard (h33 K-cedes; MUST equal the number of LS devices ceded)",
+                       gH46CedeSpinGuard);
+          ehci_os_logx("!! h53 gH53Unceded (ceded ports taken back after the companion released OWNER)",
+                       gH53Unceded);
+          /* h57: the QH-overlay halt. These two must MATCH — every halt seen is a halt cleared. A non-zero
+           * count is not itself a failure (a transaction error on the wire is a device/timing event); it means
+           * the endpoint recovered instead of staying dead for the session, which is the whole fix. */
+          ehci_os_logx("!! h57 gQhHalted<<16|gQhUnhalted (QH overlay halts seen | cleared — MUST be equal)",
+                       ((gQhHalted & 0xFFFFUL) << 16) | (gQhUnhalted & 0xFFFFUL));
+          h48_probe();      /* h48: the _SystemTask trap watch + the Expert's own account. Task level. */
+          h52_probe();      /* h52: the display-driver swap watch. Task level, pure memory reads. */
+          ehci_os_logx("  h36 sharedCompanion (1 = our ISR chains Apple's on the same line)",
+                       (UInt32)gSoftc.sharedCompanion);
+          /* ★★★★★ ase_quiesce cost — THE app-less gating number (see the note on ase_quiesce).
+           * Read it as: iterMax against the ASE_QUIESCE_ITER_CAP backstop (20000), the real limit being the
+           * 10 ms TIME bound, and tbMax converted with
+           *   microseconds = tbTicks * 125 * ufSpan / tbSpan
+           * ⚠ aseTimeouts MUST be 0. Non-zero means the schedule never stopped and we reprogrammed a LIVE
+           * ring anyway — the r84/r85 freeze shape, silent until this build.
+           * ⚠⚠ h25: the label on aseIterMax used to read "bound is 200000" and was left behind when the bound
+           * became a time bound with a 20000 backstop — a reader comparing 1870 against 200000 would conclude
+           * there was 100x of headroom where there is ~10x. Fixed here; the counters themselves are unchanged
+           * so old logs stay comparable.
+           * ★★ AND THE us CONVERSION IS NOW KNOWN GOOD, which CORRECTS a recorded number: the 2026-08-07 run
+           * reported 2557.7 ticks per microframe = 20.46 MHz, and p1/p2 on 2026-08-08 both measured 5204 =
+           * 41.67 MHz. The new figure is the right one — an MDD's timebase is bus/4, and 166.7/4 = 41.67 MHz
+           * exactly, where 20.46 MHz implies an 82 MHz bus that no MDD has. ⇒ the recorded "worst 1718
+           * iterations = 1.55 ms" was 2x too high and is really ~0.77 ms, which agrees with p1's independent
+           * 1870 iterations = 0.803 ms. The DECISION is untouched: at 0.43 us/iter the retired 200000 bound
+           * was still ~86 ms of frozen event loop, so replacing it with the 10 ms time bound was right anyway.
+           * ⚠ The earlier "trustworthy because last and max agree (0.87 vs 0.90 us)" check could not have
+           * caught this: both derived from the SAME conversion, so it tested self-consistency, not the clock. */
+          ehci_os_logx("  m4 aseCalls",        gAseCalls);
+          ehci_os_logx("  m4 aseSkip (already stopped; cost 0)", gAseSkip);
+          ehci_os_logx("  m4 aseSpun (actually waited)",         gAseSpun);
+          ehci_os_logx("  m4 aseIterLast",     gAseIterLast);
+          ehci_os_logx("  m4 aseIterMax  (10 ms time bound; 20000-iter backstop)", gAseIterMax);
+          ehci_os_logx("  m4 aseIterSum  (/aseSpun = mean)",     gAseIterSum);
+          ehci_os_logx("  m4 aseTbLast   (timebase ticks)",      gAseTbLast);
+          ehci_os_logx("  m4 aseTbMax    (timebase ticks)",      gAseTbMax);
+          ehci_os_logx("  m4 calib tbSpan",    gAseTbSpan);
+          ehci_os_logx("  m4 calib ufSpan (125us each)",         gAseUfSpan);
+          /* ★★★★★ h26: is the task-level pump being STARVED? These are the discriminator the n4i run could
+           * not carry, because there was no clock in the log. gTickGapMax is the worst gap between task-level
+           * ticks; gNmLatMax is the worst delay from posting an NM request to nmResp running. Under a copy,
+           * ~18 ticks (300 ms) in either says the n4i same-qTD stalls were a starved pump; a few ticks in both
+           * leaves the device's own write latency as the explanation. gNmArmed vs gNmFired should track;
+           * gNmFailed MUST be 0 (a refused NMInstall means a parked job waits for the next arm). */
+          ehci_os_logx("  h26 gTickCalls (task-level ticks so far)",          gTickCalls);
+          ehci_os_logx("  h26 gTickGapLast / gTickGapMax (60 ticks = 1 s)",
+                       ((gTickGapLast & 0xFFFFUL) << 16) | (gTickGapMax & 0xFFFFUL));
+          ehci_os_logx("  h26 gNmArmed / gNmFired (should track)",
+                       ((gNmArmed & 0xFFFFUL) << 16) | (gNmFired & 0xFFFFUL));
+          /* ★ h27: declines are HEALTHY — the response found a tick already in progress and stood down. A
+           * park that survives is re-armed by the next heartbeat. Non-zero here just means the app tick and
+           * the pump were both live, which is exactly the Run A configuration. */
+          ehci_os_logx("  h27 gNmDeclined (response stood down; benign)", gNmDeclined);
+          /* ★ h28: keepalive arms. With NO app this is the only thing that gets the log written at all, so a
+           * non-zero value here in an app-less run is itself the proof that the NM route is alive. */
+          ehci_os_logx("  h28 gNmKeepArms (keepalive arms; app-less proof of life)", gNmKeepArms);
+          /* h63: non-zero means the pump was found DEAD and recovered. The trigger is environmental (an
+           * AppleShare alias blocking task level at boot), so on a networked machine this firing is EXPECTED
+           * and is the fix working -- it is not a fault indicator. */
+          ehci_os_logx("!! h63 gNmStuckRearms (lost NM requests recovered; non-zero = the pump was revived)",
+                       gNmStuckRearms);
+          /* h64: the VBL evidence. A large value means lowmem Ticks -- which the VBL interrupt drives --
+           * froze for that long, which is exactly what used to kill the keepalive when its cadence was keyed
+           * to Ticks. Ties this to the sibling VBL project. */
+          ehci_os_logx("!! h64 gTicksStallMaxMs (longest lowmem-Ticks freeze, ms; VBL drives that counter)",
+                       gTicksStallMaxMs);
+          /* ★ h65 THE DISCRIMINATOR: gHbRuns counts HEARTBEAT callbacks only; gVhubTick counts SIH passes,
+           * which the real EHCI IRQ also drives. gVhubTick climbing while gHbRuns is FLAT = the Time Manager
+           * one-shot stopped re-arming itself, freezing frame_ms() -- the last standing explanation for the
+           * pump arming exactly once. */
+          ehci_os_logx("!! h65 gHbRuns (heartbeat callbacks; compare with gVhubTick above)", gHbRuns);
+          /* ★ h66: the Vbus / over-current summary, per port. gPwLost non-zero means the port went DARK
+           * (the user's LED going out); gOcSeen non-zero means the controller reported over-current, which
+           * per EHCI 2.3.9 is itself a reason it would drop PORT_POWER. Either one names a physical cause
+           * that no amount of driver logic could have worked around. */
+          /* ★★★★★★ h80 — PRINT THE PER-PORT GUARDS ONLY WHEN THEY HAVE SOMETHING TO SAY.
+           * ⚠ These two loops emitted 10 LINES EVERY DUMP, and on the m29 run-4 session the dump fired 30
+           * times: 300 synchronous FSWrite + FlushVol at TASK LEVEL reporting, almost always, nothing but
+           * zeros. That is spent from the exact budget that was starving — the pump was taking 106.9 s a
+           * turn — so these lines were actively making the fault they were meant to help diagnose worse.
+           * ★ h66/h67 have read ZERO on every Mini run since h67 disproved the Vbus theory (m19). Suppress
+           * the all-clear and say so in ONE line, so a reader still knows the check RAN. Anything non-zero
+           * still prints per port, in full, unchanged — the diagnostic keeps all of its power and loses
+           * only its cost. Same lesson as h16/h68: a diagnostic nobody can afford to leave on is worthless
+           * in the run that matters. */
+          {   int _p, any = 0;
+              for (_p = 0; _p < (int)gSoftc.nPorts && _p < 15; _p++)
+                  if (gPwLost[_p] || gOcSeen[_p] || gRepower[_p]) any = 1;
+              if (!any) {
+                  ehci_os_log("  h66/h67 Vbus + over-current + re-power: ALL PORTS CLEAN (checked, all zero)");
+              } else {
+                  for (_p = 0; _p < (int)gSoftc.nPorts && _p < 15; _p++)
+                      if (gPwLost[_p] || gOcSeen[_p])
+                          ehci_os_logx("!! h66 port<<28|powerLost<<16|overCurrentSeen",
+                                       ((UInt32)_p << 28) | ((gPwLost[_p] & 0xFFUL) << 16) | (gOcSeen[_p] & 0xFFFFUL));
+                  for (_p = 0; _p < (int)gSoftc.nPorts && _p < 15; _p++)
+                      if (gRepower[_p])
+                          ehci_os_logx("!! h67 port<<28|rePowerAttempts (0 = never needed)",
+                                       ((UInt32)_p << 28) | (gRepower[_p] & 0xFFFFUL));
+              }
+          }
+          /* h83: the unit in this label was WRONG — h64 moved both ends to frame_ms() and the word "ticks"
+           * stayed. Reading 0x0b81 as ticks reports a 49 s stall; it is 2945 ms. Say the unit correctly. */
+          /* ★★★ h84: the pump BODY, in milliseconds. Three lines, deliberately — this dump runs INSIDE the
+           * body it is measuring (phase BP_PERIODIC), so every line added here inflates its own reading.
+           * The per-phase table is on screen (row 5 MAXPH/PHMS) rather than here for the same reason. */
+          ehci_os_logx("★ h84 body ms: LAST<<16|MAX (completed bodies; a wedged body never records)",
+                       ((gBodyLastMs & 0xFFFFUL) << 16) | (gBodyMaxMs > 0xFFFFUL ? 0xFFFFUL : gBodyMaxMs));
+          /* h92: the corruption instruments, on the '!!' channel so LEVEL 1 carries them every dump. */
+          ehci_os_logx("!! h92 gH92Mask (DMA guard zones violated; MUST be 0 — nonzero = OUR DMA overran)",
+                       gH92Mask);
+          {   extern volatile UInt32 gN0Kind[3], gH93Count, gH93CcBad;
+              extern void ehci_os_h93_dump(void);
+              ehci_os_logx("!! h92 DoDriverIO kinds imm<<16|sync<<8|other (the h91 completion-tail watch)",
+                           ((gN0Kind[0] & 0xFFUL) << 16) | ((gN0Kind[1] & 0xFFUL) << 8) | (gN0Kind[2] & 0xFFUL));
+              ehci_os_logx("!! h93 DM calls<<16 | IOCommandIsComplete NONZERO returns (low; MUST be 0)",
+                           ((gH93Count & 0xFFFFUL) << 16) | (gH93CcBad & 0xFFFFUL));
+              ehci_os_h93_dump();   /* prints each new DM call: code/kind/cmdID + the DM's own verdict */
+          }
+          ehci_os_logx("!! h94 retired<<16 | refused (rude-removal client transfers made safe)",
+                       ((gH94Retired & 0xFFFFu) << 16) | (gH94Refused & 0xFFFFu));
+          ehci_os_logx("!! h94 gH94Orphaned (reap-gate saves; MUST be 0 — nonzero = the funnel has a hole)",
+                       gH94Orphaned);
+          /* b12: the engine's health was invisible at LEVEL1 (gDownErr/gDownTimeouts lived only in
+           * LEVEL2 blocks) — the B&W's full-speed stalls cost a boot to that blindness. Promoted. */
+          ehci_os_logx("!! b12 gDownErr<<16 | gDownTimeouts (nonzero = transfers failing/expiring)",
+                       ((gDownErr & 0xFFFFu) << 16) | (gDownTimeouts & 0xFFFFu));
+          ehci_os_logx("!! b12 gDownDone (completed transfers) / next: gMaxStallTicks", gDownDone);
+          ehci_os_logx("!! b12 gMaxStallTicks (worst single-transfer latency, ticks; ~16ms each — a slow "
+                       "flash-GC device shows LARGE values here BEFORE it starts timing out)", gMaxStallTicks);
+          /* b12: the block driver's DoDriverIO ring ('Ucs2') records every Read/Write/Control/Status it
+           * receives with the csCode and our returned err — the exact trail DFA/ASP queries leave. It was
+           * only ever dumped on a bio STALL; print NEW entries per periodic dump instead (capped), so a
+           * clean-but-odd session (the DFA garbage string, the skipped second drive) is reconstructible.
+           * codes: 5=Open 6=Close 7=Read 8=Write 9=Control 10=Status; err 1 = kIOBusyStatus (accepted). */
+          {   static UInt32 sDioLast = 0;
+              if (!gDioLogPtr) { long _dv; if (Gestalt('Ucs2', &_dv) == noErr && _dv) {
+                  DioLogMirror *_dp = (DioLogMirror *)_dv; if (_dp->magic == 0x44696f4cUL) gDioLogPtr = _dp; } }
+              if (gDioLogPtr && gDioLogPtr->count != sDioLast) {
+                  UInt32 _n = gDioLogPtr->count, _i, _new = _n - sDioLast, _show = (_new > 24u) ? 24u : _new;
+                  ehci_os_logx("!! b12 DoDriverIO ring: NEW calls since last dump (showing latest, capped 24)",
+                               _new);
+                  for (_i = 0; _i < _show; _i++) {
+                      DioRecMirror *_r = &gDioLogPtr->recs[(_n - 1u - _i) & 127u];
+                      ehci_os_logx("!!   b12 code<<24|err16 / next line: aux (csCode for ctl+stat)",
+                                   ((UInt32)(_r->code & 0xFF) << 24) | ((UInt32)_r->err & 0xFFFFu));
+                      ehci_os_logx("!!     b12 aux", (UInt32)_r->aux);
+                  }
+                  sDioLast = _n;
+              }
+          }
+          ehci_os_logx("★ h84 gBodySlowN (completed bodies over 1000 ms — how OFTEN, not just how bad)",
+                       gBodySlowN);
+          {   UInt32 i3, best3 = 0, bestPh3 = 0;
+              for (i3 = 0; i3 < BP_N; i3++)
+                  if (gPhaseMaxMs[i3] > best3) { best3 = gPhaseMaxMs[i3]; bestPh3 = i3; }
+              ehci_os_logx("★ h84 worst SECTION: phase<<16|ms (1=entry 2=logdrain 3=latedump 4=periodic "
+                           "5=needbulk 6=hubarm 7=expose 8=rearm 9=drains 10=tail; 11=h41-BEFORE "
+                           "12=INSTALL+AddDrive 13=n19+h76 14=h41-AFTER — 11/13/14 are OUR LOGGING, "
+                           "12 is the OS)",
+                           ((bestPh3 & 0xFFFFUL) << 16) | (best3 > 0xFFFFUL ? 0xFFFFUL : best3));
+          }
+          ehci_os_logx("  h26 gNmLatLast / gNmLatMax (arm -> nmResp, MILLISECONDS)",
+                       ((gNmLatLast & 0xFFFFUL) << 16) | (gNmLatMax & 0xFFFFUL));
+          ehci_os_logx("!! h26 gNmFailed (MUST be 0 — a refused NMInstall parks the job)", gNmFailed);
+          ehci_os_logx("!! m4 aseTimeouts (MUST be 0)",          gAseTimeouts);
+          ehci_os_logx("!! m4 aseTimeoutKind (1=10ms time bound, 2=iteration cap)", gAseTimeoutKind);
           /* ★★★★ h13 PORT-AGNOSTIC DIAGNOSTICS. This dumped ports 0 and 4 and nothing else — two literals from
            * whichever ports happened to be interesting on some earlier run. Every root port is equivalent
            * hardware and the user is entitled to plug into any of them and get identical behaviour, so a
            * diagnostic that can only see two of them makes the driver LOOK port-dependent even when it is not:
            * on the h12 run the hub sat on port 4 and was visible, but on h11 it sat on port 2 and this block
            * was blind to it. Dump every port the controller reports. */
-          { UInt32 pi, pn = gSoftc.nPorts;
-            for (pi = 0; pi < pn && pi < 15; pi++)
-                ehci_os_logx("  h13 port|PORTSC (hi nibble = port)",
-                             (pi << 28) | (ehci_read32(gSoftc.opBase, EHCI_PORTSC(pi)) & 0x0FFFFFFFUL)); }
+          /* ★ h80: PORTSC only when a port has actually CHANGED since the last dump. Five lines every dump
+           * is another 150 File-Manager writes across a session that mostly reports the same values. The
+           * mask ignores the RW1C change bits, exactly as portmap_tick does, so ordinary churn does not
+           * count as a change. First dump of a session always prints, so a baseline is never missing. */
+          { UInt32 pi, pn = gSoftc.nPorts; static UInt32 sLast[15]; static int sPrimed = 0; int changed = !sPrimed;
+            for (pi = 0; pi < pn && pi < 15; pi++) {
+                UInt32 v = ehci_read32(gSoftc.opBase, EHCI_PORTSC(pi));
+                if ((v & 0x3005UL) != (sLast[pi] & 0x3005UL)) changed = 1;
+                sLast[pi] = v;
+            }
+            sPrimed = 1;
+            if (changed)
+                for (pi = 0; pi < pn && pi < 15; pi++)
+                    ehci_os_logx("  h13 port|PORTSC (hi nibble = port)",
+                                 (pi << 28) | (sLast[pi] & 0x0FFFFFFFUL));
+            else
+                ehci_os_log("  h13 PORTSC unchanged since the last dump (all ports)"); }
       } }
     /* (2) Complete the handoff the engine cannot do itself: NewGestaltValue and InstallDriverFromMemory
      *     are both task-only, so the engine sets gAsProbeOK and we finish the job here. ⚠ THIS is the
@@ -4169,6 +6890,7 @@ void ehci_vhub_selfprobe_tick(void)
     /* ★ m3: count the turn BEFORE the check, so an advance in gTaskPumpN proves this check was evaluated
      * rather than merely that selfprobe_tick was entered. AS_TASK's fail condition reads it. */
     gTaskPumpN++;
+    bphase(BP_NEEDBULK);
     if (gAsNeedBulk) {
         /* ★★★★ h14: CHECK THE REGISTRATIONS. These two results were discarded with (void), so a failure here
          * became "the drive never appeared" with nothing naming the cause. Both endpoints are required; if
@@ -4191,6 +6913,7 @@ void ehci_vhub_selfprobe_tick(void)
     }
     /* ★ h10: program and park the hub's status-change QH here, at TASK level. create_bulk sets the contract:
      * quiesce the async schedule before touching a QH that is spliced into the live ring. */
+    bphase(BP_HUBARM);
     if (gHubIntNeedArm) {
         ase_quiesce();
         epq_program(&gHubIntQ, gHub.addr, gHubIntEp, 64, 0);
@@ -4200,32 +6923,283 @@ void ehci_vhub_selfprobe_tick(void)
         ehci_os_logx("h10: status-change qTD PARKED at task level — the hub reports changes from here; endpoint",
                      gHubIntEp);
     }
+    bphase(BP_EXPOSE);          /* h84: the suspect. The 2026-08-12 body entered here and never returned. */
     if (gAsProbeOK) {
-        int hd = gEnumDev;        /* n17: the slot whose probe just completed */
-        gAsProbeOK = 0;
-        pb_find_eps(hd);
-        ehci_os_logx("  n5 handoff at task level; gIsrHits (real IRQ during probe; 0 = heartbeat-only)", gIsrHits);
-        if (gDev[hd].pOut >= 0 && gDev[hd].pIn >= 0) {
-            gDev[hd].pstate = 10;
-            /* ★★★ n19 step 3: EVERY probed slot is now exposed, not just slot 0. The gate is gone because
-             * the two things it protected are fixed: 'Eusb' carries per-device geometry (blkCnt[dv]) and
-             * every data-path call names its device, and the block driver keeps a drive number, partition
-             * base, DrvSts and media flag per slot and routes by ioVRefNum.
+        /* ★★★★★ h30 — DO NOT EXPOSE A VOLUME INTO A FINDER THAT IS STILL BUILDING THE DESKTOP.
+         *
+         * ⚠ THE T2/T4 CRASH (2026-08-08): cold boot with a drive on the card ran this whole path correctly —
+         * enumerate, probe, publish, install, AddDrive, diskEvt — and the FINDER then died with an illegal
+         * instruction mid-startup, CurApName=Finder. The Finder mounts boot-time drives by walking the drive
+         * queue DURING its startup, so an AddDrive landing in that window hands a half-initialised Finder a
+         * volume. Post-desktop insertions have always been fine (Run D: hours). The model is Apple's own —
+         * OHCI drives present at cold boot do not mount until the desktop finishes either.
+         *
+         * Gate: CurApName == "Finder" (lowmem Str31 at 0x910) continuously for FINDER_SETTLE_TICKS. Name
+         * equality alone is NOT enough — the crash had CurApName already reading Finder — hence the settle
+         * window. gAsProbeOK stays SET while deferred, so the NM keepalive (~2 s) re-evaluates until the gate
+         * opens; the hold also blocks as_tick from starting another device's enumeration mid-defer.
+         *
+         * ★★★★★ h35 — publish_service AND install_block_driver run TOGETHER here, the h30/h31 structure that
+         * PASSED T2 with a clean 2.0 cold-boot mount. h33 split them (publish at handoff, install ~6.5 s
+         * later) to free the engine during the defer; T4-on-h34 then regressed — the driver's own probe read
+         * block 0 cleanly, but the Finder called the volume UNREADABLE and a replug fixed it, a mount-path
+         * regression whose only delta from the passing T2 was that split. The publish→install gap is the
+         * suspect, so the two are adjacent again. The split's purpose is MOOT: it kept an HID port serviced
+         * during a drive's defer, but the K-filter cedes HIDs to Apple BEFORE enumeration touches them (this
+         * run: the FS mouse ceded before the drive handed off), so parking the engine strands nothing — worst
+         * case a second DRIVE waits one ~6.5 s defer at cold boot, exactly as h31 did. */
+        {
+            /* ★★★★★★ h44 — WAIT FOR THE FINDER TO BE *READY*, NOT MERELY FOR TIME TO PASS.
              *
-             * publish_service is re-run for each device because it republishes the WHOLE geometry table;
-             * it is idempotent and cheap. install_block_driver installs the driver once and thereafter
-             * just announces, so calling it per device adds a drive rather than a second driver. */
-            ehci_vhub_publish_service(); gMountedOnce = 1;
-            install_block_driver(hd);   /* first call installs + AddDrives; later ones announce */
-            ehci_os_logx("n19: device EXPOSED to the OS as its own drive; slot", (UInt32)hd);
-        } else {
-            ehci_os_log("!! n5: probe reported OK but the bulk endpoints are missing — not publishing 'Eusb'");
-            gSelfEnumDone = 0;
+             * ⚠ THE USER'S OBSERVATION THAT CRACKED THIS (2026-08-10): the "initialize" prompt appears at the
+             * same instant as the KEYCHAIN RECONNECT prompt for a file server, just behind it, right before the
+             * desktop icons load. That is the Finder's NETWORK-VOLUME RESTORATION phase - modal dialogs up,
+             * File Manager busy - and it explains the whole T2-versus-T4 split that four builds could not:
+             *   T2 (drive only): the drive enumerates at once, so our AddDrive lands BEFORE that phase. Clean.
+             *   T4 (drive + HIDs): the FS mouse burns three failed enumeration attempts first (~seconds), which
+             *     pushes our AddDrive + diskEvt straight INTO it - handing a volume to a Finder sitting behind
+             *     a modal prompt. h42's dumps proved our entry and geometry are correct, so the medium was never
+             *     the problem; the MOMENT was.
+             * ⇒ The old gate measured the wrong thing: elapsed time since CurApName read "Finder", which says
+             * nothing about whether the Finder can accept a volume right now.
+             *
+             * ★ ADDED CONDITION: no modal dialog frontmost. Read from low memory only - WindowList (0x09D6) is
+             * the frontmost window, and windowKind sits at +108, just past the 108-byte GrafPort in a
+             * WindowRecord. dialogKind is 2. This is a pure memory read: NO Toolbox call, no allocation, no
+             * event loop - the driver has never touched the Window Manager and this does not start.
+             * ⚠ HARD CAP so a dialog left up forever cannot mean "no drive ever": past DEFER_CAP_TICKS we
+             * expose anyway and say so in the log. A late mount beats no mount. */
+            enum { FINDER_SETTLE_TICKS = 300 };            /* 5 s after the Finder name first appears */
+            enum { DEFER_CAP_TICKS     = 2700 };           /* 45 s absolute ceiling on the whole defer */
+            static UInt32 sFndSince = 0, sDeferStart = 0; static int sDeferLogged = 0;
+            static int sDeferDumps = 0;        /* h47: cap the in-window queue dumps (705 in one window) */
+            volatile UInt8 *ap = (volatile UInt8 *)0x0910UL;   /* CurApName, Str31 */
+            int isFinder = (ap[0] == 6 && ap[1]=='F' && ap[2]=='i' && ap[3]=='n' &&
+                            ap[4]=='d' && ap[5]=='e' && ap[6]=='r');
+            UInt32 nowT = *(volatile UInt32 *)0x016AUL;
+            int dialogUp = 0;
+            {   void *fw = *(void * volatile *)0x09D6UL;    /* WindowList = frontmost window */
+                if (fw) { short kind = *(volatile short *)((volatile char *)fw + 108);
+                          if (kind == 2) dialogUp = 1; }    /* 2 = dialogKind */
+            }
+            /* ★★★★★★ h46 — sDeferStart MUST BE PER-EXPOSURE. IT WAS PER-BOOT, SO THE GATE WAS A ONE-SHOT.
+             *
+             * ⚠ THE h45 RUN (2026-08-10): four of five mounts logged "defer CAP reached (45 s) — exposing
+             * anyway" and only the COLD BOOT logged a real release. sDeferStart was set once under
+             * `if (!sDeferStart)` and never cleared, so it measured uptime since the FIRST defer this boot,
+             * not the elapsed time of THIS one. Past 45 s of uptime `nowT - sDeferStart >= DEFER_CAP_TICKS`
+             * is already true on the FIRST evaluation of every later exposure ⇒ the cap branch fires
+             * immediately and the readiness gate is bypassed entirely for every hot-plug.
+             *
+             * ★ Two separate harms, and the second is the one this project keeps paying for: the gate stopped
+             * protecting anything after the first 45 s, AND the log line claimed a 45-second wait that never
+             * happened. A lying diagnostic has cost cycles here before (the v36 write instrumentation, h41's
+             * counters). Clearing it on BOTH release paths makes the message true again in either direction.
+             *
+             * ⚠⚠ DO **NOT** also reset sFndSince here. The per-exposure clock is sDeferStart alone.
+             *
+             * ★★★★★★ h47 — AND `isFinder` WAS THE WRONG QUESTION, WHICH FIX 2 TURNED INTO A 45 s REGRESSION.
+             *
+             * ⚠ THE n4g RUN (2026-08-10, app-driven, no INIT): `exposure RELEASED` appears ZERO times and the
+             * defer ended only via `defer CAP reached (45 s)`, with `isFinder<<8|dialogUp` logged as 0x0000 —
+             * isFinder was **0**. 705 h43 queue dumps fired inside that window. The user saw a ~20 s stall
+             * before the drive mounted.
+             *
+             * ★ WHY: `isFinder` reads CurApName (0x0910), which is the **CURRENT** process. In the APP-DRIVEN
+             * path this whole check runs from the activator's own slot-23 pump, so CurApName is the ACTIVATOR
+             * and isFinder can never be true — `SetFrontProcess` hands the front to the Finder for event
+             * routing but does NOT change CurApName while our code is executing. So the release branch was
+             * unreachable and only the cap could end the defer. In the APP-LESS path the NM response borrows
+             * the Finder's context, CurApName reads "Finder", and the gate works — which is exactly why v8
+             * and v4b released properly at 335 and 555 ticks.
+             * ⇒ Before h46, the never-reset sDeferStart made the cap fire on the first evaluation, so the
+             * app-driven path exposed INSTANTLY *by accident*. Making the cap real turned that into a genuine
+             * 45-second wait. **Fix 2 is right for app-less and was a regression for app-driven.**
+             *
+             * ★★ THE FIX, and it is the same shape as every other bug this session — a variable cleared by an
+             * event that is not the event it cares about. `if (!isFinder) sFndSince = 0;` wiped the latch
+             * whenever ANY other process happened to be current, including our own activator. So:
+             *   1. sFndSince now LATCHES: set once the Finder has been seen as the current process, never
+             *      cleared because something else is running.
+             *   2. the defer condition asks `!sFndSince` ("the Finder has not appeared yet") instead of
+             *      `!isFinder` ("the Finder is not running right now").
+             * Cold-boot protection is unchanged: before the Finder ever appears sFndSince is 0, so we still
+             * defer, and we still serve FINDER_SETTLE_TICKS after that first sighting. What goes away is
+             * penalising a path merely because OUR code is the one asking.
+             * ★ h44's own comment argued this already: CurApName timing "says nothing about whether the Finder
+             * can accept a volume right now", and the ADDED condition — no modal dialog frontmost — is the one
+             * that actually fixed T4. `dialogUp` still carries that, and it is read from the global
+             * WindowList, so it works whichever process is current. */
+            if (!sDeferStart) sDeferStart = nowT ? nowT : 1;
+            if (isFinder && !sFndSince) sFndSince = nowT ? nowT : 1;   /* h47: LATCH — never cleared */
+            if ((nowT - sDeferStart) >= DEFER_CAP_TICKS) {
+                ehci_os_logx("h44: defer CAP reached (45 s) — exposing anyway; dialogUp", (UInt32)dialogUp);
+                sDeferStart = 0;                 /* h46: this defer is over; the next one times itself */
+                sDeferDumps = 0;                 /* h47: each defer window gets its own dump budget */
+                gExposureDeferred = 0;
+            } else if (!sFndSince || (nowT - sFndSince) < FINDER_SETTLE_TICKS || dialogUp) {
+                if (!sDeferLogged) {
+                    sDeferLogged = 1;
+                    ehci_os_logx("h30/h44: volume exposure DEFERRED — isFinder<<8|dialogUp (h44: a modal "
+                                 "dialog frontmost means the Finder cannot take a volume yet)",
+                                 ((UInt32)isFinder << 8) | (UInt32)dialogUp);
+                }
+                /* ★★★★★★ h43 — DUMP THE QUEUES *INSIDE THE DEFER WINDOW*, which is where the prompt lives.
+                 * h42's "BEFORE our install" dump was too late by construction: our install waits ~6 s for the
+                 * Finder to settle, and the "initialize" prompt appears DURING that wait, so by dump time the
+                 * offending entry has already been created AND dismissed by the user's Eject. h42 therefore
+                 * proved only that the END state is clean (one entry, ours, correctly mounted) - it could not
+                 * see the crime. This fires on every re-check (~2 s apart) for the whole window, so an entry
+                 * that appears and vanishes inside it is caught. Task level: this is selfprobe_tick_body.
+                 *
+                 * ⚠⚠ h47 CAPS IT. The n4g run fired this **705 times** in one 45 s window — several
+                 * FSWrite + FlushVol per call, at task level, sustained, and in the SAME window as the boot
+                 * crash we are chasing. That is both diagnostic noise and a plausible confound: this project
+                 * has already wedged the File Manager with an unthrottled driver log loop, which is why the
+                 * h16 token-bucket cap exists. The hunt this dump was built for (h41→h44, "which stack
+                 * registered this medium") is CLOSED — the answer was that our entry is correct and the prompt
+                 * is a configuration limit. A handful of frames still catches an entry that appears and
+                 * vanishes; 705 adds nothing. */
+                if (sDeferDumps < 24) { sDeferDumps++;   /* h68: 6 -> 24; the defer window is where
+                                                         * the answer lives and it was the most starved */
+                    h41_queue_dump("=== h43 QUEUES **DURING THE DEFER WINDOW** (the prompt happens in here) ==="); }
+                gExposureDeferred = 1;                     /* keepalive re-checks in ~2 s; park stays set */
+            } else {
+                if (sDeferLogged) {
+                    sDeferLogged = 0;
+                    ehci_os_logx("h30/h44: exposure RELEASED — Finder settled AND no modal dialog; ticks "
+                                 "since Finder appeared", nowT - sFndSince);
+                    ehci_os_logx("  h46 ticks this defer actually took (the cap is 2700 = 45 s)",
+                                 sDeferStart ? (nowT - sDeferStart) : 0);
+                }
+                sDeferStart = 0;                 /* h46: per-exposure clock — see the note above */
+                sDeferDumps = 0;                 /* h47: each defer window gets its own dump budget */
+                gExposureDeferred = 0;
+            }
+        }
+        if (!gExposureDeferred) {
+            /* h59: the LATCHED slot, not gEnumDev. gEnumDev is rewritten by every slot allocation, and this
+             * line can run up to 45 s after the probe that set it — see the note at gExposeDev. */
+            int hd = (gExposeDev >= 0) ? gExposeDev : gEnumDev;
+            gAsProbeOK = 0; gExposeDev = -1;
+            pb_find_eps(hd);
+            ehci_os_logx("  n5 handoff at task level; gIsrHits (real IRQ during probe; 0 = heartbeat-only)", gIsrHits);
+            /* ★★★★★★ I15 AS A CHECK, NOT A COMMENT — docs/ENGINE-STATE-MACHINE.md §7 F2.
+             *
+             * ⚠ WHAT THIS DEFENDS. Exposing a device we have not fully probed hands the Finder a volume it
+             * cannot read, and the user-visible result is an "initialize this disk?" prompt over a drive that
+             * is perfectly fine — destructive-looking, and indistinguishable in the log from several other
+             * faults. m24 produced exactly that prompt and I spent a full analysis pass unable to rule this
+             * in or out, because nothing in the code ASSERTED it and the probe's log lines had been dropped.
+             *
+             * ★ Today the property holds by construction: gAsProbeOK is set at ONE site, downstream of
+             * READ CAPACITY, the geometry plausibility check and a successful read of block 0. So this guard
+             * should never fire. That is the point — it is one refactor away from being false, and this
+             * driver's entire bug history is state that USED to be guaranteed by a call ordering nobody had
+             * written down. Cheap to hold, and it converts a silent wrong mount into a named refusal.
+             *
+             * ⚠ THE ENDPOINT TEST BELOW IS NOT THIS TEST. pOut/pIn are registered at SELFENUM COMPLETE,
+             * before the BOT probe runs at all, so it proves the device was ENUMERATED, never that its medium
+             * was READ. gDevBlkCnt[] is written at exactly one place (READ CAPACITY, after the plausibility
+             * check), which makes it the only honest witness to a completed probe.
+             * ⚠ inUse is required TOO: reconnect_reset clears a slot's state but does NOT zero its geometry
+             * (fixed below), so on its own a stale block count could outlive the device that produced it. */
+            if (!gDev[hd].inUse || gDevBlkCnt[hd] == 0) {
+                ehci_os_logx("!! I15 VIOLATED — refusing to expose a slot that has NOT completed a probe. "
+                             "This must never fire; if it has, the probe/exposure coupling is broken. "
+                             "slot<<16|inUse<<8|blkCntNonZero",
+                             ((UInt32)hd << 16) | ((UInt32)(gDev[hd].inUse ? 1 : 0) << 8) |
+                             (UInt32)(gDevBlkCnt[hd] ? 1 : 0));
+                gSelfEnumDone = 0;          /* let discovery re-run; do NOT strand the controller (I1/I5) */
+            } else if (gDev[hd].pOut >= 0 && gDev[hd].pIn >= 0) {
+                gDev[hd].pstate = 10;
+                /* publish + install ADJACENT (the proven order): install_block_driver installs once and
+                 * thereafter just announces, so calling it per device adds a drive not a second driver. */
+                /* ★★★★★★ h78 FIX 2 — STAND THE DoDriverIO DRAIN DOWN FOR THE WHOLE MOUNT.
+                 * Everything from here until the Finder has finished taking the volume is File Manager
+                 * work on OUR drive, and every one of those calls reaches usb_disk.c's DoDriverIO, which
+                 * drains our log ring with synchronous FSWrite + FlushVol ON THE BOOT VOLUME. That is
+                 * File Manager work issued from inside a File Manager call chain on a different volume,
+                 * and on the m27 hub run it is where task level died — gTaskPumpN froze at the exact
+                 * value this dump records, and never moved again.
+                 * ⚠ WALL-CLOCK AND SELF-CLEARING (30 s). It must expire without task-level help, because
+                 * the state it is protecting against is precisely "task level is dead". An inhibit that
+                 * needed the pump to lift it would be permanent in exactly the case that matters. */
+                ehci_os_ilog_inhibit_drain(1800UL);
+                ehci_vhub_publish_service(); gMountedOnce = 1;
+                /* ★ h41: the discriminating pair of dumps — see h41_queue_dump. */
+                bphase(BP_EXP_PRE);
+                h41_queue_dump("=== h41 QUEUES **BEFORE** our install (a foreign entry here = APPLE already "
+                               "registered this medium) ===");
+                /* ★★★ f4: SNAPSHOT THE ENGINE AT THE INSTANT WE HAND THE VOLUME OVER. Everything after this
+                 * line is the Finder mounting through our brand-new block driver, and the F4 question is
+                 * whether another device's probe is live on the shared slot while that happens. Taken BEFORE
+                 * install_block_driver so it describes the moment of handover, not the aftermath. */
+                /* SPLIT: report BOTH slots — bit 5 = the ENGINE is busy, bit 4 = block I/O is busy. Before
+                 * the split those were the same bit, which is precisely the confusion being removed. */
+                gF4Snap = ((UInt32)(gAs.running ? 1 : 0) << 24) | ((UInt32)(gAs.pc & 0xFF) << 16)
+                        | (((gBioHead - gBioTail) & 0xFFUL) << 8)
+                        | ((UInt32)(gEgBusy ? 1 : 0) << 5)
+                        | ((UInt32)(gDpBusy ? 1 : 0) << 4) | (UInt32)(gF4Owner & 0x0F);
+                gF4SnapDownQ = gDownQHead - gDownQTail;
+                bphase(BP_EXP_ADD);      /* h84b: the OS's own work — install, AddDrive, diskEvt. Nothing of ours. */
+                install_block_driver(hd);
+                bphase(BP_EXP_POST);     /* h84b: back to our logging */
+                ehci_os_logx("n19: device EXPOSED to the OS as its own drive; slot", (UInt32)hd);
+                /* ★★★★★★ h76 — DUMP THE STATE **HERE**, SYNCHRONOUSLY, NOT ON A TIMER.
+                 * ⚠ THE m26 LESSON. The f4 verdict was hung off +5 s and +15 s deadlines, and in run 2 the
+                 * File Manager wedged before EITHER fired, so the single most important run of this hunt
+                 * produced no state at all. This instant — immediately after AddDrive returned — is the LAST
+                 * MOMENT WE KNOW THE FILE MANAGER WORKS, because AddDrive itself just succeeded. Anything
+                 * scheduled for later is a bet that the machine survives, and that bet has now lost once.
+                 * The timed dumps stay (they show what changed AFTER the mount); this one guarantees a
+                 * floor. */
+#if H76_DIAGNOSTICS
+                ehci_os_log("=== h76 STATE AT AddDrive (synchronous — the last instant the File Manager is "
+                            "known good; the timed dumps may never fire) ===");
+                ehci_os_logx("  h76 gBioPhase (>=20 = in BOT recovery)", (UInt32)gBioPhase);
+                ehci_os_logx("  h76 egBusy<<8|dpBusy (the two in-flight slots)",
+                             ((UInt32)(gEgBusy ? 1 : 0) << 8) | (UInt32)(gDpBusy ? 1 : 0));
+                ehci_os_logx("  h76 bio ring depth (queued block requests)", gBioHead - gBioTail);
+                ehci_os_logx("  h76 gAs.running<<8|gAs.pc (concurrent enumeration?)",
+                             ((UInt32)(gAs.running ? 1 : 0) << 8) | ((UInt32)gAs.pc & 0xFFu));
+                ehci_os_logx("  h76 gDownErr<<16|gDownTimeouts", ((gDownErr & 0xFFFFUL) << 16) | (gDownTimeouts & 0xFFFFUL));
+                ehci_os_logx("  h76 gSplitSaved<<16|gEgRecovCompl",
+                             ((gSplitSaved & 0xFFFFUL) << 16) | (gEgRecovCompl & 0xFFFFUL));
+                ehci_os_logx("  h76 gTaskPumpN (the pump whose death the screen watchdog reports)", gTaskPumpN);
+                /* ★ ARM THE SCREEN WATCHDOG. From here on, if task level goes silent for 5 s the heartbeat
+                 * paints the live state to the top-left of the screen once a second. That is the readout
+                 * that survives the File-Manager wedge this build exists to diagnose. */
+                gPwPumpLast = gTaskPumpN; gPwPumpAtTick = TICKS_NOW; gPwArmed = 1;
+                /* ★★★★★★ PROOF OF LIFE — PAINT ONCE, RIGHT NOW, UNCONDITIONALLY.
+                 * ⚠ WITHOUT THIS THE INSTRUMENT IS UNFALSIFIABLE. The watchdog only paints when task level
+                 * stalls, so a blank screen would mean EITHER "no stall happened" OR "the painter is
+                 * broken" — and we would have no way to tell which, on the one run that matters. This
+                 * project has paid for that mistake three times already (m20's sampling artifact, m24's 458
+                 * dropped lines, and the m26 timed dump that never fired), and every time the instrument
+                 * was believed until it was checked.
+                 * ★ So paint the state box here, at a moment we KNOW is healthy. The user sees it work.
+                 * On a good boot the Finder simply draws over it a moment later as it lays out the desktop,
+                 * so it costs a brief flicker and buys certainty about the readout. */
+                paint_watchdog_state();
+#endif  /* H76_DIAGNOSTICS */
+                bphase(BP_EXP_AFTER);
+                h41_queue_dump("=== h41 QUEUES **AFTER** our install (ours should now appear; compare refNums) ===");
+                /* ★ h41: and once more ~15 s later, by which time the Finder has put up the prompt and the user
+                 * has answered it. That is the state no log has ever captured — every T4 log to date ends at
+                 * the line above — and it shows whether the end state holds ONE entry or two. */
+                gH41LateDue = *(volatile UInt32 *)0x016AUL + 900UL;
+                gF4EarlyDue = *(volatile UInt32 *)0x016AUL + 300UL;   /* f4: +5 s floor — m24 died before +15 s */
+            } else {
+                ehci_os_log("!! n5: probe reported OK but the bulk endpoints are missing — not publishing 'Eusb'");
+                gSelfEnumDone = 0;
+            }
         }
     }
     /* p1a: an enumerated device was unplugged. Reset the probe state HERE (task level — reconnect_reset
      * does File-Mgr logging and must never run at interrupt level) so gDev[0].pstate returns to 0 and the case-0
      * hook can re-enumerate on the next insert. */
+    bphase(BP_REARM);
     if (gSelfEnumRearm) {
         gSelfEnumRearm = 0;
         ehci_os_log("=== SELFENUM: enumerated device was pulled — resetting probe state for re-enumeration ===");
@@ -4260,6 +7234,7 @@ void ehci_vhub_selfprobe_tick(void)
         gSelfEnumDone = 0; gSelfEnumTries = 0;
     }
     /* n15: drain the new-device and no-free-slot notices (same interrupt-set / task-logged discipline). */
+    bphase(BP_DRAINS);
     if (gNewDevMask) {
         UInt32 m = gNewDevMask; int q;
         gNewDevMask = 0;
@@ -4338,6 +7313,16 @@ void ehci_vhub_selfprobe_tick(void)
                 ehci_os_logx("n24: parked port UN-PARKED (its device left, so the reason to park is gone; "
                              "a new device here gets a fresh 3 attempts); port", (UInt32)q);
     }
+    /* h53: drain the un-cede notices. Seeing one means the companion handed a ceded port back and we have
+     * stopped showing it to Apple -- which is what stops Apple enumerating the next device plugged in there. */
+    if (gPortUncedeMask) {
+        UInt32 m = gPortUncedeMask; int q;
+        gPortUncedeMask = 0;
+        for (q = 0; q < 15; q++)
+            if (m & (1UL << q))
+                ehci_os_logx("!! h53: ceded port UN-CEDED (companion released OWNER, so it is OURS again and is "
+                             "hidden from Apple once more -- this is the APPLE_HIDE leak closing); port", (UInt32)q);
+    }
     /* n4b: drain the hidden-connect log flags set by service_ports at interrupt level. */
     if (gHideLogMask) {
         UInt32 m = gHideLogMask; int q;
@@ -4357,12 +7342,45 @@ void ehci_vhub_selfprobe_tick(void)
      *   gDownTimeouts climbing = the down watchdog IS firing (recovery failing) vs 0 = watchdog never runs;
      *   USBCMD bit5 (ASE 0x20) / USBSTS bit15 (ASS 0x8000) = is the async schedule actually RUNNING;
      *   USBSTS 0x1000 (HCHalted) / 0x10 (host system error) = controller faulted. */
-    if (gDpBusy) {
+    /* ★★★★ h25: the trigger is THE SAME TRANSFER OUTSTANDING FOR 250 ms, not merely "busy at the sampling
+     * instant". The old test was `if (gDpBusy)` alone, and it cried wolf.
+     *
+     * ⚠ PROVED BY THE p2 RUN (2026-08-08, the noUSL pump): it fired ELEVEN times in a run where every test
+     * passed, and its own dumps showed a perfectly healthy engine — `gPState` 10 (probe COMPLETE, so there was
+     * no self-probe transfer to not-complete), `gIsrHits` climbing 23 -> 1399, `gDownDone` climbing 11 -> 667,
+     * FRINDEX moving, `gDownErr`/`gDownTimeouts`/`gDownRelink` all 0, and `gDpBusy` reading **0** in the dump
+     * body because the transfer retired during the log write. It was reporting ordinary file-copy traffic as a
+     * stall: `gDpBusy` is the BULK slot, which during a copy is legitimately set almost all the time, so a
+     * 1 Hz sample catching it set says nothing at all. p1 scored 0 only because the USL route happens not to
+     * tick us mid-copy — i.e. the count measured WHEN WE SAMPLE, not whether anything was wrong.
+     *
+     * ★ A stall is one transfer that stops retiring, so track the qTD: same `gDpTd` still in flight 250 ms
+     * later. Transfers flowing normally replace `gDpTd` constantly and never accumulate age, while a genuinely
+     * wedged one trips it well inside the old 1 s cadence. Keeps every reader the dump had, and keeps the 1 Hz
+     * rate limit for the repeat case. ⚠ This is a DIAGNOSTIC gate only — nothing here changes engine
+     * behaviour, and the counters it prints are unchanged, so old logs stay comparable.
+     * ★ Why it matters beyond noise: this project's rule is that a lying diagnostic costs cycles, and this one
+     * would have made any future real stall indistinguishable from normal copying. */
+    /* ★★★ THE SPLIT WIDENS THIS WATCHDOG, AND IT HAD TO. It watched gDp*, which is now BLOCK I/O ONLY — so
+     * left alone it would have gone HALF BLIND on the day the split shipped: an ENGINE transfer could wedge
+     * for ever and this, the one stall detector, would report a perfectly idle block-I/O slot and say
+     * nothing. That is worse than before the split, because the gap would be invisible rather than merely
+     * unfixed. Watch whichever slot is busy, and SAY WHICH ONE it is. */
+    {   static UInt32 sSameTd = 0, sSameSince = 0; static int sSameIsEng = 0;
+        UInt32 nowT0 = *(volatile UInt32 *)0x016AUL;
+        int      egB  = gEgBusy != 0;
+        UInt32   curTd = egB ? (UInt32)gEgTd : (gDpBusy ? (UInt32)gDpTd : 0);
+        int      anyB  = egB || gDpBusy;
+        if (!anyB || curTd != sSameTd) { sSameTd = anyB ? curTd : 0; sSameSince = nowT0; sSameIsEng = egB; }
+    if (anyB && sSameTd && (long)(nowT0 - sSameSince) >= 15L) {   /* same qTD outstanding >= 250 ms */
         static UInt32 nextStall = 0;
-        UInt32 nowT = *(volatile UInt32 *)0x016AUL;          /* lowmem Ticks (60 Hz) */
+        UInt32 nowT = nowT0;
         if ((long)(nowT - nextStall) >= 0) {
             nextStall = nowT + 60UL;                         /* ~1 s */
-            ehci_os_log("!! v47 STALL — self-probe transfer not completing:");
+            ehci_os_log("!! v47 STALL — the SAME transfer has been outstanding for 250 ms (h25: not merely busy):");
+            ehci_os_logx("  SPLIT: which slot is stalled (1 = ENGINE ctl/probe, 0 = BLOCK I/O)",
+                         (UInt32)(sSameIsEng ? 1 : 0));
+            ehci_os_logx("  h25 ticks the same qTD has been in flight (60 = 1 s)", nowT - sSameSince);
             ehci_os_logx("  gPState", (UInt32)gDev[0].pstate);
             ehci_os_logx("  gDpBusy", (UInt32)gDpBusy);
             ehci_os_logx("  gDpIsIn", (UInt32)gDpIsIn);
@@ -4436,6 +7454,8 @@ void ehci_vhub_selfprobe_tick(void)
             }
         }
     }
+    }   /* h25: closes the same-qTD age tracker opened above the dump */
+    bphase(BP_TAIL);
     /* n5: give the engine a step from here too. Harmless duplication of the heartbeat's call (as_tick is
      * idempotent and re-entrancy-guarded); it just saves a heartbeat of latency when an app IS pumping. */
     as_tick();
@@ -4668,18 +7688,41 @@ long ehci_vhub_control_xfer(void *pipe, void *complUPP, volatile UInt8 *buf, UIn
                 }
             }
         } else if (pid == 1 && (UInt32)buf >= 0x1000UL && gHaveSetup) { /* IN data: fabricate */
+            int filled = 0;                                          /* ★ h30, see the else below */
             if (gSetup[1] == 0x06) {                                /* GET_DESCRIPTOR */
-                if      (gSetup[0] == 0x80 && gSetup[3] == 0x01) fill(buf, gDevDesc, 18, len);
-                else if (gSetup[0] == 0x80 && gSetup[3] == 0x02) fill(buf, gCfgDesc, 25, len);
-                else if (gSetup[0] == 0xA0 && gSetup[3] == 0x29) fill(buf, gHubDesc, 9, len);
+                if      (gSetup[0] == 0x80 && gSetup[3] == 0x01) { fill(buf, gDevDesc, 18, len); filled = 1; }
+                else if (gSetup[0] == 0x80 && gSetup[3] == 0x02) { fill(buf, gCfgDesc, 25, len); filled = 1; }
+                else if (gSetup[0] == 0xA0 && gSetup[3] == 0x29) { fill(buf, gHubDesc, 9, len); filled = 1; }
                 else if (gSetup[0] == 0x80 && gSetup[3] == 0x03) { /* STRING */
                     if (gSetup[2] == 0) { if (len >= 4) { buf[0]=0x04; buf[1]=0x03; buf[2]=0x09; buf[3]=0x04; } }
                     else                { if (len >= 2) { buf[0]=0x02; buf[1]=0x03; } }
+                    filled = 1;
                 }
             } else if (gSetup[1] == 0x00) {                         /* GET_STATUS */
                 if (gSetup[0] == 0xA3) { int p = gSetup[4] - 1; if (p >= 0 && p < gSoftc.nPorts) ehci_vhub_port_status(p, buf); }
                 else if (gSetup[0] == 0xA0) { buf[0]=buf[1]=buf[2]=buf[3]=0; }        /* hub status */
                 else { buf[0] = 0x01; buf[1] = 0; }                 /* device status: SELF-POWERED (v0.19 fix) */
+                filled = 1;
+            }
+            /* ★★★★★ h30 — AN UNHANDLED IN REQUEST MUST NOT COMPLETE WITH THE CALLER'S BUFFER UNTOUCHED.
+             * Until now, any request this fabricator did not recognise — GET_DESCRIPTOR types beyond
+             * device/config/hub-class/string (DEVICE_QUALIFIER…), GET_CONFIGURATION, GET_INTERFACE, any
+             * class request the boot path never issues — fell through to enq_compl and reported SUCCESS
+             * while the caller's buffer still held whatever garbage was there. A caller that then PARSES
+             * the "descriptor" (Apple System Profiler's Devices & Volumes scan walks every USB bus asking
+             * exactly such questions) chases fabricated lengths and pointers into an illegal instruction.
+             * ⚠ This is the SAME disease the block driver cured in r37 ("returning noErr … and leaving it
+             * unset was the original DriverGestalt crash"), one layer down, and it is in every shipped ROM
+             * incl. m3 — which matches ASP crashing on BOTH machines.
+             * ZERO the buffer instead: bLength=0 parses as "no descriptor here" and every standard caller
+             * stops cleanly. And LOG the request (interrupt-safe ring), so the very next ASP run tells us
+             * exactly what it asked for — instrumentation and safety in one change. */
+            if (!filled) {
+                UInt32 z; for (z = 0; z < len; z++) buf[z] = 0;
+                ehci_os_ilogx("h30: UNHANDLED root-hub IN request answered with ZEROS (was: garbage); "
+                              "bmRT|bReq|wValLo|wValHi",
+                              ((UInt32)gSetup[0] << 24) | ((UInt32)gSetup[1] << 16) |
+                              ((UInt32)gSetup[2] << 8)  |  (UInt32)gSetup[3]);
             }
         } else if (pid == 0) { gHaveSetup = 0; }                    /* status stage */
     }
@@ -4762,6 +7805,43 @@ static void service_ports(void)
                 gPortParked[p] = 0;
                 gPortUnparkMask |= (1UL << (p & 0x0F));   /* task level logs it */
             }
+            /* ★★★★★★ h53 — UN-CEDE A PORT THE COMPANION HAS HANDED BACK. THE APPLE_HIDE LEAK, FOUND.
+             *
+             * ⚠ THE T5b PHASE 3b RUN (2026-08-10) caught it: cede port 1 to the keyboard (PORTSC 0x3800),
+             * unplug the keyboard (0x3800 -> 0x1000, ownership auto-reverted with no write of ours), then plug
+             * a DRIVE into that same port. We took the port and enabled it at high speed (0x1005) — and
+             * APPLE ENUMERATED THE SAME DRIVE, assigning address 0x2F and asking for bulk endpoints 1 and 2,
+             * the Bulk-Only mass-storage pair. h45's guard refused both (gH45Refused 0 -> 2) so it was a clean
+             * non-mount instead of the h44-era FREEZE, but two stacks reached one medium.
+             *
+             * ★ WHY. apple_hidden_port() reads:
+             *       if (gPortParked[p]) return 1;
+             *       if (gPortCeded[p])  return 0;      <- a CEDED port is deliberately VISIBLE to Apple
+             *       return (PORTSC & OWNER) ? 0 : 1;
+             * gPortCeded[p] is set when we cede and, per the n11 lesson (keep the intent in software, never
+             * re-read the decision out of a register), is never cleared by a hardware disagreement. That was
+             * right for the case n11 fixed. But THIS CHIP AUTO-REVERTS OWNERSHIP ON DISCONNECT, so after the
+             * HID leaves, the hardware says "yours again" while our software still says "Apple's" — the port
+             * stays UN-HIDDEN and Apple enumerates whatever is plugged in next.
+             *
+             * ★★ n24 hit this exact asymmetry ONE VARIABLE OVER — gPortParked was permanent and needed the
+             * un-park directly above — and reasoned that a CEDED port's removal was invisible "because CCS
+             * reads 0 either way". The h30 chip fact overturns that premise: **bit 13 CLEARING is the visible
+             * signal**, so the hand-back IS detectable, right here, from the same PORTSC read.
+             *
+             * ⚠ NOTE THE CONDITION IS THE OWNER BIT, NOT !conn. A ceded port with a device still attached
+             * reads CCS 0 anyway (that is the n11 blindness), so keying off `conn` would fire while the
+             * keyboard was still plugged in and un-hide a port that really is Apple's. Only the companion
+             * releasing OWNER means it is ours again.
+             * ★ And this sits OUTSIDE the `apple_hidden_port(p) && !port_ceded(p)` gate below — deliberately.
+             * port_ceded() returns 1 for a ceded port, so anything inside that gate is unreachable for exactly
+             * the ports this fix exists to rescue. That was h17's bug 2 and it made n24's un-park dead code for
+             * builds; the same trap, one variable over, and this is the fourth unreachable-fix in the project. */
+            if (gPortCeded[p] && !(pv & EHCI_PORT_OWNER)) {
+                gPortCeded[p] = 0;
+                gPortUncedeMask |= (1UL << (p & 0x0F));   /* task level logs it */
+                gH53Unceded++;
+            }
             if (apple_hidden_port(p) && !port_ceded(p)) {
                 if (conn) {
                     /* ★ n13: do NOT let a newcomer seize the state of a device we have already probed.
@@ -4773,6 +7853,9 @@ static void service_ports(void)
                      * state (n12). Only when every slot is taken do we fall back to ignoring it.
                      * gSelfEnumPort/gSelfEnumDone are enumeration-scoped, not "the" device: they schedule
                      * which port is enumerated next, and the mounted device's own slot is untouched. */
+                    dead_ring_clear();                       /* h94 FAIL-OPEN: a new arrival may be assigned a
+                                                              * recycled address; a stale "dead" entry must
+                                                              * never refuse a live device's traffic */
                     if (dev_alloc() < 0) {
                         gSecondDevMask |= (1UL << p);        /* no free slot; state left untouched */
                     } else {
@@ -4787,14 +7870,21 @@ static void service_ports(void)
                      * probedPort — the n13 lesson — so a newcomer cannot make us clean up the wrong one. */
                     { int d, k, freed = -1;
                       for (d = 0; d < USB_MAX_DEV; d++) {
+                          UInt32 dAddr;                      /* h94: the address the departed device answered to */
                           if (!gDev[d].inUse || gDev[d].probedPort != p) continue;
+                          dAddr = gDev[d].curAddr;
                           for (k = 0; k < NBULK; k++)
-                              if (gBulkEP[k].used && gBulkEP[k].dev == (UInt8)d) gBulkEP[k].used = 0;
+                              if (gBulkEP[k].used && gBulkEP[k].dev == (UInt8)d) {
+                                  if (!dAddr) dAddr = gBulkEP[k].addr;   /* Apple-era device: the endpoint knows */
+                                  gBulkEP[k].used = 0;
+                              }
                           gRearmDev = d;      /* n19 step 3: tell the task-level rearm WHICH drive went */
                           freed = d;          /* n23: remember that a slot WE OWNED just lost its device */
                           gDev[d].inUse = 0; gDev[d].probedPort = -1;
                           gDev[d].pOut = -1; gDev[d].pIn = -1;
                           if (d != 0) gDev[d].pstate = 0;    /* slot 0's teardown is the proven path below */
+                          usl_retire_device(d, dAddr);       /* h94: retire the dead device's client transfers
+                                                              * BEFORE the USL hears of the removal and frees */
                       }
                     /* ★★★★ n23 FIX B: report the removal whenever a slot we owned lost its device.
                      * This used to hinge on gSelfEnumDone for any slot other than 0 — and the PREVIOUS rearm
@@ -4836,14 +7926,20 @@ static void service_ports(void)
                     if (gHub.claimed && p == gHub.rootPort) {
                         int d, k;
                         for (d = 0; d < USB_MAX_DEV; d++) {
+                            UInt32 dAddr;                  /* h94: as in the root-port loop above */
                             if (!gDev[d].viaHub) continue;
+                            dAddr = gDev[d].curAddr;
                             for (k = 0; k < NBULK; k++)
-                                if (gBulkEP[k].used && gBulkEP[k].dev == (UInt8)d) gBulkEP[k].used = 0;
+                                if (gBulkEP[k].used && gBulkEP[k].dev == (UInt8)d) {
+                                    if (!dAddr) dAddr = gBulkEP[k].addr;
+                                    gBulkEP[k].used = 0;
+                                }
                             gRearmDev = d;                 /* so the task-level rearm unmounts THIS drive */
                             gSelfEnumRearm = 1;
                             gDev[d].inUse = 0; gDev[d].viaHub = 0; gDev[d].hubPort = 0;
                             gDev[d].probedPort = -1; gDev[d].pOut = -1; gDev[d].pIn = -1;
                             if (d != 0) gDev[d].pstate = 0;
+                            usl_retire_device(d, dAddr);   /* h94: everything behind the hub left too */
                         }
                         gHub.claimed = 0; gHub.rootPort = -1; gHub.nPorts = 0; gHub.scanPort = 0; gHub.skipMask = 0;
                         hub_int_stop();   /* h10 */
@@ -4889,6 +7985,11 @@ static void deliver_completions(void)
         volatile Compl *cc = &gC[gCTail % C_N]; void *upp = cc->upp, *pp = cc->pipe; gCTail++;
         if (upp) ((ehci_usl_complete)upp)(pp, 0);
     }
+    if (gH94Hold) return;   /* h94: substitute completions for a rude removal are still queued for the
+                             * task-level drain. Holding the status-change report here (one task round-trip,
+                             * ~ms) is what guarantees the USL cannot free its pipe/transfer structures
+                             * before the clients' completions have run against them. Fail-open: compl_drain
+                             * runs unconditionally every uim23 tick and always clears the hold. */
     if (gIntTrigger && gIntPending && gIntBuf && gIntCB) {         /* status-change interrupt completion */
         UInt8 bmp = 0; int q, np = gSoftc.nPorts;
         for (q = 0; q < np && q < 15; q++) if (gPortChange[q]) bmp |= (UInt8)(1u << (q + 1));
@@ -4915,8 +8016,75 @@ static void sih_reconnect_arm(void)
         gSihArmed = 1; gSihArmTick = gVhubTick;
     }
 }
+/* ★★★★★★★ h66 — WATCH Vbus AND OVER-CURRENT. THE USER'S LED OBSERVATION, INSTRUMENTED.
+ *
+ * ⚠ THE OBSERVATION THAT PROMPTED THIS (2026-08-11, and it is better evidence than any of the last three
+ * theories): on boots where the keyboard has to be moved to another port, THE DRIVE'S RED POWER LED IS OFF;
+ * on boots where everything keeps working, it is LIT. That is Vbus -- PORT_POWER, PORTSC bit 12.
+ * ★ EHCI 2.3.9: on an over-current condition THE CONTROLLER ITSELF CLEARS PORT_POWER. So a port can go dark
+ * with no write of ours, the device disappears, and until now nothing in the log could say why -- because OCC
+ * sits in EHCI_PORTSC_RW1C, so every read-modify-write we perform has been CLEARING the over-current latch
+ * without anyone ever reading it. We have been destroying this evidence on every port write since r1.
+ * ⇒ This runs FIRST in ehci_vhub_service, before service_ports, so the latch is recorded before we wipe it.
+ * ★ PURE READS. It never writes PORTSC, so it cannot perturb what it is measuring and is safe at this level. */
+static void h66_port_watch(void)
+{
+    int p, np = (int)gSoftc.nPorts;
+    if (!gSoftc.opBase || np <= 0 || np > 15) return;
+    for (p = 0; p < np; p++) {
+        UInt32 v = ehci_read32(gSoftc.opBase, EHCI_PORTSC(p));
+        if (!gPwInit) { gPwPrev[p] = v; continue; }
+        if ((v & (EHCI_PORT_OCA | EHCI_PORT_OCC)) && gOcSeen[p] < 0xFFFFUL) {
+            gOcSeen[p]++;
+            if (gOcSeen[p] == 1)
+                ehci_os_ilogx("!! h66 OVER-CURRENT on a port — the controller clears PORT_POWER itself; "
+                              "port<<28|PORTSC", ((UInt32)p << 28) | (v & 0x0FFFFFFFUL));
+        }
+        if ((gPwPrev[p] & EHCI_PORT_POWER) && !(v & EHCI_PORT_POWER)) {
+            gPwLost[p]++;
+            ehci_os_ilogx("!! h66 ★ PORT POWER LOST (Vbus off — this is the LED going dark); port<<28|PORTSC",
+                          ((UInt32)p << 28) | (v & 0x0FFFFFFFUL));
+            ehci_os_ilogx("!! h66   was", gPwPrev[p]);
+            /* ★★★★★★ h67 — GATED SELF-HEAL. The diagnostic above says a port went dark; this puts it back,
+             * but ONLY when doing so is safe and meaningful:
+             *   · NOT if over-current is indicated. Per EHCI 2.3.9 the controller drops PORT_POWER ITSELF on
+             *     an over-current condition, and re-powering into one means fighting a hardware protection in
+             *     a loop. If OCA/OCC is set we deliberately LEAVE IT OFF and let the log say why -- that case
+             *     has no software fix and the right answer is a powered hub or a less hungry drive.
+             *   · NOT if the companion owns the port. Our PORTSC writes are ignored under Owner=1 (measured:
+             *     v8's power-down read back 0x2800 unchanged on three boot logs), so a write there would be a
+             *     silent no-op that only confuses the next reader.
+             *   · RATE-LIMITED to H67_MAX_REPOWER per port per session, so this can never become a loop.
+             * ⚠ It cannot strand anything: an unpowered port is already dead to both stacks, so restoring
+             * power strictly widens what can work -- including the cede path, which is the user's route back
+             * to a keyboard. This is the opposite shape to h60, which BLOCKED a path. */
+            if ((v & (EHCI_PORT_OCA | EHCI_PORT_OCC)) != 0) {
+                ehci_os_ilog("!! h67   OVER-CURRENT indicated — NOT re-powering; this is a hardware "
+                             "protection and has no software fix");
+            } else if ((v & EHCI_PORT_OWNER) != 0) {
+                ehci_os_ilog("!! h67   the companion owns this port — our PORTSC writes are ignored there, "
+                             "so not attempting a re-power");
+            } else if (gRepower[p] < H67_MAX_REPOWER) {
+                UInt32 w = (v & ~EHCI_PORTSC_RW1C) | EHCI_PORT_POWER;
+                ehci_write32(gSoftc.opBase, EHCI_PORTSC(p), w);
+                gRepower[p]++;
+                ehci_os_ilogx("!! h67 ★ RE-POWERED the port (no over-current, ours); port<<28|PORTSC[after]",
+                              ((UInt32)p << 28)
+                              | (ehci_read32(gSoftc.opBase, EHCI_PORTSC(p)) & 0x0FFFFFFFUL));
+            } else {
+                ehci_os_ilogx("!! h67   re-power budget spent for this port; leaving it off; port", (UInt32)p);
+            }
+        } else if (!(gPwPrev[p] & EHCI_PORT_POWER) && (v & EHCI_PORT_POWER)) {
+            ehci_os_ilogx("!! h66 port power RESTORED; port<<28|PORTSC",
+                          ((UInt32)p << 28) | (v & 0x0FFFFFFFUL));
+        }
+        gPwPrev[p] = v;
+    }
+    gPwInit = 1;
+}
 void ehci_vhub_service(void)
 {
+    h66_port_watch();   /* h66: FIRST, so an over-current latch is seen before our own writes clear it */
     gVhubTick++;
     (void)hub_int_ack();
     down_relink_if_needed();   /* r60: heal the async ring BEFORE reaping — restores reachability so a
@@ -4936,6 +8104,18 @@ void ehci_vhub_service(void)
                           * drove bio_advance for in-flight requests; this starts a freshly-appended one
                           * when the engine is idle (worst-case latency = one heartbeat, ~8ms). */
     sih_reconnect_arm();   /* r95: watch for Apple's post-reconnect park + arm the takeover, from interrupt level */
+    /* ★★★★★ h26 APP-LESS: notice a parked task-level job and post the NM trampoline for it. This runs on the
+     * 8 ms heartbeat and the real IRQ, so a park is picked up within one heartbeat with no application of ours
+     * involved. NMInstall only ENQUEUES, which is what makes it legal from here — see ehci_nm_task_resp. */
+    /* ★ h64 MEASUREMENT: how long does lowmem Ticks itself stall? Sampled here on the 8 ms heartbeat and
+     * timed with frame_ms(), which VBL cannot stop. If the theory above is right this reports a large number
+     * on a boot that used to fail — the fix restores the pump, and the pump is what lets the dump be written,
+     * so this build proves its own diagnosis instead of asserting it. */
+    {   UInt32 t = TICKS_NOW, ms = frame_ms();
+        if (t != gTickSeenLast) { gTickSeenLast = t; gTickSeenMs = ms; }
+        else if ((UInt32)(ms - gTickSeenMs) > gTicksStallMaxMs) gTicksStallMaxMs = (UInt32)(ms - gTickSeenMs);
+    }
+    task_work_arm();
 }
 
 /* ==================== real EHCI interrupt + periodic timer ====================
@@ -4947,7 +8127,7 @@ void ehci_vhub_service(void)
  * else masks USBINTR and queues the SIH, which clears the source and re-unmasks. */
 #define VHUB_HB_MS 8
 static UInt32 gIntrEnabled = (EHCI_STS_PCD | EHCI_STS_USBINT | EHCI_STS_USBERRINT);
-static int gA2Live = 0; static volatile UInt32 gSihQueued = 0;
+static int gA2Live = 0;   /* h54: gSihQueued moved up beside gIsrConsec so ctl_step's probe can read it */
 static TimerID gHbTimer = 0;
 static InterruptSetID gSetID = 0; static InterruptMemberNumber gMember = 0;
 static void *gSavedRefcon = 0; static InterruptHandler gSavedHandler = 0;
@@ -4966,9 +8146,194 @@ static void storm_paint(void)
     }
 }
 
+/* ================================================================================================
+ * ★★★★★★★ h76 — THE SCREEN WATCHDOG. EVIDENCE THAT DOES NOT DIE WITH THE FILE MANAGER.
+ *
+ * ⚠ WHY THIS EXISTS, and it was predicted in this file after h18 and never acted on: "the next attempt
+ * needs evidence that survives a stall rather than more counters written through FSWrite."
+ * EVERY log line in this driver is a synchronous FSWrite + FlushVol. The m26 run-2 failure WEDGED THE FILE
+ * MANAGER — desktop drawn, wristwatch cursor, not one icon, for ever — so logging stopped instantly and
+ * silently, mid-line, with no error recorded. The +5 s state dump never printed because the File Manager
+ * was already gone before the deadline. Our entire diagnostic channel is destroyed by the exact fault we
+ * are trying to diagnose, and no amount of extra logging can fix that.
+ * ⇒ Paint to the SCREEN. It touches no Toolbox call, no allocator, no File Manager — just stores into the
+ * framebuffer, which is why storm_paint (v46) has always been "the ONLY readout that survives an
+ * interrupt-level CPU lockup". This extends that from a blank white band to actual NUMBERS.
+ *
+ * ★ AND IT REPAINTS ~1/s, WHICH IS THE POINT. A frozen gVhubTick means the driver died; a CLIMBING
+ * gVhubTick beside a FROZEN gTaskPumpN means the driver is fine and TASK LEVEL is what stopped — the
+ * single most valuable distinction in this whole hunt, and one no log could ever have given us, because a
+ * log cannot be written by the thing whose death it is trying to report.
+ *
+ * SAFETY, since this runs at INTERRUPT level and writes raw screen memory:
+ *   · base from ScrnBase (0x0824), exactly as storm_paint proves works on this hardware;
+ *   · rowBytes read defensively through MainDevice -> gdPMap -> PixMap, every pointer NULL-checked, and
+ *     REJECTED unless plausible — on failure we fall back to storm_paint's plain band, so the diagnostic
+ *     degrades instead of faulting;
+ *   · every write is bounded to a small fixed box near the top-left, so even a wrong stride can only make
+ *     an ugly pattern, never scribble memory;
+ *   · stores only. No Toolbox, no allocation, no File Manager. The interrupt audit stays clean. */
+static const UInt8 gHexFont[16][6] = {
+    {0x6,0x9,0x9,0x9,0x9,0x6}, {0x2,0x6,0x2,0x2,0x2,0x7}, {0x6,0x9,0x1,0x2,0x4,0xF},
+    {0xE,0x1,0x6,0x1,0x9,0x6}, {0x9,0x9,0xF,0x1,0x1,0x1}, {0xF,0x8,0xE,0x1,0x9,0x6},
+    {0x6,0x8,0xE,0x9,0x9,0x6}, {0xF,0x1,0x2,0x4,0x4,0x4}, {0x6,0x9,0x6,0x9,0x9,0x6},
+    {0x6,0x9,0x9,0x7,0x1,0x6}, {0x6,0x9,0x9,0xF,0x9,0x9}, {0xE,0x9,0xE,0x9,0x9,0xE},
+    {0x6,0x9,0x8,0x8,0x9,0x6}, {0xE,0x9,0x9,0x9,0x9,0xE}, {0xF,0x8,0xE,0x8,0x8,0xF},
+    {0xF,0x8,0xE,0x8,0x8,0x8}
+};
+/* h85: painted so it READS as the build number — 0x85 shows as "85". ⚠ KEEP IN SYNC WITH
+ * EHCI_BUILD_TAG in ehci_uim.c; they are the same fact told to two different readers. */
+#define EHCI_BUILD_PAINT 0x94u
+#define PW_SCALE   3                     /* pixels per font pixel */
+#define PW_GW      (5 * PW_SCALE)        /* glyph cell width  (4 px glyph + 1 px gap) */
+#define PW_GH      (8 * PW_SCALE)        /* glyph cell height (6 px glyph + 2 px gap) */
+#define PW_MAXX    600u                  /* hard bound: never write past this column ... */
+#define PW_MAXY    200u                  /* ... or this line. Any screen is at least 640x480. */
+
+/* longs-per-row, or 0 if we cannot establish it safely. */
+static UInt32 pw_row_longs(void)
+{
+    UInt8 **gdh; UInt8 *gd; UInt8 **pmh; UInt8 *pm; UInt32 rb;
+    gdh = (UInt8 **)*(volatile unsigned long *)0x08A4UL;   /* MainDevice: GDHandle */
+    if (!gdh || (unsigned long)gdh < 0x1000UL) return 0;
+    gd = *gdh;  if (!gd || (unsigned long)gd < 0x1000UL) return 0;
+    pmh = *(UInt8 ***)(gd + 0x16);                         /* GDevice.gdPMap */
+    if (!pmh || (unsigned long)pmh < 0x1000UL) return 0;
+    pm = *pmh;  if (!pm || (unsigned long)pm < 0x1000UL) return 0;
+    rb = (UInt32)(*(volatile UInt16 *)(pm + 4) & 0x3FFFu); /* PixMap.rowBytes, minus the flag bits */
+    if (rb < 1024u || rb > 32768u || (rb & 3u)) return 0;  /* implausible => caller falls back */
+    return rb >> 2;
+}
+static void pw_glyph(UInt32 *fb, UInt32 rowLongs, UInt32 x0, UInt32 y0, UInt8 g, UInt32 colour)
+{
+    int r, c, sy, sx;
+    if (x0 + 4u * PW_SCALE >= PW_MAXX || y0 + 6u * PW_SCALE >= PW_MAXY) return;   /* bounded, always */
+    for (r = 0; r < 6; r++) {
+        UInt8 bits = gHexFont[g & 0x0F][r];
+        for (c = 0; c < 4; c++) {
+            if (!(bits & (8 >> c))) continue;
+            for (sy = 0; sy < PW_SCALE; sy++)
+                for (sx = 0; sx < PW_SCALE; sx++)
+                    fb[(y0 + (UInt32)(r * PW_SCALE + sy)) * rowLongs + (x0 + (UInt32)(c * PW_SCALE + sx))] = colour;
+        }
+    }
+}
+/* Paint `n` hex digits of `v` at character cell (cx, cy). */
+static void pw_hex(UInt32 *fb, UInt32 rowLongs, UInt32 cx, UInt32 cy, UInt32 v, int n, UInt32 colour)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        pw_glyph(fb, rowLongs, (cx + (UInt32)i) * PW_GW, cy * PW_GH,
+                 (UInt8)((v >> (4 * (n - 1 - i))) & 0x0Fu), colour);
+}
+static void paint_watchdog_state(void)
+{
+    UInt32 *fb = *(UInt32 * volatile *)0x0824UL;           /* ScrnBase — storm_paint's proven source */
+    UInt32 rl = pw_row_longs();
+    UInt32 i;
+    if (!fb || (unsigned long)fb < 0x1000UL) return;
+    if (!rl) { storm_paint(); return; }                    /* cannot lay out -> the plain band still says "fired" */
+    /* Black backing box so the digits are legible over whatever the Finder drew. */
+    for (i = 0; i < PW_MAXY; i++) {
+        UInt32 j; UInt32 *row = fb + i * rl;
+        for (j = 0; j < PW_MAXX; j++) row[j] = 0x00000000UL;
+    }
+    /* Row 0 — a bright red banner so it is unmistakable on a photograph. */
+    for (i = 0; i < PW_GH; i++) {
+        UInt32 j; UInt32 *row = fb + i * rl;
+        for (j = 0; j < PW_MAXX; j++) row[j] = 0x00FF0000UL;
+    }
+    /* Row 1: the liveness pair. TICK climbing + PUMP frozen == the driver is alive, TASK LEVEL is dead.
+     * Row 2: the block-I/O state machine and both in-flight slots.
+     * Row 3: the error counters we could never see, because the log died before they were dumped. */
+    pw_hex(fb, rl, 0,  1, gVhubTick,                     8, 0x0000FF00UL);   /* green: must CLIMB */
+    pw_hex(fb, rl, 9,  1, gTaskPumpN,                    8, 0x0000FFFFUL);   /* cyan:  frozen == task level dead */
+    pw_hex(fb, rl, 0,  2, (UInt32)gBioPhase,             2, 0x00FFFFFFUL);   /* >= 20 == stuck in BOT recovery */
+    pw_hex(fb, rl, 3,  2, (UInt32)(gEgBusy ? 1 : 0),     1, 0x00FFFFFFUL);
+    pw_hex(fb, rl, 5,  2, (UInt32)(gDpBusy ? 1 : 0),     1, 0x00FFFFFFUL);
+    pw_hex(fb, rl, 7,  2, (gBioHead - gBioTail),         2, 0x00FFFFFFUL);   /* queued and not completing */
+    pw_hex(fb, rl, 10, 2, (UInt32)gAs.pc,                2, 0x00FFFFFFUL);
+    pw_hex(fb, rl, 13, 2, (UInt32)(gAs.running ? 1 : 0), 1, 0x00FFFFFFUL);
+    pw_hex(fb, rl, 0,  3, gDownErr,                      4, 0x00FFFF00UL);
+    pw_hex(fb, rl, 5,  3, gDownTimeouts,                 4, 0x00FFFF00UL);
+    pw_hex(fb, rl, 10, 3, gEgRecovCompl,                 4, 0x00FFFF00UL);
+    pw_hex(fb, rl, 15, 3, gSplitSaved,                   4, 0x00FFFF00UL);
+    /* ★★★★ h83 ROW 4 (magenta) — WHY the pump stopped, which rows 1-3 cannot say.
+     * The 2026-08-12 Mini hang froze gTaskPumpN at 0x0a with the engine completely idle and every error
+     * counter zero, and the last dump read gNmArmed == gNmFired == 10. Balanced. Two incompatible stories
+     * fit that, they need opposite fixes, and no counter on screen could separate them:
+     *   A — we stopped ASKING: no further arm was ever issued, so nothing woke the pump.
+     *   B — we asked and NOBODY ANSWERED: a request went out and the Finder never ran it.
+     * These four fields decide it on sight, with no log and no working task level:
+     *   ARMED > FIRED  -> B. A request is outstanding and unanswered.
+     *   ARMED == FIRED and both frozen, POSTED 0 -> A. We are not asking.
+     *   POSTED 1 forever -> the gNMTPosted latch is stuck, which is the ONLY way task_work_arm can
+     *                       return on its first line for the rest of the session (see h83 at gNmArmTickK).
+     *   STUCK climbing -> h63 is alive for the first time ever and is re-posting; if the machine then
+     *                     recovers, B is confirmed AND fixed. If it climbs and the machine stays wedged,
+     *                     the Finder is dead to us and the fault is not the request at all.
+     *   KEEP climbing  -> the ~2 s keepalive is still reaching NMInstall, so interrupt level is healthy
+     *                     and the break is downstream of us. */
+    pw_hex(fb, rl, 0,  4, gNmArmed,                      4, 0x00FF00FFUL);   /* ARMED */
+    pw_hex(fb, rl, 5,  4, gNmFired,                      4, 0x00FF00FFUL);   /* FIRED */
+    pw_hex(fb, rl, 10, 4, gNmStuckRearms,                4, 0x00FF00FFUL);   /* STUCK (h63 revivals) */
+    pw_hex(fb, rl, 15, 4, (UInt32)(gNMTPosted ? 1 : 0),  1, 0x00FF00FFUL);   /* POSTED latch */
+    pw_hex(fb, rl, 17, 4, gNmKeepArms,                   4, 0x00FF00FFUL);   /* KEEP (keepalive arms) */
+    /* ★★★★ h84 ROW 5 (orange) — WHERE the body is, and HOW LONG it has been there.
+     * Row 4 established that a wedge is a body that never returns. This row names the section and times it
+     * LIVE, which is the only form that works: a high-water mark is written at body exit, and the failure
+     * is a body that never exits. PH is the answer; NOWMS is the evidence it is not merely slow.
+     *   PH    current section, 0 = not in the body (see the BP_* table)
+     *   NOWMS ms since this body started, clamped at FFFF. Climbing across two paints = wedged HERE.
+     *   MAXMS worst COMPLETED body this session
+     *   MAXPH / PHMS  the section with the worst high-water, and that figure — "which part is the long pole"
+     * ⚠ MAXMS and PHMS are healthy-path statistics. On a wedge read PH and NOWMS and ignore the rest. */
+    {   UInt32 el = 0, i2, best = 0, bestPh = 0;
+        if (gBodyPhase != BP_IDLE) {
+            el = frame_ms() - gBodyStartMs;
+            if (el > 0xFFFFUL) el = 0xFFFFUL;          /* pin rather than wrap — a wrapped field lies (I10) */
+        }
+        for (i2 = 0; i2 < BP_N; i2++)
+            if (gPhaseMaxMs[i2] > best) { best = gPhaseMaxMs[i2]; bestPh = i2; }
+        if (best > 0xFFFFUL) best = 0xFFFFUL;
+        pw_hex(fb, rl, 0,  5, (UInt32)gBodyPhase, 2, 0x00FF8000UL);   /* PH    */
+        pw_hex(fb, rl, 3,  5, el,                 4, 0x00FF8000UL);   /* NOWMS */
+        pw_hex(fb, rl, 8,  5, gBodyMaxMs > 0xFFFFUL ? 0xFFFFUL : gBodyMaxMs,
+                                                  4, 0x00FF8000UL);   /* MAXMS */
+        pw_hex(fb, rl, 13, 5, bestPh,             2, 0x00FF8000UL);   /* MAXPH */
+        pw_hex(fb, rl, 16, 5, best,               4, 0x00FF8000UL);   /* PHMS  */
+        /* ★★ h85: BUILD and LOG LEVEL, in white, at the end of row 5. With the logging compiled out the log
+         * file holds two lines, so the screen has to be able to identify the run on its own — otherwise a
+         * level-0 build and a level-2 build are indistinguishable from a photograph, and this project has
+         * already lost a cycle to a stale log and a wrong app version. BUILD is painted so it READS as the
+         * decimal build number (0x85 -> "85"), not as hex arithmetic. */
+        pw_hex(fb, rl, 21, 5, EHCI_BUILD_PAINT, 2, 0x00FFFFFFUL);              /* "85" */
+        pw_hex(fb, rl, 24, 5, (UInt32)ehci_os_log_level(), 1, 0x00FFFFFFUL);   /* log level */
+        /* h92: the canary mask, red so a dead guard zone is unmissable. 00 = all guards intact. */
+        pw_hex(fb, rl, 26, 5, gH92Mask, 2, 0x00FF0000UL);
+    }
+}
+/* Interrupt level, from the heartbeat. Arms only after an exposure, fires only once task level has been
+ * silent for 5 s, repaints ~1/s, and stops after 120 paints so it can never become the problem itself. */
+static void paint_watchdog_tick(void)
+{
+    UInt32 now = TICKS_NOW;
+    if (!gPwArmed) return;
+    if (gTaskPumpN != gPwPumpLast) { gPwPumpLast = gTaskPumpN; gPwPumpAtTick = now; return; }
+    if ((long)(now - gPwPumpAtTick) < 300L) return;        /* task level quiet < 5 s: normal, say nothing */
+    if (gPwPaints >= 120u) return;                         /* ~2 minutes of evidence is plenty */
+    {   static UInt32 sNext = 0;
+        if ((long)(now - sNext) < 0) return;
+        sNext = now + 60UL;                                /* ~1 s between repaints */
+    }
+    gPwPaints++;
+    paint_watchdog_state();
+}
+
 static OSStatus vhub_sih(void *p1, void *p2)
 {
     (void)p1; (void)p2;
+    gSihRuns++;                 /* h54: diagnostic only — the probe reads it to see whether the SIH is starved */
     ehci_vhub_service();
     /* SHARED-IRQ FIX #1 (Mini mount): clear gSihQueued BEFORE re-unmasking. The old order (unmask then
      * clear) left a window where a completion arriving after the unmask re-entered vhub_isr, which masked
@@ -4991,12 +8356,44 @@ static OSStatus vhub_heartbeat(void *p1, void *p2)
      * out, so the heartbeat never actually stops and the driver keeps touching hardware after kFinalize.
      * Returning before frame_time_update() is what makes the driver go quiet. */
     if (gServiceStop) return noErr;
+    /* ★ h76: the screen watchdog. Deliberately HERE, in the timer handler, and not in the SIH — this is the
+     * one path that keeps running when everything above it has stopped, which is exactly the condition it
+     * exists to report. Cheap: a counter compare on all but ~1 pass per second. */
+#if H76_DIAGNOSTICS
+    paint_watchdog_tick();
+#endif
+    gHbRuns++;                  /* h65: heartbeat-ONLY liveness. Compare with gVhubTick (SIH passes,
+                                 * which the real IRQ also drives): gVhubTick climbing while gHbRuns is
+                                 * flat means the Time Manager one-shot stopped re-arming, which would
+                                 * freeze frame_ms() and is the last standing explanation for callN 1. */
     frame_time_update();        /* advance the USL frame clock on a steady 8 ms cadence (single writer) */
     /* QUEUE the secondary handler (like the ISR path) rather than running the service inline at timer
      * level — so EVERY transfer completion is delivered to the USL/class driver at secondary-interrupt
      * level, matching Apple's OHCI UIM. (A completion arriving at timer level may be why the mass-
      * storage driver won't re-issue after REQUEST SENSE.) */
     if (!gSihQueued) { gSihQueued = 1; QueueSecondaryInterruptHandler(vhub_sih, NULL, NULL, NULL); }
+    /* ★ ase_quiesce timebase calibration, free of charge: this path already reads UpTime() to re-arm, and
+     * frame_time_update() just advanced the microframe accumulator. Accumulating both spans lets the log
+     * convert ase_quiesce's raw tick deltas into microseconds without a clock-rate assumption and without
+     * spinning anywhere to calibrate. Skips the first pass (no previous sample) and any pass where the
+     * accumulator did not move. */
+    {   UInt32 tbNow = UpTime().lo;
+        static UInt32 sTbPrev = 0, sUfPrev = 0; static int sHave = 0;
+        if (sHave) {
+            UInt32 dtb = tbNow - sTbPrev, duf = gMicroAcc - sUfPrev;
+            if (duf && dtb) {
+                /* ★ HALVE BOTH BEFORE EITHER CAN WRAP. The first run of this instrumentation reached 96.6%
+                 * of a 32-bit wrap in 202.8 s: seven more seconds and the accumulator would have rolled over
+                 * and silently DEFLATED the microsecond conversion, reporting a smaller number that looked
+                 * perfectly plausible. Only the RATIO matters, and halving both preserves it exactly, so the
+                 * calibration now survives a session of any length. */
+                if (gAseTbSpan > 0x40000000UL || gAseUfSpan > 0x40000000UL) {
+                    gAseTbSpan >>= 1; gAseUfSpan >>= 1;
+                }
+                gAseTbSpan += dtb; gAseUfSpan += duf;
+            }
+        }
+        sTbPrev = tbNow; sUfPrev = gMicroAcc; sHave = 1; }
     when = AddDurationToAbsolute((Duration)VHUB_HB_MS, UpTime());
     SetInterruptTimer(&when, vhub_heartbeat, 0, &gHbTimer);   /* one-shot: re-arm */
     return noErr;
@@ -5014,7 +8411,10 @@ static InterruptMemberNumber vhub_isr(InterruptSetMember m, void *refcon, UInt32
     if (gSoftc.sharedCompanion) {
         gIsrConsec++;
         if (gIsrConsec > gIsrConsecMax) gIsrConsecMax = gIsrConsec;
+#if EHCI_PAINT   /* h86: the release build must never draw on the screen — not even in a storm.
+                  * The counters (gIsrConsec/Max) stay; a field report of a wedge gets a PAINT=1 build. */
         if (gIsrConsec > 499u && gStormPainted == 0) { gStormPainted = 1; storm_paint(); }
+#endif
     }
     sts = ehci_read32(gSoftc.opBase, EHCI_USBSTS) & gIntrEnabled;
     if (sts) {                                                 /* OUR (EHCI) interrupt */
@@ -5050,6 +8450,14 @@ void ehci_vhub_start_service(EHCIRegEntryIDPtr node)
      * the displaced companion handler so the keyboard/mouse stay serviced; the launcher's settle window
      * keeps their re-enumeration from colliding with the drive's enumeration. On a DEDICATED line (PCI
      * card, sharedCompanion==0) vhub_isr never touches the companion handler. */
+#if EHCI_FORCE_POLLED
+    /* b9: the B&W G3 NMI capture (2026-08-14) proved an unserviced interrupt storm at the first PCD
+     * assertion — the driver-ist install "succeeds" on the Heathrow-era tree but the ISR is never
+     * dispatched. In forced-polled mode we never install the ISR and never write USBINTR, so the
+     * controller can never assert the line at all; the 8ms heartbeat carries all completions. */
+    pe = -1;
+    ehci_os_log("  b9 EHCI_FORCE_POLLED: skipping ISR install + USBINTR enable BY BUILD CONFIG");
+#endif
     if (pe == noErr && sz >= sizeof(InterruptSetMember)) {
         OSErr ge, ie = -1;
         gSetID = ist[0].setID; gMember = ist[0].member;
@@ -5132,7 +8540,15 @@ static pascal void ehci_shutdown_proc(short stage)
 void ehci_vhub_install_shutdown_hook(void)
 {
     if (gShutUPP) return;                                        /* once only */
-    gShutUPP = NewShutDwnUPP(ehci_shutdown_proc);
+    /* h96: same rule as the pump UPP — the Shutdown Manager calls this descriptor at restart time,
+     * long after whatever zone hosted this call may have evaporated. A stale descriptor HERE means
+     * the quiesce never runs and the jump lands in recycled memory at the worst possible moment
+     * (mid-shutdown, no MacsBug). SysZone, explicitly, like h90. */
+    {   THz oldZone = GetZone();
+        SetZone(SystemZone());
+        gShutUPP = NewShutDwnUPP(ehci_shutdown_proc);
+        SetZone(oldZone);
+    }
     if (gShutUPP) {                                  /* ShutDwnInstall returns void — the UPP is the only
                                                       * thing that can fail here */
         ShutDwnInstall(gShutUPP, sdRestartOrPower);

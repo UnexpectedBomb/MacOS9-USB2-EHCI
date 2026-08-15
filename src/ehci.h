@@ -64,12 +64,33 @@ long ehci_os_init(ehci_softc *sc, EHCIRegEntryIDPtr node);
 /* Init-phase tracing to a flushed disk file (ehci_os.c); safe from the app-context Initialize. */
 void ehci_os_log(const char *s);
 void ehci_os_logx(const char *label, unsigned long v);
+/* h85: the banner bypasses the level gate — run validation ("expected banner, or the run is void") has to
+ * survive with the logging compiled out. ehci_os_log_level() reports the compiled level so the screen
+ * watchdog can paint it, i.e. so the mode is verifiable with no file at all. */
+void ehci_os_log_always(const char *s);
+int  ehci_os_log_level(void);
+/* h87: plant the DoDriverIO UPP the USL's parcel machinery never wrote into our unit-table DCE
+ * (dCtlWindow +0x1E) — the ASP Devices-and-Volumes crash. TASK LEVEL ONLY (allocates). */
+void ehci_os_fix_native_dce(void);
 /* n5: interrupt-safe log ring — use these from ANY code reachable below task level (the async
  * enumeration/probe engine). Callers MUST pass string literals; the ring stores the pointer, not a copy.
  * ehci_os_ilog_drain() does the File Manager work and is TASK LEVEL ONLY. */
 void ehci_os_ilog(const char *s);
 void ehci_os_ilogx(const char *label, unsigned long v);
+/* CRITICAL variants: exempt from the h15/h16 RATE cap (never from the ring bound). Reserve these for the
+ * lines a diagnosis RESTS on — probe completion, geometry, the exposure latch. The m24 log dropped 458
+ * ordinary ring lines and thereby read as an exposure with no probe in front of it; see the long note at
+ * ILogRec in ehci_os.c and docs/ENGINE-STATE-MACHINE.md §0. Keep the set tiny. */
+void ehci_os_ilogc(const char *s);
+void ehci_os_ilogcx(const char *label, unsigned long v);
+/* ⚠ h78: TWO DRAINS, AND THE CALLER DECIDES WHICH. ehci_os_ilog_drain() is the one usb_disk.c's
+ * DoDriverIO calls — i.e. from INSIDE a File Manager call chain — so it has a tiny budget and stands
+ * down completely while a mount is in flight. ehci_os_ilog_drain_bulk() is for selfprobe_tick only,
+ * which runs in the NM response and is not inside a File Manager call. Draining 384 lines from the
+ * former is what wedged the File Manager on the m27 hub run; see the long note in ehci_os.c. */
 void ehci_os_ilog_drain(void);
+void ehci_os_ilog_drain_bulk(void);
+void ehci_os_ilog_inhibit_drain(unsigned long ticks);
 
 /* DMA pool (ehci_os.c): wired-page allocator for QHs/qTDs.
  * ehci_dma_alloc returns a zeroed, `align`-aligned logical block and writes its

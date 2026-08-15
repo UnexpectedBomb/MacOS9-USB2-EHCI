@@ -1,3 +1,330 @@
+/* ★ THE ROM BUILD TAG. Bump this on EVERY ROM build; it is logged as the first line of uimInitialize and is
+ * the ONLY way a log can say which driver actually booted (the Get-Info route is closed — a `vers` (1) in a
+ * Mac OS ROM stops the machine booting). Keep it identical to the tag in the .hqx filename. */
+#define EHCI_BUILD_TAG "b16rel" /* h97rel = the 2026-08-15 RELEASE of the b15 driver for Mini + MDD
+                                * (LEVEL0 PAINT0, interrupts). b16rel = the SAME SOURCE at the B&W
+                                * release config (LEVEL0 PAINT0 FORCE_POLLED, lzss'd parcel). Driver
+                                * delta over h96rel/b10rel is exactly the b15 Control-21/22 fix below,
+                                * hardware-validated on the B&W (per-slot "USB 2.0, drive N (v1.0)" in
+                                * DFA; skip reclassified known-cosmetic, workaround documented).
+                                *
+                                * b15 = kDriveIcon/kMediaIcon (Control 21/22) FILLED — the actual DFA
+                                * garbage-string mechanism. b14 proved by experiment that kdgFlush +
+                                * kDriveInfo answers change NOTHING in Disk First Aid; the b14 ring
+                                * census then showed DFA never asks kdgVersion, and the Apple-stack
+                                * control (HIGHSPEED on the built-in USB 1.1 port) rendered "USB
+                                * (v2.1.1)" — a WHERE-STRING the driver itself composes, returned with
+                                * a 256-byte ICN# through Control 21. Our blanket noErr acked 21/22
+                                * with csParam UNFILLED -> DFA rendered bytes past its own leftover
+                                * stack long: deterministic garbage, identical across drives/builds/
+                                * machines. Fix in usb_disk.c: per-slot {ICN# + "USB 2.0, drive N
+                                * (v1.0)"} blob served for 21/22; per-slot DISTINCT strings also target
+                                * the one-of-two-drives-listed skip (identical responses on one refNum
+                                * look like one physical drive). VERIFY: DFA lists BOTH volumes, each
+                                * with a clean per-drive location line + our icon. b13/b13b/b14 were
+                                * the instrument ladder (selector ring; see docs/BW-TEST-CARD-b2.md).
+                                *
+                                * b2 = the B&W G3 retail-9.2.2-base PROVING build: the h96 driver
+                                * (both 2026-08-14 fixes in) at LEVEL1 PAINT1, on the retail ROM base.
+                                * Supersedes b1 UNBOOTED — b1 carried the h91 driver, which predates
+                                * both the h94 rude-removal UAF fix and the h96 SysZone UPPs; a third
+                                * machine never runs known-buggy bytes. Pair with the v9-dm MDD
+                                * extension (8.2). See docs/BW-TEST-CARD-b1.md (updated for b2).
+                                *
+                                * h96rel = the 2026-08-14 RELEASE build of h96 (LEVEL0 PAINT0, one
+                                * driver, both machines). Ships beside extension v8.2/v11.1 (the v9-dm
+                                * DM-resident vehicle). The two corrupters of the 8/13-8/14 hunt are both
+                                * closed and hardware-validated: the rude-removal UAF (h94, confirmed by
+                                * efficacy) and the evaporating parade arena (driver-side SysZone UPPs in
+                                * h96 + the extension's v9-dm vehicle; both machines cold-boot clean).
+                                *
+                                * h96 = THE EVAPORATING-DESCRIPTOR FIX (the boot-window crash family).
+                                * The h94rel cold-boot crash was SOLVED from one StdLog + the INIT's own
+                                * log: the extension's NM response descriptor (printed at 0x01E7C4A0 at
+                                * INIT time) sat INSIDE the exact block MacsBug showed recycled as the
+                                * Helvetica FOND (01E7B3E0-01E7D6F4) — every heap OK, a stale-pointer
+                                * wild jump through SystemTask (KeyboardSystemTaskPatch frame), 28s into
+                                * boot, PC executing font bytes. NewRoutineDescriptorTrap/NewNMUPP
+                                * allocate in TheZone, and the boot-era zones those calls ran in do not
+                                * survive; the freed bytes keep working until the block is reused, which
+                                * is why the family (eject-crash session, h92 warm-restart crash, this)
+                                * only ever struck at desktop-load time and never under deliberate
+                                * hunting. The app era (h53, weeks clean) had NO descriptors — the
+                                * corruption era began exactly at the extension transition. h90 already
+                                * carried the rule AND the idiom ("the RD must outlive whichever app
+                                * hosts boot" — SetZone(SystemZone())); the lesson existed in one place
+                                * and was not consulted at the other allocation sites. NOW FIXED AT ALL
+                                * THREE: the driver's pump UPP (gNMTUpp — the most-called pointer in the
+                                * driver), the shutdown UPP (gShutUPP — called at restart), and the
+                                * extension's NM descriptor (ehci_init_dbg.c v9, ships as extension
+                                * vers 8.1/11.1). VERIFY: the INIT log's descriptor line must print a
+                                * LOW system-heap address (not 0x01Exxxxx), then repeated cold boots +
+                                * normal use; the h52/h94 counters and canaries ride along (LEVEL1
+                                * PAINT1). Session B's zone damage remains separately attributed to the
+                                * h94 UAF (fixed, efficacy-proven); this is the SECOND mechanism.
+                                *
+                                * h95 = h94 CODE BYTE-IDENTICAL, DIAGNOSTIC CONFIG (LEVEL1 PAINT1).
+                                * Exists because the h94rel COLD BOOT crashed at desktop load on the MDD
+                                * (Unimplemented Instruction at 01E7D0EA, PC inside the Helvetica FOND —
+                                * executing font data; Finder drawing the desktop). Cold boot + fixed
+                                * driver + zero removals = NOT the h94 UAF; there is a SECOND corruption
+                                * mechanism in the BOOT WINDOW, and the h92-era warm-restart crash
+                                * reattributes to it. The release ROM was blind (LEVEL0/PAINT0); this
+                                * recut turns every instrument back on with ZERO code delta, so repeated
+                                * cold boots can (a) establish the base rate and (b) carry the h93 DM
+                                * ring + h94 counters + canaries + h52 swap watch into the crash window.
+                                * One variable: the config. Do not add code to this build.
+                                *
+                                * h94rel = the 2026-08-14 RELEASE build of h94 (LEVEL0 PAINT0, one
+                                * driver for both machines). h94's fix CONFIRMED BY EFFICACY on the MDD:
+                                * a deliberate settle-window yank caught a live USL client transfer
+                                * (gH94Retired 1), the funnel retired it, gH94Orphaned 0, heap clean;
+                                * plus 3 mid-wire block-path catches (gQhHalted) all recovered clean
+                                * across the batteries. The ASP 15x "residue" was RESOLVED BY ANALYSIS,
+                                * not code: it is the USL's task-level idle poll slowing ~8ms -> ~120ms
+                                * after ASP; all real-time work is SIH-driven and unaffected; deferred
+                                * completions worst-case ~120ms. No behavior change from h94.
+                                *
+                                * h94 = THE RUDE-REMOVAL USE-AFTER-FREE FIX. The h93 run ANSWERED the h92
+                                * question and overturned its correlation: 216 DoDriverIO calls across
+                                * three sessions (ASP run deliberately, repeatedly), EVERY
+                                * IOCommandIsComplete verdict noErr, and two of those burst-carrying
+                                * sessions kept a CLEAN heap — the dispatch path is exonerated by
+                                * experiment, and the "72-call burst" is just ASP's normal scan shape
+                                * (18 x Open/Control/Status/Close). What both corrupt sessions actually
+                                * shared, and every clean one lacked, was a RUDE REMOVAL with USL client
+                                * transfers still in flight (the freshly-inserted SanDisk yanked
+                                * mid-settle; the boot-era leg pull). MECHANISM (found in code, matches
+                                * the MacsBug scribble at 01C20350 exactly): this hardware's USL NEVER
+                                * calls AbortPipe/DeletePipe — slots 18/19, zero calls in every banked
+                                * log — it just frees its pipe/transfer structures on removal, while our
+                                * ENGINE slot/FIFO still hold that client's completion UPP, pipe pointer
+                                * and destination buffer; the orphaned transfer times out (-6640) and
+                                * down_reap wrote IN-data into the freed buffer and fired the UPP with
+                                * the freed pipe. Idle-drive yanks have nothing in flight, hence every
+                                * clean hardening pass. THE FIX (ehci_vhub.c, three layers, flag work
+                                * only): (1) usl_retire_device at the disconnect handler nulls the client
+                                * pointers and queues substitute completions (status -6640) through
+                                * gComplQ, and gH94Hold parks the root-hub status-change report until
+                                * compl_drain delivers them at task level — clients complete BEFORE the
+                                * USL learns and frees; (2) down_pump refuses issues for dead devices
+                                * (h81's lesson, USL-side); (3) a reap-side orphan gate suppresses client
+                                * writes if the funnel ever misses (gH94Orphaned MUST stay 0). Dead-addr
+                                * ring FAILS OPEN (cleared on any connect + create_bulk). VERIFY: insert
+                                * a drive, yank it MID-SETTLE (the h93 repro), repeatedly; expect
+                                * gH94Retired > 0, alert still posts, hc all CLEAN, gH94Orphaned 0.
+                                * Ships as the MDD diagnostic ROM (LEVEL1 PAINT1).
+                                *
+                                * h93 = h92 + THE DEVICE-MANAGER CALL HISTORY. The h92 soak produced the
+                                * tightest correlation of the hunt: sessions where something dispatches
+                                * through our USL-made, h90-repaired unit entry CORRUPT the system heap
+                                * (ASP afternoon session; the 72-call burst boot, which also saw unit slot
+                                * 2's driver pointer swap in the same window); sessions with ZERO such
+                                * traffic stay clean (the soak, the cold boot). Canaries stayed 0
+                                * throughout and the crash PC sat 2 MB from our blocks, so our DMA is
+                                * exonerated -- the suspect is the DISPATCH/COMPLETION path itself, most
+                                * concretely IOCommandIsComplete against an entry whose queued-command
+                                * bookkeeping the USL never finished (usb_disk's identical tail on a
+                                * PROPERLY installed entry never corrupts). h91 threw the DM's own verdict
+                                * away; h93 records every call (code, kind, cmdID) and that verdict, plus
+                                * a MUST-BE-0 count of nonzero returns. VERIFY by running ASP DELIBERATELY,
+                                * then hc all + the log. Ships as the MDD diagnostic ROM (LEVEL1 PAINT1).
+                                *
+                                * h92 = THE CORRUPTION ATTRIBUTION INSTRUMENT. Pure diagnostics.
+                                * The MDD's system heap was found CORRUPT (free list bad, block header
+                                * trashed at 01973390) with the eject crash a mere downstream victim, and
+                                * attribution UNKNOWN between every system-heap writer. Timeline: h53 ran
+                                * for weeks beside the CPU-temp CSM cleanly; the corruption arrived in the
+                                * h91 era. This build makes a recurrence SELF-ATTRIBUTING:
+                                * (1) CANARIES: the 0x1000 alignment slack around all three transfer-engine
+                                *     DMA allocations (dmapage / downbuf / egbuf) is pattern-filled and
+                                *     swept every task tick. Dead canary = OUR DMA overran, span named.
+                                *     Mask painted RED at the end of row 5 (00 = intact) + '!!'-logged.
+                                * (2) MAP: '!! h92 MAP' lines at boot give our blocks' start/end, so a
+                                *     MacsBug bad-block address is checkable against our neighbourhood.
+                                * (3) KIND COUNTERS: DoDriverIO calls by imm/sync/other — the h91
+                                *     completion tail (IOCommandIsComplete) is the one genuinely new
+                                *     Device-Manager path of this era, watched explicitly.
+                                * Ships as the MDD diagnostic ROM (LEVEL 1, PAINT 1). Soak under normal
+                                * use WITH the CPU-temp CSM installed (coexistence is the test config);
+                                * on any wedge/crash, photograph row 5 and run MacsBug 'hc all'.
+                                *
+                                * h91 = THE NATIVE COMPLETION CONTRACT (the m40 infinite wristwatch).
+                                * h90 WORKED: ASP's open dispatches into DoDriverIO, no crash. But a native
+                                * driver's RETURN VALUE completes only IMMEDIATE commands — synchronous ones
+                                * are QUEUED, and finish only via IOCommandIsComplete(cmdID, result). Our
+                                * DoDriverIO ignored `kind`, so ASP's synchronous Status PB kept ioResult=1
+                                * forever and ASP spun a wristwatch for good. Fix: usb_disk.c:700's proven
+                                * completion tail, byte for byte, single exit. n0 proves the Device Manager
+                                * never delivered a command here pre-h90, so nothing working can change.
+                                * Ships as m41 (Mini, LEVEL 1, PAINT 0). VERIFY: ASP -> Devices and Volumes
+                                * populates in the normal second or two.
+                                *
+                                * h90 = REPLACE THE DISPATCH DESCRIPTOR UNCONDITIONALLY.
+                                * The escalation, each check one level too shallow, each proven on hardware:
+                                *   h87 assumed EMPTY -> real RD there. h88 checked MAGIC -> fine, left it,
+                                *   crashed. h89 checked the TARGET IS A POINTER -> it is (0x001ADxxx), and
+                                *   it is the very TVector every crash's R12 held: its CODE WORD is the
+                                *   PC=8 payload. DCE -> RD -> TVector; the rot was in the last link.
+                                * n0 proves nothing ever dispatched through this entry (total commands 0,
+                                * every boot), so there is nothing to preserve: log the corpse's full chain
+                                * (including the TVector code word) and plant our own RD, every time.
+                                * Ships as m40 (Mini, LEVEL 1, PAINT 0). VERIFY: 'h90 replacing ...
+                                * UNCONDITIONALLY' + 'AFTER' in the log, then ASP -> Devices and Volumes.
+                                *
+                                * h89 = VALIDATE THE DESCRIPTOR'S TARGET, NOT JUST ITS MAGIC.
+                                * m37's own '!!' log closed the loop: the entry IS found (slot 0x32, refNum
+                                * FFCD), and +0x1E already holds a REAL RoutineDescriptor (0xAAFE magic) —
+                                * whose procDescriptor at RD+0x14, the actual jump target, is garbage. h88's
+                                * magic-only check called that valid and left it alone; ASP then crashed
+                                * through a well-formed descriptor with a junk payload. h89 requires the
+                                * TARGET to be plausible too, replaces the shell when it is not (stale RD
+                                * leaked, never freed — something unknown allocated it), and logs the bad
+                                * target so the diagnosis is in the file. Ships as m38 (Mini, LEVEL 1,
+                                * PAINT 0). VERIFY: the h89 lines, then ASP -> Devices and Volumes.
+                                *
+                                * h88 = h87's DCE fix RETRIED FROM THE PUMP until it lands, and reported.
+                                * m36 still crashed IDENTICALLY (one EHCIUIM entry in the whole table, crawl
+                                * naming OpenInstalledDriver+B4) => the h87 walk found nothing, leading read:
+                                * uimInitialize runs BEFORE the USL registers the unit entry. h88: (1) also
+                                * called from the first task-level pump tick, after all registration;
+                                * (2) latched only on success, so it retries every tick until it lands;
+                                * (3) patches ALL matches; (4) reports on the '!!' channel => a LEVEL 1
+                                * build documents the outcome at ~4 lines per boot. Ships as m37 (Mini,
+                                * LEVEL 1, PAINT 0). VERIFY: the !!-h88 lines in the log, then ASP.
+                                *
+                                * h87 = h86 + THE ASP CRASH, FIXED AT ITS ACTUAL CAUSE.
+                                *
+                                * ASP -> Devices and Volumes crashed on BOTH machines since forever. The
+                                * user's MacsBug StdLog decoded it completely: ASP _Opens every unit-table
+                                * driver; our parcel-claimed entry ('EHCIUIM', created by the USL's family
+                                * machinery, n0-proven NEVER dispatched: total commands 0) lacks the
+                                * DoDriverIO UPP that DriverLoaderLib stashes in the DCE's dCtlWindow
+                                * (+0x1E). The ROM's open path CallUniversalProc's through that field
+                                * (procInfo 0xFFF1) -> garbage vector -> PC=00000008. Byte-for-byte the
+                                * "un-openable ROM-claimed ndrv" crash an earlier ndrv project hit (same ROM routine).
+                                * FIX (ehci_os_fix_native_dce, called from uimInitialize): find our DCE by
+                                * the name MacsBug itself reads (dCtlDriver+0x12), plant
+                                * NewRoutineDescriptor(DoDriverIO, 0xFFF1, kPowerPCISA) at +0x1E, allocated
+                                * in the SYSTEM zone. Exactly what the ROM installer does for real installs.
+                                * AND: DoDriverIO's `default: return noErr` became honest errors (statusErr
+                                * etc.) — success-with-untouched-buffer is the h30 disease, and ASP's
+                                * DriverGestalt('vers') Status would have parsed garbage one call later.
+                                * VERIFY: ASP -> Devices and Volumes on both machines. Ships as m36 (Mini,
+                                * LEVEL0 PAINT0) + MDD h87 (LEVEL0 PAINT1). READ docs/H86-TEST-CARD.md for
+                                * the rest; fallbacks Mini m29 (h78), MDD h53 + v8. */
+                               /* h86 = THE RELEASE CANDIDATE. Two changes on top of the 5/5-validated h85:
+                                *
+                                * (1) THE RUDE-REMOVAL ALERT ACTUALLY APPEARS. h82's was called and silent —
+                                *     m32's level-2 log proves the whole chain ran three times (UnmountVol
+                                *     noErr x3, resolver ok, "h82: posting" x3, nothing drawn). The hand-laid
+                                *     AlertStdAlertParamRec was PPC-aligned; Dialogs.h wraps the real one in
+                                *     #pragma options align=mac68k, so StandardAlert read every field +2 off
+                                *     and bailed. Fix: pass NIL alertParam (documented all-defaults form, one
+                                *     OK button) — no struct, nothing left to misalign. VERIFY WITH ONE YANK.
+                                * (2) EHCI_PAINT beside EHCI_LOG_LEVEL in CMakeLists: PAINT=1 = the m34 test
+                                *     behaviour (watchdog + rows 1-5 + storm band); PAINT=0 = the RELEASE
+                                *     build, which never draws on the user's screen. Counters stay in both.
+                                *
+                                * Ships as TWO ROMs from THIS one source:
+                                *   m35 (Mini, VBL-fixed base):  LEVEL=0 PAINT=0  — the release candidate
+                                *   h86 (MDD, STOCK forkful base): LEVEL=0 PAINT=1 — the universal-door
+                                *     retest: does the MDD's gDownTimeouts failure survive with the logging
+                                *     load gone? Persists = real NEC-side bug. Gone = logging was implicated.
+                                * READ docs/H86-TEST-CARD.md. Fallbacks: Mini m29 (h78), MDD h53 + v8. */
+                               /* h85 = THE DISCRIMINATOR: THE FILE MANAGER LOGGING IS COMPILED OUT.
+                                *
+                                * ★ MEASURED TWICE ON 2026-08-13. Through pump 9 every completed pump body
+                                * was <= 274 ms and gBodySlowN was 0 — a genuinely healthy machine. Then
+                                * slot 1's AddDrive landed, the Finder began mounting, and THE VERY NEXT LOG
+                                * DRAIN TOOK 30715 ms, holding the Finder's own thread for half a minute.
+                                * The 09:12 run measured the same section at 31064 ms. 160 lines x ~190 ms
+                                * per FSWrite + PBFlushFileSync + FlushVol on a boot volume the mount is
+                                * already hammering; the arithmetic closes to within 2%.
+                                * ⇒ THE INSTRUMENT IS THE DOMINANT LOAD, precisely when a mount is in flight.
+                                *
+                                * ⚠ WHY A SWITCH AND NOT A TUNED FLUSH POLICY: h78 cut the DoDriverIO drain
+                                * 384 -> 6 AND stood it down 30 s, passed three runs, failed the fourth.
+                                * Narrowing a window looks exactly like a fix until it doesn't. At level 0
+                                * the code is NOT THERE, so the answer cannot be a coincidence of timing.
+                                *   level 0 solid over several boots -> the instrument was the disease,
+                                *                                       AND THIS IS THE SHIPPING BUILD
+                                *   level 0 still wedges            -> logging was never the cause, and the
+                                *                                       screen paint still says where
+                                *
+                                * SURVIVES AT LEVEL 0: every counter; the whole screen watchdog (it reads
+                                * counters and writes the framebuffer — no File Manager); the BANNER, forced
+                                * through so run validation still works; and rows 1-5 on a failure. Row 5 now
+                                * ends with BUILD ("85") and LEVEL in white, so a photograph identifies the
+                                * run with no file at all.
+                                * ⚠ The INIT's three logs (~56 lines, separate files/code) are DELIBERATELY
+                                * untouched — one variable per run. If startup is still slow, they are next.
+                                * Ships as m34. READ docs/H85-TEST-CARD.md. Fallback: m29 (h78). */
+                               /* h84 = THE PUMP BODY, TIMED AND LOCATED. Pure instrumentation.
+                                *
+                                * m32/h83 settled WHAT: at all three paints ARMED == FIRED with POSTED == 1,
+                                * which can only mean we were inside the response and it had run past the
+                                * watchdog's 5 s trigger. The hang is that picture taken further along — the
+                                * h76 dump read gTaskPumpN 0x0a, so we were inside body #10 at the second
+                                * AddDrive and it never reached 11. The response borrows the FINDER'S OWN
+                                * THREAD, so a body that does not return IS the wedge: one cause, every
+                                * symptom. What is missing is WHERE it stops and HOW LONG it takes.
+                                *
+                                * ⚠ NOTHING WE HAD COULD SEE IT. task_work_arm returns early while a request
+                                * is posted, so the next arm can only happen AFTER the body ends: gNmLat and
+                                * gTickGap BOTH measure the gap. Two instruments, one blind spot.
+                                * ⚠ AND A HIGH-WATER MARK ALONE WOULD BE USELESS — it is written at body
+                                * EXIT, and the failure is a body that never exits. So the load-bearing
+                                * fields are LIVE: gBodyPhase and gBodyStartMs, read by the paint at
+                                * interrupt level as "stuck in section N for M ms".
+                                *
+                                * SCREEN ROW 5 (orange): PH NOWMS MAXMS MAXPH PHMS.
+                                * LOG: three lines — body LAST/MAX, gBodySlowN (bodies over 1000 ms), and the
+                                * worst SECTION. The per-phase table stays on screen, not in the log, because
+                                * this dump runs INSIDE the body it measures (I10).
+                                *
+                                * ZERO behaviour change: eleven bphase() checkpoints, each one subtract and
+                                * two stores. No logging, no allocation, nothing on the hot path.
+                                * Ships as m33. READ docs/H84-TEST-CARD.md. Fallback: m29 (h78). */
+                               /* h83 = WHY THE PUMP STOPS. One diagnostic + one proven defect.
+                                *
+                                * The 2026-08-12 Mini hang froze gTaskPumpN at 0x0a with the engine idle and
+                                * every error counter zero — the m27 signature exactly, and h81's bio_kick
+                                * guard was provably uninvolved (bio ring empty, both slots free). The last
+                                * dump read gNmArmed == gNmFired == 10: balanced, so the log could not say
+                                * whether we STOPPED ASKING or asked and were NEVER ANSWERED.
+                                *
+                                * (1) SCREEN WATCHDOG ROW 4 (magenta): ARMED, FIRED, STUCK, POSTED, KEEP.
+                                *     Reads the answer off a wedged machine with no working task level.
+                                *     ARMED > FIRED = nobody answered; POSTED stuck at 1 = the latch that
+                                *     makes task_work_arm return on its first line forever.
+                                * (2) h63's STUCK-REQUEST WATCHDOG HAS BEEN DEAD SINCE h65, by a unit
+                                *     mismatch: it compares gVhubTick (SIH passes) against gNmArmTick
+                                *     (frame_ms MILLISECONDS). frame_ms outruns gVhubTick ~8x from the first
+                                *     second, so the difference is permanently negative and the watchdog can
+                                *     never reach its own body. gNmStuckRearms is 0 in EVERY run ever
+                                *     logged — that is the fingerprint, not a quiet watchdog. Fixed with a
+                                *     second stamp in the check's own clock; the latency instrument is
+                                *     untouched. Row 4's STUCK field makes the fix self-verifying.
+                                * (3) The gNmLat log label said "ticks"; both ends are frame_ms. It is
+                                *     MILLISECONDS, and the wrong word cost a 16x misreading of the stall.
+                                * No transfer-engine change. Ships as m32. READ docs/H83-TEST-CARD.md.
+                                * Fallback: m29 (h78). */
+                               /* h78 = THE FILE-MANAGER PRESSURE FIXES, named by the m27 hub hang. The
+                                * screen watchdog measured driver-alive / task-level-DEAD with OUR ENGINE
+                                * COMPLETELY IDLE, which rules out a stuck transfer and points at what we
+                                * DO TO the File Manager. Three cuts:
+                                *  (1) the DoDriverIO drain is capped at 6 lines (was 384) — it runs from
+                                *      INSIDE a File Manager call chain, on the boot volume;
+                                *  (2) that drain stands down entirely for 30 s from AddDrive, wall-clock
+                                *      and self-clearing, because the mount is the dangerous window;
+                                *  (3) the periodic dump is paced by WALL CLOCK (2 s enumerating, 15 s
+                                *      once mounted) instead of pump passes — it was emitting 5365 lines
+                                *      after the mount, measured.
+                                * Carries h74's split (validated: gSplitSaved 5, zero clobbers), h75's
+                                * recovery routing, and the h76 screen watchdog. Ships as m29.
+                                * READ docs/H78-TEST-CARD.md. Fallback m25 (h73). */
+
 /*
  * ehci_uim.c — EHCI USB 2.0 host-controller driver (UIM) for Mac OS 9.
  *
@@ -45,12 +372,12 @@ EHCIDriverDescription TheDriverDescription = {
     { 15, "pciclass,0c0320" },
     { 1, 0, 0x80 /*final*/, 0 },
     0x00000005UL,   /* 0x05 = kDriverIsLoadedUponDiscovery(0x01) | kDriverIsUnderExpertControl(0x04).
-                     * Same value as the working ROM ATA controller (cmd646-ata) and eSATA v65.
-                     * ★ DELIBERATELY *NOT* kDriverIsOpenedUponLoad(0x02): eSATA v64 proved on HARDWARE
+                     * Same value as the working ROM ATA controller (cmd646-ata) and an earlier disk ndrv (its v65).
+                     * ★ DELIBERATELY *NOT* kDriverIsOpenedUponLoad(0x02): an earlier disk ndrv proved on HARDWARE (its v64)
                      * that auto-opening at boot crashes near the desktop (the OS brings a not-yet-
                      * functional driver fully online into the SystemTask machinery, then calls a garbage
                      * UPP) — and our own kOpen does the FULL bring-up (HCReset/DMA/IRQ), which the
-                     * eSATA v63/v64 lesson says FREEZES during the early PCI-claim phase. So we accept
+                     * same driver's v63/v64 lesson says FREEZES during the early PCI-claim phase. So we accept
                      * load-without-open here; a later, task-context trigger performs the Open (see
                      * docs/NATIVE_INTEGRATION_DESIGN.md — likely a tiny boot INIT calling OpenDriver,
                      * which is how Apple itself shipped USB support on PCI-card machines). */
@@ -58,7 +385,7 @@ EHCIDriverDescription TheDriverDescription = {
     { 0,0,0,0,0,0,0,0 },
     /* ★★ n1 ROOT-CAUSE FIX (2026-07-31). This was `0` — NO declared service — and the n0 hardware test
      * proved DoDriverIO was NEVER CALLED (trace: 0 commands; "DoDriverIO" absent from the whole log;
-     * EHCIUIM_init.log did not even exist before an app ran). Reason, documented in our own eSATA driver:
+     * EHCIUIM_init.log did not even exist before an app ran). Reason, documented in an earlier disk ndrv by the same author:
      * a native driver's description MUST declare at least one service (DriverFamilyMatching.h, "The List
      * of Services (at least one)") — **omitting it makes VerifyFragmentAsDriver REJECT the fragment**, so
      * the Device Manager never loads it as a driver at all. The USL could still call our exported dispatch
@@ -66,7 +393,7 @@ EHCIDriverDescription TheDriverDescription = {
      * NB this also means lc1's "boot quiesce at kInitialize" has never actually run.
      * Category/type = 'ndrv'/'genr' = a GENERIC native driver: honest for a host controller and neutral —
      * deliberately NOT 'usb ' (kServiceCategoryUSB), which could invite Apple's USB Expert to adopt us and
-     * undo the Apple-independence we built. (eSATA declares 'ndrv'/'blok'; if 'genr' turns out not to
+     * undo the Apple-independence we built. (that earlier ndrv declares 'ndrv'/'blok'; if 'genr' turns out not to
      * satisfy the loader, 'blok' is the HW-proven fallback to try next.) */
     1,
     { FOURCC('n','d','r','v'), FOURCC('g','e','n','r'), { 1, 0, 0x80 /*final*/, 0 } }
@@ -89,6 +416,30 @@ static OSStatus uimInitialize(UInt32 a0, UInt32 a1, UInt32 a2, UInt32 a3,
 {
     long e;
     (void)a4; (void)a5; (void)a6; (void)a7;
+    /* ★★★★★★ THE BUILD TAG, FIRST LINE, ALWAYS. Bump EHCI_BUILD_TAG on every ROM.
+     *
+     * ⚠⚠ WHY THIS EXISTS: on 2026-08-08 an app-less run could not be validated at all, because the only
+     * build identity in this log was the narrative banner below — which still said **h21** while h22 through
+     * h28 had shipped. Asked "which ROM actually booted?", the log could not answer, and neither could I: the
+     * load addresses differ every boot, so nothing in the trace distinguishes one driver build from another.
+     * The project's own rule is "validate the run before analysing it: expected banner" — and for the ROM that
+     * rule was unmeetable. Combined with the Get-Info stamp being impossible (a `vers` (1) breaks boot,
+     * see reference_os9_rom_vers1_breaks_boot) the FILENAME was the only identity, and a filename does not
+     * travel into the log.
+     * ★ One short line, bumped per build, costs nothing and makes every future run self-identifying. */
+    /* h85: _always, not _log. With the File Manager logging compiled out this is the ONLY line the driver
+     * writes, and the run-validation rule depends on it. The line after it says which mode is running, so a
+     * log with two lines is a level-0 run and a log with thousands is a level-2 one — unmistakable. */
+    ehci_os_log_always("=== EHCIUIM BUILD " EHCI_BUILD_TAG " === (if this tag is not the ROM you installed, the run is void)");
+    ehci_os_log_always(ehci_os_log_level() == 0
+        ? "=== h85 LOG LEVEL 0 — the File Manager logging is COMPILED OUT. This banner and this line are the"
+          " only two lines the driver will write. Every counter and the whole screen watchdog still work;"
+          " read the run off the SCREEN (rows 1-5), not off this file. ==="
+        : (ehci_os_log_level() == 1
+            ? "=== h85 LOG LEVEL 1 — only '!!' lines are written. A quiet log is a clean run, not a dead one. ==="
+            : "=== h85 LOG LEVEL 2 — full trace. ⚠ THIS IS THE DIAGNOSTIC MODE AND IT IS THE DOMINANT LOAD:"
+              " measured at 30715 ms in one log drain while a mount was in flight. Do not read timing from a"
+              " level-2 run and call it the driver's. ==="));
     ehci_os_log("=== EHCIUIM h21: the CTL/BULK split is REVERTED - it caused the hub-connect freeze. ★ ACTIVATOR UNCHANGED - n4g still pairs. ★★ h20 WAS THE DISCRIMINATOR AND IT ANSWERED CLEANLY, in the direction I did not expect: h20 was h19's split STRUCTURE with h15's SERIALISED timing, and it FROZE ON THE HUB CONNECT exactly like h19. So removing the concurrency did not help, and the concurrency was never the trigger - the split's PLUMBING is. The chain: h17 (h15 + diagnostics + un-park + an inert promotion) connects the leg FINE; h19 (same, plus the split, concurrent) FROZE; h20 (same, plus the split, serialised) FROZE. The only meaningful delta from h17 to h20 is the split plumbing, because the promotion was measured inert (gCtlPromoted 0). ★★ SO THE SPLIT IS OUT. This build is h15's engine plus exactly two things that earned their place: the h16 DIAGNOSTICS, which change no USB behaviour and paid for themselves immediately (the gated gEnumDeferBusy and a token-bucket log cap that stops a driver loop from wedging the File Manager), and h17's UN-PARK fix, which moves n24's un-park above the 'apple_hidden_port && !port_ceded' gate - port_ceded() reports a PARKED port as ceded, so that un-park had been DEAD CODE since the day it was written and a parked port could never come back. ★★ WHAT IS NOW KNOWN AND SHOULD NOT BE RE-DERIVED: the hot-plug-during-a-copy failure is REAL and its cause is understood - down_reap calls bio_advance BEFORE down_pump, and bio_advance re-arms the next chunk itself, so during a multi-chunk copy gDpBusy is always 1 by the time down_pump runs and a queued control request is never issued at all. That diagnosis is in docs/CTL-BULK-SPLIT.md and it still stands. What does NOT work is fixing it by splitting the in-flight state: four attempts, two of which regressed a working driver into a freeze. The user has scoped hot-plug-during-a-copy as a narrow nice-to-have, so it is parked deliberately, not forgotten. ★ THE VALIDATED FOUR-DRIVE BUILD IS h15 and it remains the shipping artifact until this one is validated in its own right. ★ WATCH: connect the leg with a drive already mounted - the sequence that froze h18, h19 and h20 - then the full four-drive sequence. A drive plugged in DURING a copy is still expected to fail. ===");
     ehci_os_log("=== (h20, the discriminator that ruled the split OUT) ===");
     ehci_os_log("=== (h19) THE CTL/BULK SPLIT - control tran - h19's structure with h15's timing. ★ ACTIVATOR UNCHANGED - n4g still pairs. ★★ THIS BUILD IS AN EXPERIMENT AND ITS ONLY JOB IS TO ANSWER ONE QUESTION. h19's CTL/BULK split DID work at what it was for - gCiIssued climbed 16 to 96 with zero control timeouts or errors, so control transfers really do issue and complete on their own slot - and it ALSO froze the machine on connecting the hub, which h15 does not. h18 froze exactly the same way from a completely different arbitration change, and h17 (which carries the un-park hoist and nothing else) connects the hub fine. So the freeze tracks WHEN control and bulk get issued relative to each other; it is not the un-park, and not obviously the plumbing. ★★ TWO CANDIDATES REMAIN AND THEY NEED OPPOSITE RESPONSES, so guessing is worth nothing: (a) the split's PLUMBING is unsound - separate slots, separate bounce, ctl_reap - in which case revert to h15 entirely; or (b) the CONCURRENCY is the trigger, the hub claim being unable to tolerate control and bulk overlapping while a drive is mounted and doing I/O, in which case the plumbing is worth keeping and simply stays serialised. ★★ h20 = CTL_BULK_CONCURRENT 0. Every structural change from h19 is still here (the control slot, its own DMA bounce at 0xF90, its own watchdog, and ctl_reap deliberately not driving bio_advance) but down_pump now issues NOTHING while any transfer is in flight, which is h15's rule expressed over two slots instead of one. Concurrency is the single isolated variable. ★★ READ THE RESULT LIKE THIS: if the hub connects and four drives work, the answer is (b) - the plumbing is sound and worth keeping on its own merits, because it also fixes control completions driving the BOT state machine and the one-watchdog-for-two-classes blind spot that made an orphaned transfer invisible. Hot-plug-during-a-copy then needs concurrency, which is a separate and much narrower problem and the user has called it a nice-to-have. If it still freezes, the answer is (a) - the plumbing is at fault, revert to h15 and stop. ★ WATCH: connect the leg with a drive already mounted (the exact h18/h19 freeze), then the full four-drive sequence. gCiIssued should still climb (control still flows, just never concurrently), gCiTimeouts and gCtlTooBig must be 0. A drive plugged in DURING a copy is EXPECTED TO FAIL in this build - that is not the question being asked. ===");
@@ -159,6 +510,30 @@ static OSStatus uimInitialize(UInt32 a0, UInt32 a1, UInt32 a2, UInt32 a3,
          * desktop the user hit, which a cold boot cures. ehci_os_boot_quiesce() was meant to cover this but
          * lives on the kInitialize path, which n0 proved is never called. */
         { extern void ehci_vhub_install_shutdown_hook(void); ehci_vhub_install_shutdown_hook(); }
+        /* ★ h24: publish the 'Eusb' service HERE, while we are still at task level (LoadUIMForEntry), so an
+         * external pump can find tickFn before anything has mounted. Until h24 the selector appeared only
+         * after a probe succeeded, which made the n4h USL-pump experiment unable to tick at all — see the
+         * long note on ehci_vhub_publish_service_early(). Publishing is inert before a mount. */
+        { extern void ehci_vhub_publish_service_early(void); ehci_vhub_publish_service_early(); }
+        /* ★★★ h87: make the parcel-claimed unit-table entry dispatchable (the ASP Devices-and-Volumes
+         * crash — see the long note at ehci_os_fix_native_dce). HERE because this is proven task level
+         * (we are logging), the unit table exists, and it must run before any user can reach ASP. */
+        ehci_os_fix_native_dce();
+        /* ★ h31: our HCReset above cleared CONFIGFLAG and handed every port to the companions for the
+         * bring-up window; on this chip an active companion connection then survives hc_start's
+         * CONFIGFLAG=1. Evict such ports now, while nothing can be mounted yet. */
+        { extern void ehci_vhub_bringup_owner_sweep(void); ehci_vhub_bringup_owner_sweep(); }
+        /* ★ h43: and one dump at BRING-UP, the earliest task-level moment we exist. Together with the
+         * defer-window dumps this brackets the prompt: bring-up (before any exposure of ours), every ~2 s
+         * through the defer, then before/after/+15 s around the install. If a foreign entry for this medium
+         * ever exists, one of those frames must contain it. */
+        { extern void ehci_vhub_queue_dump_public(const char *when);
+          ehci_vhub_queue_dump_public("=== h43 QUEUES **AT BRING-UP** (earliest we can look; nothing of ours "
+                                      "is exposed yet) ==="); }
+        /* ★★★★★ h26 APP-LESS: build the NMUPP for the task-level pump. Here because NewNMUPP allocates, and
+         * this is the one place we are guaranteed task level (LoadUIMForEntry). After this, a parked
+         * task-level job reaches task level with no application of ours running. */
+        { extern void ehci_vhub_appless_init(void); ehci_vhub_appless_init(); }
     } else {
         ehci_os_logx("  ehci_os_init FAILED e=", (unsigned long)e);
     }
@@ -247,7 +622,13 @@ static void ctrl_trace(UInt32 devAddr, UInt32 pid, UInt32 len, volatile UInt8 *b
 /* Generic no-op slot. The USL passes args in r3..r10; a stub ignores them and succeeds — but now
  * RECORDS the call (slot + all 8 args) so uim23 can surface it. (CreateControl/Bulk/Interrupt/Isoch
  * endpoint, abort/delete/clear-stall, power, reserved — the virtual hub routes control by device
- * address, so it needs no endpoint bookkeeping; bulk/isoch are later milestones.) */
+ * address, so it needs no endpoint bookkeeping; bulk/isoch are later milestones.)
+ * ★★★★ h94: slots 18/19 (AbortPipe/DeletePipe) have NEVER been called on this hardware — zero captures
+ * in every banked log, including the whole rude-removal era. This G4's USL frees its pipe/transfer
+ * structures on removal WITHOUT telling the UIM, which is why stubbing them was never the bug and
+ * implementing them would fix nothing: the removal safety lives in ehci_vhub.c's usl_retire_device
+ * (the disconnect funnel + issue refusal + reap orphan gate). If a slot 18/19 call EVER shows up in
+ * slot_trace, capture its args — that is the day these two earn real bodies. */
 #define STUB(n) static OSStatus uim##n(UInt32 a,UInt32 b,UInt32 c,UInt32 d,UInt32 e,UInt32 f,UInt32 g,UInt32 h) \
                 { slot_trace((n), a, b, c, d, e, f, g, h); return noErr; }
 STUB(2) STUB(10) STUB(14) STUB(15) STUB(18) STUB(19) STUB(20) STUB(25) STUB(26) STUB(27) STUB(28)

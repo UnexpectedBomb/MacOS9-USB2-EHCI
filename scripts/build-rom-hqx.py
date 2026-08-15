@@ -12,9 +12,8 @@ The <version-tag> names the OUTPUT FILE only. It is deliberately NOT written int
 resource fork of its own, which DISCARDS the ROM's real 616 KB resource fork and with it the 185 KB
 SysEnabler. Every USB 2.0 ROM shipped before 2026-08-07 lost SysEnabler that way, on both machines.
 `tbxi build -o X.hqx` preserves the fork. As a bonus .hqx is plain ASCII, so it carries no forks or
-xattrs of its own and cannot spawn an AppleDouble "._" sidecar when it crosses a file server that
-cannot store forks natively. Feeding such a sidecar to StuffIt Expander by mistake bus-errors an
-OS 9 machine into MacsBug, because from that side it looks like a real file of the same name.
+xattrs of its own and cannot spawn an AppleDouble "._" sidecar on a network share -- one of those was
+fed to StuffIt Expander and bus-errored the machine into MacsBug.
 
 ⚠⚠⚠ THIS SCRIPT NO LONGER STAMPS A VERSION, AND MUST NOT BE MADE TO AGAIN.
 
@@ -49,9 +48,15 @@ REPO = path.dirname(HERE)
 
 
 def main():
-    if len(sys.argv) != 4:
+    args = list(sys.argv[1:])
+    # ★ b15b: --lzss passes through to the injector — the B&W recipe compresses the driver parcel
+    # (src=...pef.lzss in the Parcelfile); Mini/MDD ship it raw. See usb_rom_inject.py for history.
+    lzss = '--lzss' in args
+    if lzss:
+        args.remove('--lzss')
+    if len(args) != 3:
         raise SystemExit(__doc__)
-    base, tag, out = sys.argv[1], sys.argv[2], sys.argv[3]
+    base, tag, out = args
     if not out.lower().endswith('.hqx'):
         raise SystemExit('output must end in .hqx (that is the fork-safe format)')
 
@@ -60,7 +65,7 @@ def main():
     try:
         print('1. injecting the driver into a dump directory ...')
         r = subprocess.run([sys.executable, path.join(REPO, 'rom', 'usb_rom_inject.py'),
-                            base, '-o', dump + '/'])
+                            base, '-o', dump + '/'] + (['--lzss'] if lzss else []))
         if r.returncode != 0:
             raise SystemExit('injection FAILED -- not building a ROM from it')
 
@@ -69,6 +74,17 @@ def main():
             raise SystemExit('no SysEnabler.rdump in the dump: this base has no resource fork, so a '
                              'built ROM would lose SysEnabler. Use a fork-ful base '
                              '(scripts/rehydrate-rom-fork.py).')
+        # ★★ b1 (2026-08-13): remember what the BASE's fork looked like, because the verify step below now
+        # compares OUTPUT against BASE rather than testing absolutes. A generic RETAIL ROM (the B&W's 8.7,
+        # 'Mac OS 9.2.2') legitimately has NO enabler and DOES ship its own vers (1) = "Mac OS ROM 8.7" that
+        # the machine boots with — both of the old absolute checks are false positives on such a base. See
+        # docs/BW-ROM-INTAKE.md, "TWO GUARDS BLOCK THE BUILD". Nothing here stamps anything, ever.
+        base_rdump = open(rdump, encoding='mac-roman').read()
+        base_se    = path.getsize(path.join(dump, 'SysEnabler'))
+        if base_se == 0 and len(base_rdump.strip()) < 200:
+            raise SystemExit('SysEnabler is empty AND the resource fork is trivial — this base lost its '
+                             'fork (a fork-ful retail base still dumps ~3.5 KB of its own resources). '
+                             'Rehydrate a proper copy; do NOT build from this.')
 
         # ⚠⚠⚠ STAMPING IS DELIBERATELY GONE. It broke boot. See the banner at the top of this file.
         print('2. NOT stamping a vers resource (see the note at the top of this script) ...')
@@ -87,19 +103,27 @@ def main():
         if r.returncode != 0:
             raise SystemExit('the built .hqx could not be dumped back -- do NOT ship it')
         se = path.getsize(path.join(chk, 'SysEnabler'))
-        if se == 0:
-            raise SystemExit('SysEnabler is 0 bytes in the output -- the fork was lost, do NOT ship it')
+        # ★★ Guard 1, STRICTLY STRONGER (b1): "SysEnabler non-empty" was written to catch a LOST FORK, but a
+        # retail base has no enabler at all. The real invariant is "the output's enabler matches the base's",
+        # which catches fork loss on enabler-ful bases AND passes honest enabler-less retail bases — and
+        # unlike the old test it also catches a fork-loss that leaves a stub.
+        if se != base_se:
+            raise SystemExit('SysEnabler CHANGED: base %d bytes -> output %d. The fork was damaged in the '
+                             'build. Do NOT ship this ROM.' % (base_se, se))
         vers = open(path.join(chk, 'SysEnabler.rdump'), encoding='mac-roman').read()
-        # ★ The check is now INVERTED: a vers (1) here is a BOOT FAILURE, not a feature.
-        if re.search(r"data 'vers' \(1[^)]*\) \{", vers):
-            raise SystemExit('the output carries a vers (1) in the ROM resource fork. That fork is the '
-                             'System Enabler\'s, and a vers (1) there describes the ENABLER, not our build. '
-                             'It stops the machine booting. Do NOT ship this ROM.')
+        # ★★ Guard 2, STRICTLY STRONGER (b1): the h23 failure was a vers (1) WE ADDED to an enabler's fork.
+        # The retail 8.7 base ships its OWN vers (1) ("Mac OS ROM 8.7") and boots with it, so "no vers (1)
+        # anywhere" is the wrong test. The right one: the fork must be BYTE-IDENTICAL to the base's — we add
+        # nothing, ever, to any fork. That refuses a stamp into ANY resource, not just vers (1).
+        if vers != base_rdump:
+            raise SystemExit('the ROM resource fork CHANGED between base and output. This tool must never '
+                             'modify that fork (h23: a stamped vers (1) mis-versioned the System Enabler '
+                             'and stopped the machine booting). Do NOT ship this ROM.')
         keep2 = "data 'vers' (2" in vers
-        print('  SysEnabler        %d bytes  OK' % se)
+        print('  SysEnabler        %d bytes  (matches the base%s)' % (se, ', enabler-less retail base' if se == 0 else ''))
         print('  Bootscript        %d bytes' % path.getsize(path.join(chk, 'Bootscript')))
-        print('  vers (1)          absent  <- REQUIRED; a vers (1) here breaks boot')
-        print('  vers (2) intact   %s  (the ROM\'s own CPU Software string)' % ('yes' if keep2 else 'NO'))
+        print('  resource fork     byte-identical to the base  <- REQUIRED; we add NOTHING to that fork')
+        print('  vers (2) intact   %s' % ('yes' if keep2 else 'n/a on this base'))
         print('\ndone: %s' % out)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

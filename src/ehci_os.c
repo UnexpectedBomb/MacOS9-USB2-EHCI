@@ -16,6 +16,7 @@
 #include <MacMemory.h>
 #include <Devices.h>
 #include <Files.h>
+#include <MixedMode.h>   /* h87: NewRoutineDescriptor for the DCE dispatch UPP */
 #include "ehci.h"
 #include "ehci_vhub.h"   /* Path A: DoDriverIO kOpen drives the vhub bring-up (xfer_init + start_service) */
 
@@ -25,7 +26,55 @@
  * lands next to the app; open EHCIUIM_init.log in SimpleText after a reboot. */
 static short gDbgRef = 0;
 static short gDbgVol = 0;   /* r49: the log's OWN volume (boot), captured at create */
-void ehci_os_log(const char *s)
+
+/* ★★★★★★★ h85 — THE DISCRIMINATOR. COMPILE THE FILE MANAGER LOGGING OUT.
+ *
+ * MEASURED, twice, on 2026-08-13 (validated/logs/MINI-m33-h84-*): through pump 9 every completed pump
+ * body was <= 274 ms and gBodySlowN was 0. Then slot 1's AddDrive landed, the Finder began mounting, and
+ * the VERY NEXT log drain took **30715 ms** — 30.7 seconds holding the Finder's own thread. The 09:12 run
+ * measured the same section at 31064 ms. 160 lines x ~190 ms per FSWrite + PBFlushFileSync + FlushVol on
+ * a boot volume that the mount is already hammering. The arithmetic closes to within 2%.
+ *
+ * ⇒ THE INSTRUMENT IS THE DOMINANT LOAD, and it is dominant exactly when a mount is in flight.
+ *
+ * ⚠ WHY A SWITCH AND NOT A TUNED FLUSH POLICY. h78 cut the DoDriverIO drain from 384 lines to 6 AND stood
+ * it down for 30 s, then passed three runs and failed on the fourth. NARROWING A WINDOW LOOKS EXACTLY LIKE
+ * A FIX UNTIL IT DOESN'T, and "flush every N lines" is that same move a third time. A switch is a
+ * DISCRIMINATOR: at level 0 the code is not there, so the answer cannot be a coincidence of timing.
+ *   level 0 solid over several boots -> the instrument was the disease, AND THIS IS THE SHIPPING BUILD
+ *   level 0 still wedges            -> logging was never the cause, the biggest confound is eliminated,
+ *                                      and the screen paint still says where
+ *
+ * ★ WHAT SURVIVES AT LEVEL 0: every counter, and the whole screen watchdog — it reads counters and writes
+ * the framebuffer and touches no File Manager at all. A failing run still yields rows 1-5. Also the
+ * BANNER, forced through, so the run-validation rule ("expected banner, or the run is void") still holds.
+ * ⚠ The INIT's own three logs (Boot / NM / INIT, ~56 lines total, separate files, separate code) are
+ * DELIBERATELY UNTOUCHED: they are the only proof the resident vehicle worked, they run once, and they run
+ * before any mount is in flight. If extension loading is still slow at level 0, they are the next suspect —
+ * changing them here would put two variables in one run. */
+#ifndef EHCI_LOG_LEVEL
+#define EHCI_LOG_LEVEL 0
+#endif
+int ehci_os_log_level(void) { return EHCI_LOG_LEVEL; }
+/* Level 1 keeps the "!!" lines — every error, guard trip and MUST-BE-ZERO line in this driver is written
+ * with that prefix, and logx preserves it into the formatted buffer, so one test covers both writers. */
+static int log_wanted(const char *s)
+{
+#if EHCI_LOG_LEVEL >= 2
+    (void)s; return 1;
+#elif EHCI_LOG_LEVEL == 1
+    return (s && s[0] == '!' && s[1] == '!');
+#else
+    (void)s; return 0;
+#endif
+}
+static void log_write_raw(const char *s);
+
+void ehci_os_log(const char *s)          { if (log_wanted(s)) log_write_raw(s); }
+/* The banner, and only the banner: run validation must survive every level. */
+void ehci_os_log_always(const char *s)   { log_write_raw(s); }
+
+static void log_write_raw(const char *s)
 {
     FSSpec sp; long n = 0, z = 1; static int tried = 0;
     if (!tried) { tried = 1;
@@ -53,6 +102,9 @@ void ehci_os_log(const char *s)
 void ehci_os_logx(const char *label, unsigned long v)
 {
     char buf[80]; int i = 0, j; static const char hx[] = "0123456789abcdef";
+    /* h85: test the LABEL, not the formatted buffer — same verdict (logx copies the prefix through) and it
+     * skips the formatting too. At level 0 this whole function is a compare and a return. */
+    if (!log_wanted(label)) return;
     while (label[i] && i < 60) { buf[i] = label[i]; i++; }
     buf[i++] = ' '; buf[i++] = '0'; buf[i++] = 'x';
     for (j = 28; j >= 0; j -= 4) buf[i++] = hx[(v >> j) & 0xF];
@@ -76,7 +128,27 @@ void ehci_os_logx(const char *label, unsigned long v)
  * pumping, and the block driver's DoDriverIO (File Manager calls, definitely task level) once a volume is
  * mounted. Enumeration lines may therefore appear LATE, in a burst. Overflow is counted, never silent. */
 #define ILOG_N 384
-typedef struct { const char *msg; UInt32 val; UInt8 kind; } ILogRec;   /* kind 1 = msg, 2 = msg + value */
+/* kind 1 = msg, 2 = msg + value, 3 = CRITICAL msg, 4 = CRITICAL msg + value.
+ * ★★★★★★ THE CRITICAL CLASS (2026-08-11) — SEE docs/ENGINE-STATE-MACHINE.md §0.
+ *
+ * ⚠ THE m24 RUN IS WHY THIS EXISTS, and the cost was a wrong conclusion I very nearly built a ROM on.
+ * The rate cap dropped **458 ring lines** in one window, and the ring is where the ENTIRE probe narrative
+ * lives — SELFENUM COMPLETE, READ CAPACITY, the geometry record, SELFPROBE COMPLETE. The exposure narrative
+ * uses ehci_os_log (direct, task level, UNCAPPED), so what reached the file was an exposure with no probe in
+ * front of it, and I read that as a device exposed without being probed. It was not: the probe completed and
+ * its lines were thrown away. Three independent facts said so and none of them was a log line.
+ * ⇒ A cap that can drop the lines a diagnosis RESTS ON is not protecting the machine, it is manufacturing
+ * false findings — I10, for the fifth time in this project.
+ *
+ * ★ THE CRITICAL SET IS DELIBERATELY TINY: probe complete, geometry, the exposure latch, and the state
+ * transitions that prove a device really was verified. A handful of lines per device per attach — bounded by
+ * the number of devices, not by any loop. That is what makes exempting them safe: the h14 livelock this cap
+ * was built for emits ORDINARY lines at heartbeat rate, and those are still capped exactly as before.
+ * ⚠ The ring's own 384-entry bound and its overflow counter still apply to critical lines. They are exempt
+ * from the RATE cap, not from the ring. Nothing here is unbounded.
+ * ⚠ DO NOT promote a line into this class to make a hunt easier. The set is small on purpose; a critical
+ * class that grows to cover the log is just the cap removed, with extra steps. */
+typedef struct { const char *msg; UInt32 val; UInt8 kind; } ILogRec;
 static volatile ILogRec gILog[ILOG_N];
 static volatile UInt32  gILogHead = 0, gILogTail = 0, gILogDropped = 0;
 /* ★★★★ h16: line-rate cap as a TOKEN BUCKET rather than a fixed per-second window.
@@ -113,10 +185,76 @@ void ehci_os_ilogx(const char *label, unsigned long v)
     __asm__ __volatile__("eieio");
     gILogHead = i + 1;
 }
-/* TASK LEVEL ONLY — this is the one place the ring touches the File Manager. */
+/* CRITICAL variants — exempt from the RATE cap (never from the ring bound). See the note at ILogRec. */
+void ehci_os_ilogc(const char *s)
+{
+    UInt32 i = gILogHead;
+    if (i - gILogTail >= ILOG_N) { gILogDropped++; return; }
+    gILog[i % ILOG_N].msg = s; gILog[i % ILOG_N].val = 0; gILog[i % ILOG_N].kind = 3;
+    __asm__ __volatile__("eieio");
+    gILogHead = i + 1;
+}
+void ehci_os_ilogcx(const char *label, unsigned long v)
+{
+    UInt32 i = gILogHead;
+    if (i - gILogTail >= ILOG_N) { gILogDropped++; return; }
+    gILog[i % ILOG_N].msg = label; gILog[i % ILOG_N].val = (UInt32)v; gILog[i % ILOG_N].kind = 4;
+    __asm__ __volatile__("eieio");
+    gILogHead = i + 1;
+}
+/* ★★★★★★★ h78 — TWO DRAIN BUDGETS, BECAUSE THIS FUNCTION IS CALLED FROM TWO VERY DIFFERENT PLACES.
+ *
+ * ⚠ THE m27 HUB HANG. The screen watchdog measured it: driver alive (gVhubTick climbing), task level
+ * DEAD (gTaskPumpN frozen at 18), and OUR DRIVER COMPLETELY IDLE — gBioPhase 0, bio ring empty, both
+ * in-flight slots free, every error counter 0. We had satisfied every request and gone quiet, and the
+ * machine was still wedged. So the fault is not a stuck transfer; it is something we are DOING TO the
+ * File Manager.
+ * ★ AND THIS IS IT. usb_disk.c's DoDriverIO calls this drain — and DoDriverIO is called BY THE FILE
+ * MANAGER. kRead/kWrite are excluded deliberately, but kOpen / kClose / kStatus / kControl are NOT, and
+ * those are exactly what the File Manager issues while MOUNTING a volume. With a budget of ILOG_N that
+ * is up to 384 synchronous FSWrite + FlushVol ON THE BOOT VOLUME, issued from inside a File Manager
+ * call chain operating on a DIFFERENT volume.
+ * ★★ AND THE HUB IS WHAT LOADS THE GUN: the second drive enumerates concurrently and stuffs the ring at
+ * interrupt rate, so by the time the mount calls kStatus the ring is FULL. One drive leaves it nearly
+ * empty, the drain is cheap, and the mount succeeds — which is precisely the topology dependence and
+ * the intermittency we have been chasing since m22, in one mechanism.
+ *
+ * ⇒ THE SPLIT IS BY CALLER, NOT BY A NEW ARGUMENT: `drainFn` lives in gSvc and the n4g activator holds
+ * the same pointer, so the SIGNATURE CANNOT CHANGE without breaking that ABI.
+ *   · ehci_os_ilog_drain()      — the exported one, what DoDriverIO calls. TINY budget. Enough to keep
+ *                                 lines moving after the activator quits (n9's whole purpose) without
+ *                                 ever becoming a burst inside someone else's File Manager call.
+ *   · ehci_os_ilog_drain_bulk() — internal, generous budget, called ONLY from selfprobe_tick, which runs
+ *                                 in the NM response and is NOT inside a File Manager call chain.
+ * The bulk of the draining therefore happens in the safe context and the dangerous one is capped. */
+#define ILOG_DRAIN_DODRIVERIO   6u     /* inside a File Manager call — must never be a burst */
+#define ILOG_DRAIN_BULK       160u     /* the NM-response path, where a burst is safe */
+/* h78 fix 2: a mount is in flight — do not drain from DoDriverIO AT ALL until this deadline passes.
+ * Wall-clock and self-clearing, checked against lowmem Ticks, so it needs no task-level help to expire:
+ * if task level is dead the inhibit must lift on its own or we would lose the drain for ever. */
+static volatile UInt32 gDrainInhibitUntil = 0;
+void ehci_os_ilog_inhibit_drain(unsigned long ticks)
+{
+    gDrainInhibitUntil = *(volatile UInt32 *)0x016AUL + (UInt32)ticks;
+}
+static void ilog_drain_budgeted(UInt32 budget);
+
+/* TASK LEVEL ONLY — this is the one place the ring touches the File Manager.
+ * ⚠ This is the EXPORTED entry, i.e. the one usb_disk.c's DoDriverIO calls from inside a File Manager
+ * call chain. It is deliberately tiny, and it stands down entirely while a mount is in flight. */
 void ehci_os_ilog_drain(void)
 {
-    UInt32 d, budget = ILOG_N;
+    if ((long)(*(volatile UInt32 *)0x016AUL - gDrainInhibitUntil) < 0) return;   /* mount in flight */
+    ilog_drain_budgeted(ILOG_DRAIN_DODRIVERIO);
+}
+/* The safe-context drain: selfprobe_tick only, from the NM response. */
+void ehci_os_ilog_drain_bulk(void)
+{
+    ilog_drain_budgeted(ILOG_DRAIN_BULK);
+}
+static void ilog_drain_budgeted(UInt32 budget)
+{
+    UInt32 d;
     /* ⚠ BOUNDED, and it must stay bounded. The producer runs at INTERRUPT level and can refill the ring
      * while we are draining — each line here is a File Manager write, so the drain is orders of magnitude
      * slower than the producer. An unbounded `while (tail != head)` can therefore livelock at TASK level,
@@ -152,9 +290,17 @@ void ehci_os_ilog_drain(void)
             const char *m = r->msg; UInt32 v = r->val; UInt8 k = r->kind;
             gILogTail++;                                       /* consume BEFORE writing: a File-Mgr stall must
                                                                 * not make us re-emit the same line */
-            if (!gILogTokens) { gILogThrottled++; continue; }   /* h15: drop, never stall */
-            gILogTokens--;
-            if (k == 2) ehci_os_logx(m, v); else if (k == 1) ehci_os_log(m);
+            /* CRITICAL (kind 3/4) bypasses the token check entirely: these are the lines a diagnosis rests
+             * on, and dropping them is what made the m24 log say the opposite of what happened. They still
+             * SPEND a token when one is available, so a burst of them shortens the ordinary budget rather
+             * than being free. */
+            if (k < 3) {
+                if (!gILogTokens) { gILogThrottled++; continue; }   /* h15: drop, never stall */
+                gILogTokens--;
+            } else if (gILogTokens) {
+                gILogTokens--;
+            }
+            if (k == 2 || k == 4) ehci_os_logx(m, v); else ehci_os_log(m);
         }
     }
     d = gILogDropped;
@@ -458,6 +604,36 @@ int gBroughtUp = 0;   /* Path A: guards the one-time EHCI bring-up. SHARED (non-
 #define N0_N 32
 static volatile UInt32 gN0Code[N0_N], gN0Tick[N0_N];
 static volatile UInt32 gN0Count = 0;
+volatile UInt32 gN0Kind[3] = {0, 0, 0};   /* h92: DoDriverIO calls by kind — imm / sync / async+other */
+/* ★ h93: a rolling history of Device-Manager calls into this driver, and the completion verdicts.
+ * One entry per call: code, kind, cmdID, and IOCommandIsComplete's return when the queued path ran.
+ * Dumped by ehci_os_h93_dump() from the periodic dump (task level). Ring semantics: first H93_N calls
+ * are kept verbatim — the burst we are hunting was 72 calls, so 32 covers its head, and the counters
+ * carry the totals. */
+#define H93_N 32
+volatile UInt32 gH93Code[H93_N], gH93Kind[H93_N], gH93Cmd[H93_N], gH93CC[H93_N];
+volatile UInt32 gH93Count = 0;            /* total calls recorded (index clamps at H93_N) */
+volatile UInt32 gH93CcBad = 0;            /* nonzero IOCommandIsComplete returns — MUST be 0 */
+void h93_record(UInt32 code, UInt32 kind, UInt32 cmd, int completed, UInt32 cc)
+{
+    UInt32 i = gH93Count++;
+    if (completed && cc != 0) gH93CcBad++;
+    if (i < H93_N) { gH93Code[i] = code; gH93Kind[i] = kind; gH93Cmd[i] = cmd;
+                     gH93CC[i] = completed ? (cc | 0x80000000UL) : 0x7FFFFFFFUL; }
+}
+void ehci_os_h93_dump(void)               /* task level; prints NEW entries since the last call */
+{
+    static UInt32 shown = 0;
+    UInt32 n = (gH93Count < H93_N) ? gH93Count : H93_N;
+    for (; shown < n; shown++) {
+        ehci_os_logx("!! h93 DM call: code<<24|kind<<16|loword(cmdID)",
+                     ((gH93Code[shown] & 0xFFUL) << 24) | ((gH93Kind[shown] & 0xFFUL) << 16)
+                     | (gH93Cmd[shown] & 0xFFFFUL));
+        ehci_os_logx("!!   h93 cmdID full / completion verdict next", gH93Cmd[shown]);
+        ehci_os_logx("!!   h93 IOCommandIsComplete returned (0x7FFFFFFF = immediate, not called)",
+                     gH93CC[shown]);
+    }
+}
 static void n0_record(UInt32 code)
 {
     UInt32 i = gN0Count++;
@@ -482,12 +658,31 @@ void ehci_os_n0_dump(void)   /* called from uimInitialize — task level, loggin
 OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
                  IOCommandContents contents, IOCommandCode code, IOCommandKind kind)
 {
-    (void)spaceID; (void)cmdID; (void)kind; (void)contents;
+    /* ★★★★ h91 — THE NATIVE COMPLETION CONTRACT, the m40 infinite wristwatch.
+     * h90's descriptor works: ASP's open now dispatches HERE and nothing crashes. But a native driver's
+     * return value completes only IMMEDIATE commands; synchronous/asynchronous ones are QUEUED by the
+     * Device Manager and finish ONLY when the driver calls IOCommandIsComplete(cmdID, result). This
+     * function ignored `kind` and returned — so ASP's synchronous Status PB kept ioResult = 1 forever and
+     * ASP spun on a wait that can never end. The idiom below is usb_disk.c:700's, byte for byte — the
+     * hardware-proven completion tail every mount already runs through daily. Restructured to a single
+     * exit so no path can complete twice or not at all. n0 proves the Device Manager never delivered a
+     * command here before h90, so this restructuring cannot change any previously-working path. */
+    OSErr h91err;
+    /* h92: count calls by KIND. h91's completion tail is the one genuinely NEW Device-Manager code path
+     * of the h9x era (IOCommandIsComplete on queued commands), and if some dispatcher ever hands us a
+     * kind that mismatches how the command was really issued, IOCommandIsComplete on a non-command is a
+     * plausible system-heap corrupter. These three counters + the code trace make that theory checkable
+     * from a log instead of arguable. Memory-only here (never log in DoDriverIO). */
+    extern volatile UInt32 gN0Kind[3];
+    if (kind & 0x00000004UL) gN0Kind[0]++;         /* immediate  */
+    else if (kind & 0x00000001UL) gN0Kind[1]++;    /* synchronous */
+    else gN0Kind[2]++;                             /* asynchronous / other */
+    (void)spaceID; (void)contents;
     n0_record((UInt32)code);   /* n0: memory-only record; see the comment above (never log here) */
     switch (code) {
     case kInitializeCommand:
     case kReplaceCommand:
-        /* Path A BOOT-SAFETY (eSATA v63/v64 lesson): when the ROM parcel makes the
+        /* Path A BOOT-SAFETY (a v63/v64 hardware lesson from an earlier PCI disk ndrv): when the ROM parcel makes the
          * Device Manager load us at boot, kInitialize runs during the early PCI-claim
          * phase, where full EHCI bring-up (HCReset/DMA/IRQ) FREEZES. So do NOTHING
          * here except acknowledge the claim — the real bring-up is deferred to kOpen,
@@ -497,37 +692,174 @@ OSErr DoDriverIO(AddressSpaceID spaceID, IOCommandID cmdID,
          * still brings up inline as before; only the Device-Manager path defers. */
         /* NB: NO logging here. ehci_os_log() uses the File Manager, which may not be
          * up during the early PCI-claim phase — a log call here could itself hang the
-         * boot. Pure return, exactly like eSATA's stash-only kInit (sil_os_init_stash).
+         * boot. Pure return, exactly like the stash-only kInit an earlier PCI disk ndrv proved on hardware.
          * kOpen (post-boot, File Manager up) logs the bring-up. */
         /* Lifecycle fix: DO tame a controller left HOT by a previous session (warm reboot), so its
          * unserviced interrupts + stale DMA can't storm this boot (the "unhealthy boot"). This is a
          * handful of guarded MMIO ops only — NOT the bring-up that must stay out of early boot. */
         ehci_os_boot_quiesce();
-        return noErr;
+        h91err = noErr; break;
     case kFinalizeCommand:
     case kSupersededCommand:
         dbg("EHCIUIM: DoDriverIO Finalize — stop service + release ports");
         ehci_vhub_stop_service();         /* stop the heartbeat timer/ISR/interrupts/schedules BEFORE we go */
         ehci_hc_release_ports(&gSoftc);   /* hand the ports back so 1.1 works after we're gone */
         gBroughtUp = 0;
-        return noErr;
+        h91err = noErr; break;
     case kOpenCommand:
         /* Full EHCI bring-up now, post-boot. Idempotent (guarded), so repeated opens
          * are safe. Self-finds the node (proven app path == uimInitialize's ...,0). */
+        h91err = noErr;
         if (!gBroughtUp) {
             long e;
             dbg("EHCIUIM: DoDriverIO Open — bringing up EHCI");
             e = ehci_os_init(&gSoftc, (EHCIRegEntryIDPtr)0);
-            if (e != 0) { ehci_os_logx("EHCIUIM: DoDriverIO Open bring-up FAILED e=", (unsigned long)e); return (OSErr)e; }
+            if (e != 0) { ehci_os_logx("EHCIUIM: DoDriverIO Open bring-up FAILED e=", (unsigned long)e); h91err = (OSErr)e; break; }
             (void)ehci_vhub_xfer_init();          /* DMA page + downstream QHs */
             ehci_vhub_start_service(&gSoftc.node); /* install EHCI ISR + periodic timer */
             gBroughtUp = 1;
             dbg("EHCIUIM: DoDriverIO Open — bring-up complete");
         }
-        return noErr;
+        break;
     case kCloseCommand:
-        return noErr;
+        h91err = noErr; break;
+    /* ★★★★ h87 — UNHANDLED COMMANDS MUST REFUSE, NOT "SUCCEED". The old `default: return noErr` was the
+     * h30 disease at the Device Manager layer: report success and leave the caller's buffer untouched.
+     * Unreachable while the DCE dispatch vector was garbage; h87 fixes that vector, so ASP's very next
+     * call after kOpen is a DriverGestalt('vers') kStatus — and a noErr here would hand it stack garbage
+     * to parse as a version. Honest errors instead, exactly what Apple's drivers return for csCodes they
+     * do not implement; ASP renders that as "Not available" and moves on. */
+    case kReadCommand:    h91err = -19; break;   /* readErr   */
+    case kWriteCommand:   h91err = -20; break;   /* writErr   */
+    case kControlCommand: h91err = -17; break;   /* controlErr */
+    case kStatusCommand:  h91err = -18; break;   /* statusErr  */
+    case kKillIOCommand:  h91err = noErr; break; /* nothing queued — killing nothing succeeds */
     default:
-        return noErr;
+        h91err = -50; break;            /* paramErr */
     }
+    /* h91: the single completion tail — usb_disk.c:700's proven idiom, byte for byte. */
+    if (kind & 0x00000004UL) {
+        h93_record((UInt32)code, (UInt32)kind, (UInt32)cmdID, 0, 0);
+        return h91err;                                      /* kImmediateIOCommandKind: return completes */
+    }
+    {   /* ★★★★ h93 — CAPTURE WHAT THE COMPLETION PATH ACTUALLY DOES. The 2-for-2 correlation (sessions
+         * with Device-Manager traffic through this USL-made, h90-repaired entry corrupt the system heap;
+         * sessions without it stay clean) makes THIS tail the prime suspect, and the return value of
+         * IOCommandIsComplete — which the h91 code THREW AWAY — is the Device Manager's own verdict on
+         * whether the cmdID it was handed names a real queued command. Record every call's code, kind,
+         * cmdID and that verdict; count nonzero verdicts as a MUST-BE-0. Memory-only here. */
+        OSErr cc = (OSErr)IOCommandIsComplete(cmdID, (short)h91err);
+        h93_record((UInt32)code, (UInt32)kind, (UInt32)cmdID, 1, (UInt32)(SInt32)cc);
+        return cc;
+    }
+}
+
+/* ★★★★★★★ h87 — MAKE THE ROM-CLAIMED UNIT-TABLE ENTRY ACTUALLY DISPATCHABLE.
+ *
+ * THE ASP CRASH, decoded end to end (2026-08-13, validated/logs/ + the user's StdLog):
+ * Apple System Profiler's Devices-and-Volumes scan walks the unit table and _Opens every driver. Our
+ * parcel-claimed UIM has an entry ('EHCIUIM', created by the USL's family machinery when the ROM parcel
+ * matched) that NO CODE PATH HAD EVER DISPATCHED THROUGH — n0's trace reads `total commands received 0`
+ * on every boot. The Toolbox ROM's open path (base+0x18B598, inside DriverLoaderLib) does:
+ *
+ *     lwz  r3, 0x1E(DCE)          ; the DoDriverIO UPP DriverLoaderLib stashes in dCtlWindow
+ *     ...  CallUniversalProc(r3, 0xFFF1, ...)
+ *
+ * and the ROM's OWN installer (base+0x18CECC) fills that field with
+ * NewRoutineDescriptor(DoDriverIO, procInfo 0xFFF1, kPowerPCISA). The USL's creation path never fills
+ * it, so ASP's open jumps through whatever garbage is there — PC=00000008 in the user's MacsBug, and
+ * byte-for-byte an earlier ndrv project's "un-openable ROM-claimed ndrv" crash (its decoded LR sits in the
+ * SAME ROM routine). Apple's own parcel ndrvs (.i2c-uni-n / .i2c-mac-io) don't crash only because their
+ * clients open them at boot through the working path.
+ *
+ * ⇒ THE FIX IS WHAT THE ROM'S INSTALLER WOULD HAVE DONE: find our own DCE and plant a real DoDriverIO
+ * UPP at +0x1E, procInfo 0xFFF1, PowerPC ISA. Then open/status/close dispatch into DoDriverIO like any
+ * healthy native driver: kOpen is a gBroughtUp-guarded no-op on the USL path, and unhandled status
+ * returns statusErr (above). The RoutineDescriptor is allocated in the SYSTEM zone — this runs in some
+ * application's context at boot, and an RD in an app heap would dangle when that app quits.
+ *
+ * ⚠ Task level ONLY (allocates; walks handles). Called from uimInitialize, which logs — proven task.
+ * ⚠ Field offsets are BYTE MATH, deliberately: a hand-laid struct with PPC alignment is exactly the
+ *   bug that made h82's StandardAlert silent (Toolbox structs are mac68k-aligned). Never again.
+ * ⚠ Idempotent + conservative: if +0x1E already holds a plausible RoutineDescriptor (points at the
+ *   MixedMode magic 0xAAFE), it is LEFT ALONE — a future ROM that fills the field correctly wins. */
+static int h87_ptr_ok(UInt32 a) { return a >= 0x1000UL && a < 0x60000000UL; }
+/* ★★★ h88 — THE h87 PATCH MISSED, and the m36 StdLog says how to aim. Same crash, same single EHCIUIM
+ * entry (the full DCE table shows exactly one), the crawl naming OpenInstalledDriver+B4 outright. So the
+ * walk ran and found nothing — and the leading explanation is TIMING: this was called from INSIDE
+ * uimInitialize, but the USL plausibly registers the unit entry AFTER init returns (load -> init -> then
+ * bookkeeping). h88 therefore (1) is called AGAIN from the first task-level pump tick, seconds later and
+ * unambiguously after all registration; (2) is idempotent and re-callable (gH88Done latches only on a
+ * successful plant or a found-valid vector); (3) patches EVERY match, not the first (`break` removed);
+ * (4) reports on the '!!' channel so a LEVEL 1 build documents the outcome at near-zero logging cost.
+ * All four survive whichever explanation is true. */
+static int gH88Done = 0;
+void ehci_os_fix_native_dce(void)
+{
+    void **utab; int n, i, found = 0, planted = 0;
+    if (gH88Done) return;
+    utab = *(void ** volatile *)0x011CUL;             /* UTableBase   (h52's proven accessors) */
+    n    = (int)*(volatile short *)0x01D2UL;          /* UnitNtryCnt */
+    if (!h87_ptr_ok((UInt32)utab) || n <= 0 || n > 1024) {
+        ehci_os_logx("!! h88 unit table unavailable — ASP would still crash on our entry; UTableBase",
+                     (UInt32)utab);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        void *dceh, *dce; unsigned char *drvr, *p; UInt32 v;
+        dceh = utab[i];
+        if (!h87_ptr_ok((UInt32)dceh)) continue;
+        dce = *(void * volatile *)dceh;               /* unit table holds DCtlHandles */
+        if (!h87_ptr_ok((UInt32)dce)) continue;
+        drvr = *(unsigned char * volatile *)dce;      /* dCtlDriver +0x00 -> fabricated DRVR header */
+        if (!h87_ptr_ok((UInt32)drvr)) continue;
+        /* name at header+0x12, Pascal — the field MacsBug displays, and the m35 StdLog CONFIRMS the
+         * address arithmetic on hardware: its open PB's ioNamePtr (001B9DAA) == DCE(001B9D60)+0x38+0x12. */
+        if (drvr[0x12] != 7 || drvr[0x13] != 'E' || drvr[0x14] != 'H' || drvr[0x15] != 'C' ||
+            drvr[0x16] != 'I' || drvr[0x17] != 'U' || drvr[0x18] != 'I' || drvr[0x19] != 'M') continue;
+        found++;
+        p = (unsigned char *)dce + 0x1E;              /* dCtlWindow — DriverLoaderLib's UPP slot */
+        v = ((UInt32)p[0] << 24) | ((UInt32)p[1] << 16) | ((UInt32)p[2] << 8) | (UInt32)p[3];
+        ehci_os_logx("!! h88 found our unit-table DCE (a report, not an error); slot<<16|refNum",
+                     ((UInt32)i << 16) | (UInt32)(UInt16)*(volatile short *)((char *)dce + 0x18));
+        ehci_os_logx("!!   h88 dCtlWindow (+0x1E) BEFORE — the vector OpenInstalledDriver dies through", v);
+        /* ★★★★ h90 — STOP VALIDATING THE CORPSE. REPLACE UNCONDITIONALLY.
+         *
+         * The escalation that got here, each step proven on hardware and each check one level too shallow:
+         *   h87  assumed the field was EMPTY            -> it held a real RoutineDescriptor
+         *   h88  checked the RD's 0xAAFE magic          -> magic fine; left it alone; still crashed
+         *   h89  checked procDescriptor is a pointer    -> it IS one (0x001ADxxx) — and it points at the
+         *        very TVector every crash's R12 has been holding (m35 R12=001ADCD8, m36 R12=001ADD78):
+         *        a TVector whose CODE WORD is the garbage that becomes PC=8. Three links — DCE -> RD ->
+         *        TVector — and the rot was always in the last one.
+         *
+         * The chain's owner never finished it, and n0 proves NOTHING has ever successfully dispatched
+         * through this entry (total commands 0, every boot ever). There is nothing to preserve. So: log
+         * the old chain for the record — including the TVector's code word, the actual PC=8 payload —
+         * then plant our own RD, every time. The old RD is leaked, never freed (unknown allocator). */
+        if (h87_ptr_ok(v) && *(volatile UInt16 *)v == 0xAAFEu) {
+            UInt32 tgt = *(volatile UInt32 *)(v + 0x14);
+            ehci_os_logx("!!   h90 old RD magic OK; procDescriptor (RD+0x14)", tgt);
+            if (h87_ptr_ok(tgt))
+                ehci_os_logx("!!   h90 TVector code word (*target) — the value that became PC on the crashes",
+                             *(volatile UInt32 *)tgt);
+        }
+        ehci_os_log("!!   h90 replacing the dispatch descriptor UNCONDITIONALLY (nothing has ever "
+                    "dispatched through this entry — n0: total commands 0, every boot)");
+        {   THz oldZone = GetZone();
+            UniversalProcPtr upp;
+            SetZone(SystemZone());                    /* the RD must outlive whichever app hosts boot */
+            upp = NewRoutineDescriptor((ProcPtr)DoDriverIO, 0x0000FFF1UL, kPowerPCISA);
+            SetZone(oldZone);
+            if (!upp) { ehci_os_log("!! h88 NewRoutineDescriptor FAILED — entry left as found"); continue; }
+            v = (UInt32)upp;
+            p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
+            p[2] = (unsigned char)(v >> 8);  p[3] = (unsigned char)v;
+            planted++;
+            ehci_os_logx("!!   h88 dCtlWindow AFTER — DoDriverIO UPP planted (procInfo 0xFFF1, PowerPC)", v);
+        }
+    }
+    if (found && planted) gH88Done = 1;               /* success latches; a miss leaves us re-callable */
+    if (!found) ehci_os_log("!! h88 pass found NO EHCIUIM unit entry — if this is the uimInitialize call, "
+                            "the entry is registered later and the tick-time pass must catch it");
 }

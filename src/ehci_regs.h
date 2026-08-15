@@ -104,6 +104,14 @@ static inline UInt32 ehci_cpu_to_le32(UInt32 v)
 #define EHCI_PORT_RESET     0x00000100UL
 #define EHCI_PORT_POWER     0x00001000UL
 #define EHCI_PORT_OWNER     0x00002000UL   /* 1 => port owned by companion (1.1) */
+/* ★★★ h66 — OVER-CURRENT, THE ONE PORTSC FIELD THIS DRIVER HAS NEVER READ.
+ * EHCI 2.3.9: when a port trips over-current the HOST CONTROLLER CLEARS PORT_POWER ITSELF. The port goes
+ * dark, the device vanishes, and nothing in our logs ever said why -- because OCC is in the RW1C mask below,
+ * so every read-modify-write we do has been CLEARING the evidence without ever looking at it.
+ * The user's observation on 2026-08-11 is what put this on the map: on the failing boots the drive's red
+ * power LED is OFF, on the working boots it is lit. That is Vbus, i.e. PORT_POWER, i.e. exactly this. */
+#define EHCI_PORT_OCA       0x00000010UL   /* over-current ACTIVE (live condition) */
+#define EHCI_PORT_OCC       0x00000020UL   /* over-current CHANGE (latched; RW1C)  */
 /* PORTSC write-1-to-clear change bits: CSC(bit1)|PEC(bit3)|OCC(bit5). Mask these OFF on
  * every read-modify-write so a control write doesn't inadvertently clear a pending change. */
 #define EHCI_PORTSC_RW1C    0x0000002aUL
