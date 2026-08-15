@@ -2,9 +2,11 @@
 
 **The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts USB drives and reads and writes them at **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
 
-## What's new in this release (2026-08-14)
+## What's new in this release (2026-08-15)
 
 This is the largest update since the project began, and it retires most of the caveats that used to fill this page:
+
+- **Disk First Aid now shows real drive information.** Utilities that ask a disk driver where a drive lives (Disk First Aid is the visible one) used to get an unanswered query back and would render a line of garbage text under the volume's name. The driver now answers the way Apple's own drivers do: each USB 2.0 volume shows a proper location line ("USB 2.0, drive 1 (v1.0)") and the stack's own USB 2.0 icon in Disk First Aid's list. Verify and Repair work on these volumes as normal, and always did; the label is now honest too.
 
 - **A memory-safety fix for surprise removal.** If a drive was unplugged at the rare moment the system was still talking to it (for example, within the first seconds after insertion, or a slow drive pulled before it finished mounting), an orphaned transfer could later write through pointers the OS had already freed, silently corrupting the system heap; the damage typically surfaced minutes later or at the next restart, with nothing pointing back at the cause. The driver now retires every outstanding transfer for a removed device before the OS is told the device is gone, matching the teardown discipline of Apple's own USB stack. This was found and fixed before any ROM containing the vulnerable code was published; it is called out here because surprise-removal robustness is a headline feature of this stack.
 
@@ -105,6 +107,7 @@ That injects the driver into your own ROM and emits BinHex, which keeps the ROM'
 
 - **"This disk is unreadable" at startup, sometimes, with a drive attached at boot.** Intermittent and harmless: the drive was offered to the system a moment before its filesystem was readable. **Click Eject** (never Initialize, which would erase it). The drive mounts by itself a few seconds later.
 - **A pause of 15 to 45 seconds during startup, sometimes with the keyboard and mouse briefly dead**, typically right when a Keychain or file-server dialog appears. That is Mac OS 9 itself trying to reach an AppleShare server from your Servers folder at boot; the whole system's input freezes during that window, including on stock machines. Wait it out; it recovers on its own. It is not the USB driver, and pulling cables during it can interrupt a mount in progress.
+- **A USB volume occasionally missing from Disk First Aid's list at its first launch after boot.** The volume is mounted and healthy; DFA just did not pick it up while building its initial list. Eject and reinsert the drive (it pops into the running DFA immediately) or quit and relaunch DFA. Cosmetic only.
 - **Always eject (Put Away / drag to the Trash) before unplugging a drive**, as with any removable disk. If you forget, the driver unmounts the volume safely and shows Apple's "unexpectedly disconnected" warning; your other drives are unaffected. Avoid unplugging a **hub** (or the Cinema Display's USB cable) while the drives behind it are still mounting at boot.
 
 ## A note for Mac mini G4 owners: the VBL display fix
@@ -236,14 +239,14 @@ The shippable pieces are the **driver** (`EHCIUIM` target, injected into a Mac O
 
 | File | Contains | Version shown | MD5 |
 |---|---|---|---|
-| `USB2_Mini_G4_ROM.hqx` | driver **h96rel** on the MacOS9Lives mini + VBL-fix base | in the driver log banner | `2e2a2363dd4ae06fa83491a517cbaf34` |
-| `USB2_MDD_G4_ROM.hqx` | driver **h96rel** on the MDD stock base | in the driver log banner | `904713d2a0e27ed2e488ed99cb006f4a` |
+| `USB2_Mini_G4_ROM.hqx` | driver **h97rel** on the MacOS9Lives mini + VBL-fix base | in the driver log banner | `0f9f53636585499c156d1ac903315aad` |
+| `USB2_MDD_G4_ROM.hqx` | driver **h97rel** on the MDD stock base | in the driver log banner | `2eb05b9d2583622ed3e56620cba06f71` |
 | `Mini_G4_EHCI_Ext.bin` | extension `Mini G4 EHCI` | **11.2** (Get Info / ASP) | `ff84d8b7cb629f2ea8a9f0bfb71b6b40` |
 | `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.3** (Get Info / ASP) | `f345db22764507fb3c0e1e607163d2bf` |
-| `USB2_BW_G3_ROM.hqx` | driver **b10rel** (polled mode) on the RETAIL 9.2.2 base | in the driver log banner | `ad97f6dd49e5dd89f57c12ec00743081` |
+| `USB2_BW_G3_ROM.hqx` | driver **b16rel** (polled mode) on the RETAIL 9.2.2 base | in the driver log banner | `5509afe84cd0b19cdc435624667f4f3c` |
 | `BW_G3_EHCI_Ext.bin` | extension `BW G3 EHCI` | **8.3** (Get Info / ASP) | `ee4863df8510d444f20804b72171d2e6` |
 
-The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h96rel ===`) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
+The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h97rel ===`, or `b16rel` on the B&W) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
 
 ## History
 
