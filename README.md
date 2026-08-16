@@ -1,24 +1,31 @@
 # USB 2.0 for Mac OS 9: ROM-Integrated Release
 
-**The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts USB drives and reads and writes them at **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
+**The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts USB drives and reads and writes them at up to **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
 
 ## What's new in this release (2026-08-15)
 
-This is the largest update since the project began, and it retires most of the caveats that used to fill this page:
+This is the most consequential update since the project began, solving many of the problems that appeared in earlier iterations.
 
-- **Disk First Aid now shows real drive information.** Utilities that ask a disk driver where a drive lives (Disk First Aid is the visible one) used to get an unanswered query back and would render a line of garbage text under the volume's name. The driver now answers the way Apple's own drivers do: each USB 2.0 volume shows a proper location line ("USB 2.0, drive 1 (v1.0)") and the stack's own USB 2.0 icon in Disk First Aid's list. Verify and Repair work on these volumes as normal, and always did; the label is now honest too.
+- **No more crash-prone EHCI Activator helper app!** This is probably the single biggest change, and has vastly improved usability. Activation now lives in a small **system extension**. Drop it in the Extensions folder once and forget it. There is nothing to see and nothing that can be quit by accident; it all runs in the background, similar to Apple's own built-in OHCI stack. The desktop "helper apps" were always a bit flaky and were merely a stepping stone towards the ultimate goal of a seamless, native-feeling experience.
+
+- **One driver, THREE machines, fully validated.** The same driver binary has passed all hardening tests on the Power Mac G4 MDD (PCI card), the Mac mini G4 (on-board USB 2.0), and now the oldest NewWorld Mac, the Power Mac G3 Blue & White (PCI Card). The validation on the B&W was particularly important because its ROM was built on the stock RETAIL Mac OS 9.2.2 ROM, so it's possible that it can also be dropped into other non-MDD G4 stock-9.2.2 towers with a PCI USB 2.0 card (Sawtooth, Gigabit, Digital Audio, Quicksilver). It would be VERY helpful and valuable to this project if those who have such towers can test this theory out and report back. Due to the era of the B&W, its driver runs in polled mode but in practice its copies remain fast reliable. Hardening tests included cold boots with drives attached, four drives at once with copies between them, hot-plug, hub support, and clean ejects.
+
+- **Drives connected at boot now mount at Hi-Speed.** The old "boot with your drive unplugged" ritual is gone: the extension claims the controller's free ports at boot, so a drive that is already plugged in comes up at 2.0. (You may see a harmless prompt at startup; see "Things you may notice" below.)
+
+- **Apple System Profiler no longer crashes.** ASP's "Devices and Volumes" tab had crashed to MacsBug on every machine with this driver installed since the first ROM. The cause was subtle (the OS creates a bookkeeping entry for ROM-loaded drivers but never finishes wiring it, and ASP is the only thing that ever walks through it); the driver now repairs that entry at boot. ASP scans cleanly and lists this stack's drives alongside everything else.
+
+- **Pulling a drive without ejecting now shows Apple's own warning.** "The device for disk ... was unexpectedly disconnected", word for word, exactly as the built-in USB 1.1 stack would. No crash, and the surviving drives are untouched.
 
 - **A memory-safety fix for surprise removal.** If a drive was unplugged at the rare moment the system was still talking to it (for example, within the first seconds after insertion, or a slow drive pulled before it finished mounting), an orphaned transfer could later write through pointers the OS had already freed, silently corrupting the system heap; the damage typically surfaced minutes later or at the next restart, with nothing pointing back at the cause. The driver now retires every outstanding transfer for a removed device before the OS is told the device is gone, matching the teardown discipline of Apple's own USB stack. This was found and fixed before any ROM containing the vulnerable code was published; it is called out here because surprise-removal robustness is a headline feature of this stack.
 
-- **One driver, two machines, fully validated.** The same driver binary now passes the complete hardening suite on both the Power Mac G4 MDD (PCI card) and the Mac mini G4 (on-board USB 2.0): cold boots with drives attached, four drives at once with copies between them, hot-plug, hub support, and clean ejects. The mini is no longer "newer and less proven"; both machines were validated on the same day with the same code.
-- **No more Startup Items helper app.** Activation now lives in a small **system extension** (`Mini G4 EHCI` or `MDD G4 EHCI`). Drop it in the Extensions folder once and forget it. There is nothing to see and nothing that can be quit by accident.
-- **Drives connected at boot now mount at Hi-Speed.** The old "boot with your drive unplugged" ritual is gone: the extension claims the controller's free ports at boot, so a drive that is already plugged in comes up at 2.0. (You may see a harmless prompt at startup; see "Things you may notice" below.)
-- **The intermittent boot slowdowns and freezes are fixed, and the cause was ours.** The beta driver wrote a verbose diagnostic log through the File Manager, synchronously, on the boot volume. Under the right timing that single behavior could hold the Finder's thread for 30 seconds at a stretch, which showed up as slow extension loading, a desktop that took forever, an unresponsive cursor, or a machine that never came back. The release driver writes a two-line log and nothing else. If your earlier install ever felt sluggish or wedged at boot, this was very likely why.
-- **Apple System Profiler no longer crashes.** ASP's "Devices and Volumes" tab had crashed to MacsBug on every machine with this driver installed since the first ROM. The cause was subtle (the OS creates a bookkeeping entry for ROM-loaded drivers but never finishes wiring it, and ASP is the only thing that ever walks through it); the driver now repairs that entry at boot. ASP scans cleanly and lists this stack's drives alongside everything else.
-- **Pulling a drive without ejecting now shows Apple's own warning.** "The device for disk ... was unexpectedly disconnected", word for word, exactly as the built-in USB 1.1 stack would. No crash, and the surviving drives are untouched.
-- **A third machine: the Power Mac G3 Blue & White.** The same driver now runs on the oldest NewWorld Mac, built on the RETAIL Mac OS 9.2.2 ROM (no MacOS9Lives install required), so it plausibly serves other stock-9.2.2 towers with a PCI USB 2.0 card (Sawtooth, Gigabit, Digital Audio, Quicksilver) -- reports welcome. On this era of machine the driver runs in polled mode (the card's interrupt line is not serviceable the same way there); in practice copies remain fast and the full test suite passes.
+- **Disk First Aid now shows real drive information.** Utilities that ask a disk driver where a drive lives (Disk First Aid is the visible one) used to get an unanswered query back and would render a line of garbage text under the volume's name. The driver now answers the way Apple's own drivers do: each USB 2.0 volume shows a proper location line ("USB 2.0, drive 1 (v1.0)") and the stack's own USB 2.0 icon in Disk First Aid's list. Verify and Repair work on these volumes as normal, and always did; the label is now honest too.
+
+- **The intermittent boot slowdowns and freezes are fixed.** The beta driver wrote a verbose diagnostic log through the File Manager, synchronously, on the boot volume. Under the right timing that single behavior could hold the Finder's thread for 30 seconds at a stretch, which showed up as slow extension loading, a desktop that took forever, an unresponsive cursor, or a machine that never came back. The release driver writes a two-line log and nothing else. If your earlier install ever felt sluggish or wedged at boot, this was very likely why.
+
 - **The extension is safe to install on its own.** If it finds no USB2 ROM driver on the controller (wrong machine, or the ROM step was missed), it logs one line and does nothing -- the machine boots normally. Earlier builds could freeze the boot in that mismatched configuration.
-- **Troubleshooting: if the ROM will not boot** (blinking "?" folder, or a "checksum error" at an Open Firmware prompt): your StuffIt Expander mangled the decode. Older versions (5.5 confirmed) silently convert line endings inside the file because it begins with readable text. Use StuffIt Expander 6.0 or newer, or disable "convert text files" in its preferences, and expand a fresh copy. The ROM verifies its own checksum at boot, so a bad decode refuses loudly instead of booting corrupted code.
+- 
+- **Troubleshooting: if the ROM will not boot** (blinking "?" folder, or a "checksum error" at an Open Firmware prompt): your StuffIt Expander corrupted the decode. Older versions (5.5 confirmed) silently convert line endings inside the file because it begins with readable text. Use StuffIt Expander 6.0 or newer, or disable "convert text files" in its preferences, and expand a fresh copy. The ROM verifies its own checksum at boot, so a bad decode refuses loudly instead of booting corrupted code.
+- 
 - **Simple, final file names.** The download names below say what each file is for. Version numbers live in the Finder's Get Info and Apple System Profiler (for the extensions) and in the table at the bottom of this page, not in the filenames.
 
 ## Downloads: which two files you need
@@ -31,11 +38,11 @@ Every machine needs exactly **two files**: a ROM and an extension. Take the pair
 | **Power Mac G4 MDD** with a PCI USB 2.0 card | `USB2_MDD_G4_ROM.hqx` | `MDD_G4_EHCI_Ext.bin` |
 | **Power Mac G3 Blue & White** with a PCI USB 2.0 card (retail 9.2.2) | `USB2_BW_G3_ROM.hqx` | `BW_G3_EHCI_Ext.bin` |
 
-Decode both on the Mac with **StuffIt Expander** (both formats preserve the resource forks; converting them on a PC with a fork-blind tool will break them). The ROM decodes to a file named `Mac OS ROM`; the extension decompresses to `Mini G4 EHCI` or `MDD G4 EHCI`, wearing its own USB 2.0 icon.
+Decode both on the Mac with **StuffIt Expander** (both formats preserve the resource forks; converting them on a PC with a fork-blind tool will break them). The ROM decodes to a file named `Mac OS ROM`; the extension decompresses to `Mini G4 EHCI`,  `MDD G4 EHCI`, etc, with a USB icon.
 
 Checksums and version details are in [Versions](#versions) at the bottom of this page.
 
-## The driver lives in the Mac OS ROM
+## HOW IT WORKS: The driver now lives in the Mac OS ROM!
 
 The EHCI UIM is injected into the **Mac OS ROM** itself, as a `driver,AAPL,MacOS,PowerPC` parcel bound to the USB 2.0 controller's Name Registry node (built with Elliot Nunn's Mac OS ROM toolchain). Mac OS 9 **loads and binds the driver at boot, as a genuine OS-owned host-controller driver**, the same way it loads a native Apple one. On a machine with the patched ROM, USB 2.0 support is part of the operating system, not bolted on by a helper app.
 
@@ -63,13 +70,17 @@ The EHCI UIM is injected into the **Mac OS ROM** itself, as a `driver,AAPL,MacOS
 
 - A Power Mac running Mac OS 9 with a free PCI slot and a **USB 2.0 host card** (EHCI, class `0x0C0320`).
 - **Tested: Power Mac G4 "Mirrored Drive Doors" + NEC-chipset IOGEAR card.** Most generic USB 2.0 PCI cards of the era use similar NEC/VIA EHCI silicon.
-- The card has a dedicated interrupt line, and this path has months of use plus this release's full hardening suite behind it.
 
 ### Mac mini G4 (on-board USB 2.0)
 
-- The mini's built-in rear ports are USB 2.0-capable, but Mac OS 9 has only ever driven them at 1.1. With this ROM and extension they run at Hi-Speed.
+- The Mini's built-in rear ports are USB 2.0-capable, but Mac OS 9 has only ever driven them at 1.1. With this ROM and extension they run at Hi-Speed.
 - **Validated extensively in this release**: repeated cold boots with two drives attached behind the Cinema Display's hub, drive-to-drive copies (byte-verified), hot-plug and rude-removal cycles, and Apple System Profiler scans, all clean, with the keyboard and mouse working throughout on the same controller.
 - ⚠️ **Read [the Mac mini ROM note](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) below before you install the mini ROM.** It concerns a *separate* display bug, not USB.
+
+### Power Mac G3 B&W + PCI USB 2.0 card
+
+- A Power Mac running Mac OS 9 with a free PCI slot and a **USB 2.0 host card** (EHCI, class `0x0C0320`).
+- **Tested: Power Mac G3 "Blue & White" + NEC-chipset IOGEAR card.** Most generic USB 2.0 PCI cards of the era use similar NEC/VIA EHCI silicon.
 
 ### Other machines
 
