@@ -23,9 +23,7 @@ This is the most consequential update since the project began, solving many of t
 - **The intermittent boot slowdowns and freezes are fixed.** The beta driver wrote a verbose diagnostic log through the File Manager, synchronously, on the boot volume. Under the right timing that single behavior could hold the Finder's thread for 30 seconds at a stretch, which showed up as slow extension loading, a desktop that took forever, an unresponsive cursor, or a machine that never came back. The release driver writes a two-line log and nothing else. If your earlier install ever felt sluggish or wedged at boot, this was very likely why.
 
 - **The extension is safe to install on its own.** If it finds no USB2 ROM driver on the controller (wrong machine, or the ROM step was missed), it logs one line and does nothing -- the machine boots normally. Earlier builds could freeze the boot in that mismatched configuration.
-- 
 - **Troubleshooting: if the ROM will not boot** (blinking "?" folder, or a "checksum error" at an Open Firmware prompt): your StuffIt Expander corrupted the decode. Older versions (5.5 confirmed) silently convert line endings inside the file because it begins with readable text. Use StuffIt Expander 6.0 or newer, or disable "convert text files" in its preferences, and expand a fresh copy. The ROM verifies its own checksum at boot, so a bad decode refuses loudly instead of booting corrupted code.
-- 
 - **Simple, final file names.** The download names below say what each file is for. Version numbers live in the Finder's Get Info and Apple System Profiler (for the extensions) and in the table at the bottom of this page, not in the filenames.
 
 ## Downloads: which two files you need
