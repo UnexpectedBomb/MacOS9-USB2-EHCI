@@ -1,6 +1,6 @@
 # USB 2.0 for Mac OS 9: ROM-Integrated Release
 
-**The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts USB drives and reads and writes them at up to **~20 MB/s read / ~13 MB/s write** on real hardware, roughly 10 to 20 times faster than anything OS 9 could do before.
+**The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts USB drives and reads and writes them at up to **~11 MB/s read / ~5 MB/s write** on real hardware, roughly 12 times faster than anything OS 9 could do before. See [Measured performance](#measured-performance) for the full benchmark.
 
 ## What's new in this release (2026-08-15)
 
@@ -57,12 +57,34 @@ The EHCI UIM is injected into the **Mac OS ROM** itself, as a `driver,AAPL,MacOS
 - Mounts USB 2.0 mass-storage devices (flash drives / SSDs) on the OS 9 desktop at Hi-Speed, including **drives that are already connected at boot**.
 - **Up to four drives at once, in any combination of ports.** Each gets its own volume, icon and geometry. Files copy directly between them, they can be ejected individually or all together in a single drag to the Trash, and each hot-plugs independently. Re-validated in this release with four drives across a PCI card and an external hub at the same time.
 - **Drives behind an external USB 2.0 hub run at Hi-Speed.** The hub is enumerated and driven by this stack (we power, reset and address its downstream ports ourselves), so a drive plugged into a hub, including the hub built into an Apple Cinema Display, mounts at 2.0 instead of falling back to 1.1. Keyboards and mice behind a hub are a separate problem and still do not work: see "Known limitations".
-- Reads and writes at the device's real speed, benchmarked at **20 MB/s read, ~13 MB/s write** (both are the flash device's own ceiling; the driver reaches it). Real Finder copies land lower (~4 to 8 MB/s) because the Finder's own I/O sizing is the bottleneck above the driver.
+- Reads at about **11 MB/s** and writes at about **5 MB/s** on large transfers, roughly 12x and 7x what USB 1.1 manages on the same hardware. Real Finder copies land lower, because the Finder issues smaller requests than a benchmark does. See [Measured performance](#measured-performance).
 - On an **on-board** machine (Mac mini G4), the driver hands the keyboard/mouse ports back to the built-in 1.1 controller and claims only free ports for drives, so input keeps working while drives run at Hi-Speed, including with the drives behind the Cinema Display's hub on the same controller.
 - **Ejects** cleanly (Finder menu or drag-to-Trash), like any removable disk, and warns with Apple's own alert if you pull a disk without ejecting.
 - **Tells you it's really 2.0**: a volume mounted through this driver appears on the desktop with a distinct **"2.0" drive icon**, so a Hi-Speed mount is obvious at a glance versus a plain USB 1.1 one.
 - Reliable transfers: byte-verified, with a transfer watchdog and a CSW residue/signature check on every command, and **correct block addressing across the entire volume**, so large files and volumes well past 2 GB / 4 GB read and write without corruption.
 - Plays fair with the rest of the system: Apple System Profiler scans it cleanly, restarts and shutdowns quiesce the controller through a Shutdown Manager hook, and the built-in USB 1.1 stack is untouched.
+
+## Measured performance
+
+Measured with **QuickBench 2.0 (Intech)** on a Power Mac G4 MDD, using the **same USB flash drive** for both runs: once on the machine's built-in USB 1.1 port (Apple's own stack), once through this driver on a PCI USB 2.0 card. Sequential transfers, MB/s:
+
+| Transfer size | USB 2.0 read | USB 2.0 write | USB 1.1 read | USB 1.1 write |
+|---|---|---|---|---|
+| 4 KB | 0.52 | 0.47 | 0.58 | 0.28 |
+| 16 KB | 2.01 | 0.99 | 0.80 | 0.52 |
+| 64 KB | 7.83 | 3.09 | 0.90 | 0.71 |
+| 256 KB | 10.42 | 5.01 | 0.92 | 0.63 |
+| 1 MB | **11.43** | 2.76 | 0.93 | 0.74 |
+
+Reading what that table says, honestly:
+
+- **On large transfers this stack is about 12x faster than USB 1.1** for reads, and around 6 to 7x for writes.
+- **Writes are slower than reads and vary run to run** (note the 1 MB write coming in below the 256 KB write). Some of that is the flash drive's own behavior, which shows up on the USB 1.1 run too.
+- **On very small transfers, USB 1.1 is currently faster than this driver.** The two stacks cross over at about 8 KB. That is a real limitation of this driver, not a measurement artifact, and the cause is understood: this driver's transfer engine is driven by an 8 ms timer, so every request waits for the next tick before it is issued. Measured time per transfer is a nearly constant 7.8 ms from 1 KB all the way to 64 KB, whether the transfer moves 1 KB or 64 KB. At 64 KB, only about 1.5 ms of that is time actually spent moving data.
+
+That last point is the single biggest performance item on the list, and it caps everything above: the 11 MB/s ceiling is essentially the driver's 128 KB staging buffer divided by the timer period. Issuing transfers as soon as they arrive, rather than on the next tick, is the obvious fix and is being worked on. It touches the data path, so it gets tested carefully before it ships.
+
+If you run your own benchmark, use a release build (a diagnostic build writes logs during the test and will read slow), a freshly formatted drive, and volume level tests rather than SCSI passthrough, which cannot see this driver.
 
 ## Supported machines
 
@@ -168,7 +190,8 @@ That injects the driver into your own ROM and emits BinHex, which keeps the ROM'
 - **A drive inserted while a large file copy is running may not mount.** Wait for the copy to finish and plug
   it in again, or plug it in before starting the copy. (The engine work to lift this is partly in place, but
   the case has not been validated, so the limitation stands until it is.)
-- **Writes are slower than reads.** Reads reach the device's ceiling (~20 MB/s); Finder writes land around 2 to 5 MB/s because the Finder issues small synchronous writes above the driver.
+- **Writes are slower than reads**, roughly half the read speed on large transfers, and they vary more between runs. Part of that is the flash device itself; part is this driver's staging path. See [Measured performance](#measured-performance).
+- **Small transfers are slow, and below about 8 KB USB 1.1 beats this driver.** The transfer engine is timer driven, so each request waits for the next 8 ms tick. This is the biggest known performance limitation and the fix is understood; see [Measured performance](#measured-performance).
 - **Mid-write yank is unsafe** (as on any OS): always eject first.
 - **A few tested hardware combinations** (see Supported machines). Other EHCI cards/controllers are untested.
 

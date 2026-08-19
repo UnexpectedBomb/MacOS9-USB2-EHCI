@@ -451,10 +451,27 @@ trusting a driver on any volume larger than 2 GB.
   and reverted, two of which regressed a working driver into a freeze on the hub connect, for
   reasons still not understood. Diagnosing that needs evidence that survives a stalled File Manager,
   because the driver's own logging goes through it. Recorded so nobody re-treads it blind.
-- **Throughput, solved.** Reads ~20 MB/s and writes ~13 MB/s (the flash device's own ceiling),
-  by pre-queuing whole commands (one interrupt per command) with multi-qTD 128 KB transfer chains
-  and per-endpoint hardware toggles (Bug hunt #3). Real Finder copies land lower (~8 read / ~5
-  write), the Finder's own I/O sizing, not the driver, is the ceiling there.
+- **Throughput, partly solved, and the remaining ceiling is now measured and understood.** Whole
+  commands are pre-queued (one interrupt per command) with multi-qTD 128 KB transfer chains and
+  per-endpoint hardware toggles (Bug hunt #3). A QuickBench sweep on the MDD measures **11.4 MB/s
+  sequential read and about 5 MB/s write**, versus 0.93 / 0.75 for USB 1.1 on the same drive and
+  machine.
+
+  ⚠ An earlier revision of this document claimed ~20 / ~13 MB/s. That figure came from the
+  app-era self-test, which drove the engine's own block-read service directly. It did not measure
+  the delivered File Manager path, so it was not a number a user could reproduce, and it has been
+  replaced with the benchmark above.
+
+  **The dominant limit is submission latency, not bandwidth.** Block I/O is issued from the 8 ms
+  heartbeat, so a request that arrives just after a tick waits a full period before it reaches the
+  hardware. The benchmark shows this directly: measured time per transfer is a nearly constant
+  7.8 ms from 1 KB through 64 KB, independent of size (at 64 KB, roughly 1.5 ms of that is time on
+  the wire). Larger transfers quantize to the same unit, which is why the ceiling works out to
+  about one 128 KB staging buffer per 11.5 ms. Two consequences: below about 8 KB this driver is
+  slower than USB 1.1, and the Finder, which issues modest requests, sits in the latency-bound
+  region. The lever is issuing on submit when the engine is idle rather than waiting for the tick.
+  That is a data-path change, so it needs per-direction proof and an oracle-based content test
+  before it ships, with the same QuickBench sweep as the before/after referee.
 - **On-board (shared-port) controllers, experimental (intermittent).** Machines like the Mac
   Mini G4, whose EHCI shares its ports *and interrupt line* with the OHCI companions that drive the
   keyboard/mouse, are handled by the per-port claim + the `sharedCompanion` interrupt discriminator
