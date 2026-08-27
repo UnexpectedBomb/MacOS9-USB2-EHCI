@@ -44,6 +44,11 @@ Every machine needs exactly **two files**: a ROM and an extension. Take the pair
 | **Power Mac G4 MDD** with a PCI USB 2.0 card | `USB2_MDD_G4_ROM.hqx` | `MDD_G4_EHCI_Ext.bin` |
 | **Power Mac G4 MDD (FireWire 800)**, built-in ports, no card | `USB2_MDD_G4_FW800_ROM.hqx` | `MDD_G4_EHCI_Ext.bin` |
 | **Power Mac G3 Blue & White** with a PCI USB 2.0 card (retail 9.2.2) | `USB2_BW_G3_ROM.hqx` | `BW_G3_EHCI_Ext.bin` |
+| **Power Mac G4 AGP ("Sawtooth")** with a PCI USB 2.0 card | `USB2_BW_G3_ROM.hqx` | `BW_G3_EHCI_Ext.bin` |
+
+**Sawtooth owners: yes, that is the B&W pair, and it is the right one.** It is built on the plain retail Mac OS 9.2.2 ROM rather than any machine-specific one, so it is not really a "B&W" pair at all; it travels. A Sawtooth running it was confirmed by aladds on the 68kmla forum, which is a community report rather than one of our own test machines. See [Supported machines](#supported-machines) for the detail.
+
+**Other stock-9.2.2 G4 towers** (Gigabit Ethernet, Digital Audio, Quicksilver) with a PCI USB 2.0 card: same pair, and it is expected to work for the same reason, but nobody has reported back yet. Please post either way if you try it.
 
 Decode both on the Mac with **StuffIt Expander** (both formats preserve the resource forks; converting them on a PC with a fork-blind tool will break them). The ROM decodes to a file named `Mac OS ROM`; the extension decompresses to `Mini G4 EHCI`,  `MDD G4 EHCI`, etc, with a USB icon.
 
