@@ -2,9 +2,17 @@
 
 **The first USB 2.0 (Hi-Speed) mass-storage driver for classic Mac OS 9.** Mac OS 9 shipped with USB 1.1 only (a 12 Mbit/s ceiling, roughly 1 MB/s in practice). This is a from-scratch EHCI (USB 2.0) stack that mounts USB drives and reads and writes them at up to **~11 MB/s read / ~5 MB/s write** on real hardware, roughly 12 times faster than anything OS 9 could do before. See [Measured performance](#measured-performance) for the full benchmark.
 
-## What's new in this release (2026-08-15)
+## What's new in this release (2026-08-27)
 
-This is the most consequential update since the project began, solving many of the problems that appeared in earlier iterations.
+- ★ **The Power Mac G4 MDD (FireWire 800) now runs USB 2.0 on its own built-in ports. No PCI card.** The FW800 MDD logic board has always carried a NEC USB 2.0 controller. It is the chip the machine's built-in USB ports are wired to, and Apple shipped only its USB 1.1 half: the USB 2.0 half is switched off by the machine's own BootROM at power-on, before any operating system gets a look at it. (The FW400 MDD board leaves that chip's footprint empty, so this is a FireWire 800 machine only.) This release switches it back on from inside the Mac OS ROM and hands the controller to the same driver the other three machines use. There is nothing to configure, no NVRAM edits and no hardware modification, and the driver itself did not need a single line changed. As far as we know this is the first time this controller has been driven under Mac OS 9 at all: the 2003 Orange Micro drivers written for it were Mac OS X only.
+
+- **How the switch was found.** The 2.0 half does not merely go un-enumerated, it does not answer on the PCI bus at all, so there was nothing to find by inspecting it directly. Instead we dumped all 256 bytes of the USB 1.1 controller's PCI configuration space on a machine where 2.0 works (the Mac mini G4, which uses the same NEC family) and on the FW800 MDD, and compared them. The two were byte-identical except for a single long word. The practical result is a two-line addition to the ROM's boot script.
+
+- **Everything else is unchanged.** Same driver, same extension, same install procedure. The other three machines are unaffected by this release.
+
+## What was new in the 2026-08-15 release
+
+This was the most consequential update since the project began, solving many of the problems that appeared in earlier iterations.
 
 - **No more crash-prone EHCI Activator helper app!** This is probably the single biggest change, and has vastly improved usability. Activation now lives in a small **system extension**. Drop it in the Extensions folder once and forget it. There is nothing to see and nothing that can be quit by accident; it all runs in the background, similar to Apple's own built-in OHCI stack. The desktop "helper apps" were always a bit flaky and were merely a stepping stone towards the ultimate goal of a seamless, native-feeling experience.
 
@@ -34,6 +42,7 @@ Every machine needs exactly **two files**: a ROM and an extension. Take the pair
 |---|---|---|
 | **Mac mini G4** | `USB2_Mini_G4_ROM.hqx` | `Mini_G4_EHCI_Ext.bin` |
 | **Power Mac G4 MDD** with a PCI USB 2.0 card | `USB2_MDD_G4_ROM.hqx` | `MDD_G4_EHCI_Ext.bin` |
+| **Power Mac G4 MDD (FireWire 800)**, built-in ports, no card | `USB2_MDD_G4_FW800_ROM.hqx` | `MDD_G4_EHCI_Ext.bin` |
 | **Power Mac G3 Blue & White** with a PCI USB 2.0 card (retail 9.2.2) | `USB2_BW_G3_ROM.hqx` | `BW_G3_EHCI_Ext.bin` |
 
 Decode both on the Mac with **StuffIt Expander** (both formats preserve the resource forks; converting them on a PC with a fork-blind tool will break them). The ROM decodes to a file named `Mac OS ROM`; the extension decompresses to `Mini G4 EHCI`,  `MDD G4 EHCI`, etc, with a USB icon.
@@ -97,6 +106,13 @@ If you run your own benchmark, use a release build (a diagnostic build writes lo
 - **Validated extensively in this release**: repeated cold boots with two drives attached behind the Cinema Display's hub, drive-to-drive copies (byte-verified), hot-plug and rude-removal cycles, and Apple System Profiler scans, all clean, with the keyboard and mouse working throughout on the same controller.
 - ⚠️ **Read [the Mac mini ROM note](#a-note-for-mac-mini-g4-owners-the-vbl-display-fix) below before you install the mini ROM.** It concerns a *separate* display bug, not USB.
 
+### Power Mac G4 MDD (FireWire 800), built-in ports
+
+- **No PCI card required.** The FW800 MDD's built-in USB ports are wired to an on-board NEC controller whose USB 2.0 half Apple left switched off. This ROM turns it on, publishes it to Mac OS, and the driver binds to it exactly as it does to a PCI card.
+- This applies to the **FireWire 800 MDD only** (`PowerMac3,6`). The FireWire 400 MDD leaves that chip's footprint unpopulated, so there is nothing to enable; on a FW400 machine use the PCI card pair above.
+- The controller is presented in **polled mode**, for the same reason the B&W build is: the port Apple never published has no interrupt routing for us to inherit, so the driver drives it from its own timer instead. In practice copies are fast and reliable.
+- ⚠ **This ROM is built on a community-modified FW800 MDD `Mac OS ROM`**, the kind that makes an FW800 MDD boot Mac OS 9 in the first place, so it keeps that work. If your machine boots from a *different* community ROM than the one this was built on, patch your own instead of replacing it; see "Patching your own ROM" under Install. The injector appends a parcel rather than replacing anything, so it composes with whatever patches your ROM already carries.
+
 ### Power Mac G3 B&W + PCI USB 2.0 card (and, it turns out, other G4 towers)
 
 - A Power Mac running Mac OS 9 with a free PCI slot and a **USB 2.0 host card** (EHCI, class `0x0C0320`).
@@ -121,7 +137,7 @@ A **one-time setup**, two files. After that, drives are plug-and-play.
 
 2. **Install the ROM.** Decode the `.hqx` for your machine with StuffIt Expander; it decodes to a file named `Mac OS ROM`. **Boot from a CD or another volume**, put the decoded file into the System Folder in place of the original, and reboot. You cannot swap it while booted from that same System Folder. Make sure you can boot from something else before you start.
 
-   > ⚠ **MDD owners: not if your machine only boots OS 9 thanks to a community ROM patch** (an FW800 MDD and similar). Your `Mac OS ROM` has already been modified to make OS 9 boot at all, and the prebuilt MDD file does not contain that work. Use the injector on your own already-patched ROM instead (see "Patching your own ROM" below); it appends a parcel rather than replacing anything, so it composes.
+   > ⚠ **MDD owners: `USB2_MDD_G4_ROM.hqx` is built on the stock MDD ROM**, so it is the wrong file if your machine only boots OS 9 thanks to a community ROM patch. **FireWire 800 MDD owners want `USB2_MDD_G4_FW800_ROM.hqx` instead**, which is built on a community FW800 ROM and keeps that work. If your machine boots from some other patched ROM again, use the injector on the ROM you already have (see "Patching your own ROM" below); it appends a parcel rather than replacing anything, so it composes.
    >
    > The **mini** ROM is built on the MacOS9Lives mini ROM, so it keeps the patches that make a mini boot OS 9 at all.
 
@@ -280,8 +296,9 @@ The shippable pieces are the **driver** (`EHCIUIM` target, injected into a Mac O
 | `MDD_G4_EHCI_Ext.bin` | extension `MDD G4 EHCI` | **8.3** (Get Info / ASP) | `f345db22764507fb3c0e1e607163d2bf` |
 | `USB2_BW_G3_ROM.hqx` | driver **b16rel** (polled mode) on the RETAIL 9.2.2 base | in the driver log banner | `5509afe84cd0b19cdc435624667f4f3c` |
 | `BW_G3_EHCI_Ext.bin` | extension `BW G3 EHCI` | **8.3** (Get Info / ASP) | `ee4863df8510d444f20804b72171d2e6` |
+| `USB2_MDD_G4_FW800_ROM.hqx` | driver **fw1rel** (polled mode) + the on-board controller enable, on a community FW800 MDD base | in the driver log banner | `afcae96313334fa9bcd2abe9b2d284d0` |
 
-The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h97rel ===`, or `b16rel` on the B&W) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
+The driver writes `EHCIUIM_init.log` on the boot volume: two lines identifying the build (`=== EHCIUIM BUILD h97rel ===`, or `b16rel` on the B&W, or `fw1rel` on the FW800 MDD) and the logging mode. That is the whole log in a release build; if you file a bug report, include those lines and a description, and a diagnostic build can be provided.
 
 ## History
 
